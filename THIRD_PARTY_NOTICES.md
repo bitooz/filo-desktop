@@ -200,7 +200,8 @@ that come from [Feather](https://feathericons.com) are under Feather's MIT licen
 
 `assets/icons/claude.svg`, `meta.svg`, `opencode.svg` and `mcp-linear.svg`, `mcp-stripe.svg`, `mcp-huggingface.svg`,
 `mcp-cloudflare-docs.svg`, `mcp-notion.svg`, `mcp-vercel.svg`, `mcp-github.svg`, `mcp-sentry.svg` and `mcp-clickup.svg`
-are drawn from [Simple Icons](https://simpleicons.org) 16.34.0, which is released under CC0-1.0 (public domain).
+are drawn from [Simple Icons](https://simpleicons.org) 16.34.0, which is released under CC0-1.0 (public domain), as are
+the website's GitHub and X marks (`i-github` and `i-x-logo` in `website/*.html`).
 
 ### Services' own logos
 
@@ -212,9 +213,9 @@ says where each came from.
 ### Trademarks
 
 Claude and Anthropic, OpenAI and Codex, Meta, OpenCode, Linear, Stripe, Hugging Face, Cloudflare, Notion, Vercel,
-GitHub, Sentry, ClickUp, Context7, Playwright, Upsy, DeepWiki, Executor and Google are trademarks of their owners. Their
-logos appear in Filo only to name the service or tool they stand for. Filo isn't affiliated with or endorsed by any of
-them.
+GitHub, X, Sentry, ClickUp, Context7, Playwright, Upsy, DeepWiki, Executor and Google are trademarks of their owners.
+Their logos appear in Filo only to name the service or tool they stand for. Filo isn't affiliated with or endorsed by
+any of them.
 
 ## The note editor
 
