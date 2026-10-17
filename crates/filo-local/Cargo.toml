@@ -1,0 +1,58 @@
+[package]
+name = "filo-local"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Filo's local data: chats and its database on this Mac, the MCP server with Filo's tools, and the runner for the coding tools (Claude Code, Codex, Muse Code, OpenCode)."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# `dev`: what only a build in the checkout uses: the computer-use helper built there or named by FILO_COMPUTER_USE_BIN
+# (computer.rs), FILO_SECRETS_DIR (secrets.rs), FILO_SESSION_TRACE (coding_session.rs) and the tests' `pretend_last_call`
+# (compaction.rs). On by default, and with the app's own `dev` feature, so the packaged app (scripts/package.sh) goes
+# without it.
+[features]
+default = ["dev"]
+dev = []
+
+# `filo-local mcp|feed-mcp|send|list|show|glance-document`: the same code the app runs, from a terminal (the e2e tests,
+# the standalone Feed server, scripts/glance-fixture.mjs).
+[[bin]]
+name = "filo-local"
+path = "src/bin/filo-local.rs"
+
+[dependencies]
+# Pictures sent with a message go to Claude Code as image blocks (engine.rs); also PKCE's code verifier (apps_oauth.rs),
+# the pets' SVG wrappers (characters.rs) and the computer-use screenshots sent back to the model (computer.rs).
+base64 = "0.23.1"
+# The desktop pets' pictures: read whatever an image model or the user gives, cut out and saved as PNG (characters.rs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Wall-clock schedules in this Mac's time zone (schedule.rs).
+chrono = "0.4.45"
+# Stops a turn's whole process group (the CLI and the MCP server it started).
+libc = "0.2"
+# Filo's database on this Mac (db.rs): notes, the Feed, schedules, apps, artifacts, coding tasks, the group and more.
+# `bundled` builds SQLite in, so it doesn't depend on the system's.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# The apps' MCP servers over HTTP and their OAuth sign-ins (apps_client.rs, apps_oauth.rs): blocking, on threads of
+# their own, so the MCP proxy and the checks need no async runtime.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# `preserve_order`: JSON keeps its keys in the order they're written, as it does in the app anyway (gpui turns it on,
+# and Cargo unifies features), so what the coding tools are sent reads the same in this crate's own tests.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+# PKCE's code challenge (apps_oauth.rs).
+sha2 = "0.10"
+# Reads the user's Codex `config.toml`, for the MCP servers a chat turn turns off (engine.rs).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+# The apps' API keys and sign-in tokens are kept in the login Keychain (secrets.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

@@ -1,0 +1,12 @@
+/target
+# package.sh's builds (its default OUT)
+/dist/
+# Scratch from local agent runs, and Python caches
+/.local-chat-work/
+__pycache__/
+.DS_Store
+# Kept on disk, out of the repository: the demo videos' production (takes, recording and voice-over scripts) and the
+# launch material (Product Hunt shots), and a recorder flow left at the root
+/video/
+/launch/
+/flow.cjs

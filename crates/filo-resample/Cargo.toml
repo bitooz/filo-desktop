@@ -1,0 +1,13 @@
+[package]
+name = "filo-resample"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "The part of a zoomed-in picture on screen, drawn at the screen's own pixels: Lanczos3, held clear of rings, with steeper edges."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

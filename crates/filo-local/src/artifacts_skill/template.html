@@ -1,0 +1,163 @@
+<!doctype html>
+<!--
+  HOW TO USE (delete this comment in your copy)
+  1. Copy this file to pages/<short-name>.html in your working folder and keep that path: publishing the
+     same file again saves the artifact's next version.
+  2. Set the page's title and its h1, fill the parts marked FILL, and delete the parts you don't need (the
+     status line, the cards, the tabs, the table...). Keep the <head> as it is: the first <style> is the
+     page's look outside Filo, the filo:head marker after it is where the app puts its own theme and font,
+     and the second <style> is the house style, which uses them.
+  3. Colours only from the variables (var(--text), var(--accent)...), so it follows light and dark mode.
+  4. Everything stays in this one file: no links to fonts, scripts, styles or pictures elsewhere.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TITLE</title>
+<style>
+/* Filo's Default theme, for the page opened outside the app; inside it, the app's theme below takes over. */
+:root{color-scheme:light;--background:#F6F5F2;--surface:#EBEAE7;--surfaceStrong:#E1E0DD;--raised:#FDFCF9;--sunken:#EFEEEB;--border:#CBCAC8;--text:#2A2927;--textSecondary:#4E4D4B;--textTertiary:#646361;--textDisabled:#80807D;--accent:#2B5BA8;--onAccent:#F7FAFF;--accentSoft:#CEDEF6;--onAccentSoft:#17396E;--success:#007332;--successSoft:#E1EEE3;--onSuccessSoft:#00481C;--danger:#B02A2D;--warning:#865900;--info:#006A95;--c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--title2:18px;--title3:16px;--headline:14px;--body:14px;--callout:14px;--subhead:13px;--footnote:12px;--caption:11px}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--background:#121214;--surface:#1D1D1F;--surfaceStrong:#29292C;--raised:#38383B;--sunken:#09090B;--border:#434446;--text:#DEDEE0;--textSecondary:#B1B2B4;--textTertiary:#959698;--textDisabled:#6B6C6E;--accent:#8DB8F5;--onAccent:#060B14;--accentSoft:#263244;--onAccentSoft:#AFD0FF;--success:#5DC879;--successSoft:#132517;--onSuccessSoft:#9EE1AB;--danger:#FF8D85;--warning:#E6A024;--info:#28BBFE;--c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500}}
+html,body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+</style>
+<!--filo:head-->
+<style>
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--background);color:var(--text);font-size:var(--body);line-height:1.55;-webkit-font-smoothing:antialiased}
+main{max-width:760px;margin:0 auto;padding:28px 20px 48px}
+h1,h2,h3{line-height:1.25;font-weight:600;text-wrap:balance}
+h1{font-size:calc(var(--title2) * 1.4);margin:0 0 6px}
+h2{font-size:calc(var(--body) * 1.25);margin:32px 0 10px}
+h3{font-size:var(--headline);margin:22px 0 8px}
+p,ul,ol{margin:0 0 12px}
+ul,ol{padding-left:1.3em}
+li{margin:3px 0}
+p,li,dd,td,th,h1,h2,h3,figcaption{overflow-wrap:break-word}
+a{color:var(--accent);overflow-wrap:anywhere}
+strong{font-weight:600}
+code,pre{font:var(--footnote)/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+code{background:var(--surface);padding:1px 5px;border-radius:6px;overflow-wrap:anywhere}
+pre{background:var(--sunken);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow-x:auto}
+pre code{background:none;padding:0;overflow-wrap:normal}
+img,svg,video,canvas{max-width:100%;height:auto}
+hr{border:0;border-top:1px solid var(--border);margin:28px 0}
+.sub{color:var(--textSecondary);font-size:var(--callout);margin:0}
+.meta{color:var(--textTertiary);font-size:var(--footnote)}
+.num{font-variant-numeric:tabular-nums}
+/* The first thing to read: where it stands, in one line. */
+.status{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin:18px 0;padding:12px 14px;border-radius:14px;background:var(--surface)}
+.status>*{min-width:0}
+.status .meta{margin-left:auto}
+/* Key numbers. */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:18px 0}
+.cards>*{min-width:0}
+.card{padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:var(--raised)}
+.card .label{color:var(--textSecondary);font-size:var(--footnote)}
+.card .value{font-size:calc(var(--title2) * 1.15);font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.card .note{color:var(--textTertiary);font-size:var(--caption)}
+/* Wide things scroll in their own box, never the whole page. */
+.scroll{overflow-x:auto;margin:12px 0}
+table{width:100%;border-collapse:collapse;font-size:var(--subhead)}
+th{text-align:left;font-weight:500;color:var(--textTertiary);font-size:var(--footnote);padding:0 10px 6px;vertical-align:bottom}
+td{padding:8px 10px;border-top:1px solid color-mix(in srgb,var(--border) 60%,transparent);vertical-align:top}
+td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+/* Status pills. */
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:var(--caption);font-weight:500;white-space:nowrap;background:var(--surfaceStrong);color:var(--textSecondary)}
+.pill.done{background:var(--successSoft);color:var(--onSuccessSoft)}
+.pill.now{background:var(--accentSoft);color:var(--onAccentSoft)}
+.pill.wait{background:color-mix(in srgb,var(--warning) 18%,var(--background));color:var(--warning)}
+.pill.stop{background:color-mix(in srgb,var(--danger) 16%,var(--background));color:var(--danger)}
+.callout{margin:16px 0;padding:12px 14px;border-radius:14px;border-left:3px solid var(--accent);background:var(--sunken)}
+.callout.warn{border-left-color:var(--warning)}
+figure{margin:18px 0}
+figcaption{color:var(--textSecondary);font-size:var(--footnote);margin-top:6px}
+/* Controls, for a tool. */
+label{display:block;font-size:var(--footnote);color:var(--textSecondary);margin:10px 0 4px}
+input,select,textarea{width:100%;max-width:100%;font:inherit;color:var(--text);background:var(--raised);border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+button{font:inherit;font-weight:500;color:var(--onAccent);background:var(--accent);border:0;border-radius:10px;padding:8px 14px;cursor:pointer}
+button.quiet{color:var(--text);background:var(--surface)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.row>*{min-width:0}
+/* Tabs, for a page with several parts: without scripts every part shows. */
+.tabbar{display:flex;flex-wrap:wrap;gap:4px;margin:20px 0 4px;border-bottom:1px solid var(--border)}
+.tabbar button{color:var(--textSecondary);background:none;border-radius:10px 10px 0 0;padding:8px 12px;margin-bottom:-1px;border-bottom:2px solid transparent}
+.tabbar button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.js .pane:not(.active){display:none}
+@media (max-width:520px){main{padding:20px 14px 36px}h1{font-size:var(--title2)}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>TITLE</h1>
+  <p class="sub"><!-- FILL: what this is and the answer it gives, in one sentence --></p>
+</header>
+
+<!-- Where it stands now, for a page kept up to date (delete otherwise). Keep the date: it's how a reader knows how fresh it is. -->
+<div class="status">
+  <span class="pill now"><!-- FILL: In progress --></span>
+  <span><!-- FILL: the one thing to know --></span>
+  <span class="meta">As of <!-- FILL: 13 October 2026, 14:00 --></span>
+</div>
+
+<!-- Key numbers (delete if there are none). -->
+<div class="cards">
+  <div class="card"><div class="label"><!-- FILL: Spent --></div><div class="value"><!-- FILL: $1,240 --></div><div class="note"><!-- FILL: of $1,500 --></div></div>
+  <div class="card"><div class="label"><!-- FILL --></div><div class="value"><!-- FILL --></div></div>
+</div>
+
+<!-- Tabs (delete the bar and the pane wrappers for a single page). Each button's data-pane is its pane's id. -->
+<nav class="tabbar" role="tablist">
+  <button role="tab" data-pane="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-pane="details" aria-selected="false">Details</button>
+</nav>
+
+<section class="pane active" id="overview">
+  <h2><!-- FILL: a heading that says something --></h2>
+  <p><!-- FILL --></p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Item</th><th>Status</th><th class="r">Amount</th></tr></thead>
+      <tbody>
+        <tr><td><!-- FILL --></td><td><span class="pill done">Done</span></td><td class="r"><!-- FILL --></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="pane" id="details">
+  <h2><!-- FILL --></h2>
+  <!-- A chart or diagram: inline SVG with a viewBox and no fixed width, coloured with var(--c1)…var(--c4), and its point said in words too. -->
+  <figure>
+    <svg viewBox="0 0 600 160" role="img" aria-label="FILL: what it shows"><!-- FILL --></svg>
+    <figcaption><!-- FILL: what to see in it --></figcaption>
+  </figure>
+  <!-- A button that asks Filo about the page; the user confirms before it's sent:
+  <button class="quiet" onclick="filo.chat('FILL: the question')">Ask Filo</button> -->
+</section>
+
+<p class="meta"><!-- FILL: where the numbers come from, or delete --></p>
+</main>
+
+<!-- The data the page shows, for comparing when it's next updated (delete if it isn't kept up to date). Write < as < inside it. -->
+<script type="application/json" id="page-data">{"asOf": "FILL"}</script>
+
+<script>
+// Tabs: only with scripts on; otherwise every part shows.
+(() => {
+  const tabs = [...document.querySelectorAll('.tabbar [data-pane]')];
+  if (!tabs.length) return;
+  document.documentElement.classList.add('js');
+  const show = (name) => {
+    for (const tab of tabs) tab.setAttribute('aria-selected', String(tab.dataset.pane === name));
+    for (const pane of document.querySelectorAll('.pane')) pane.classList.toggle('active', pane.id === name);
+  };
+  for (const tab of tabs) tab.addEventListener('click', () => show(tab.dataset.pane));
+})();
+</script>
+</body>
+</html>

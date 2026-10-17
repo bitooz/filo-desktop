@@ -1,0 +1,4 @@
+# The code's own width: comments and code wrap at 120 columns. CI checks it (`cargo fmt --all --check`,
+# .github/workflows/checks.yml).
+max_width = 120
+use_small_heuristics = "Max"

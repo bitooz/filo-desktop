@@ -1,0 +1,143 @@
+<!doctype html>
+<!-- The desktop note page (src/screens/note_page.rs fills the {{…}} slots: the app's fonts,
+     the theme as CSS variables, the note-editor.js bundle and the note to show). The skill
+     editor (src/screens/skill_editor.rs) uses it too, with the line under the title. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{{FONTS}}
+:root {
+  /* The phone editor's (react-native-enriched-html) variables, from the theme. */
+  --et-h1-font-size: calc(30px * var(--scale)); --et-h1-font-weight: 700;
+  --et-h2-font-size: calc(26px * var(--scale)); --et-h2-font-weight: 700;
+  --et-h3-font-size: calc(22px * var(--scale)); --et-h3-font-weight: 700;
+  --et-h4-font-size: calc(20px * var(--scale)); --et-h4-font-weight: 700;
+  --et-h5-font-size: calc(17px * var(--scale)); --et-h5-font-weight: 700;
+  --et-h6-font-size: calc(16px * var(--scale)); --et-h6-font-weight: 700;
+  --et-link-color: var(--link); --et-link-text-decoration-line: none;
+  --et-placeholder-text-color: var(--text3);
+  --et-selection-color: var(--selection);
+  --et-code-bg-color: var(--code-bg); --et-code-color: var(--text);
+  --et-codeblock-bg-color: var(--code-bg); --et-codeblock-color: var(--text); --et-codeblock-border-radius: 10px;
+  --et-blockquote-border-color: var(--border); --et-blockquote-border-width: 3px; --et-blockquote-gap-width: 14px; --et-blockquote-color: var(--text);
+  --et-ul-bullet-color: var(--text2); --et-ul-bullet-size: 6px; --et-ul-gap-width: 12px; --et-ul-margin-left: 4px;
+  --et-ol-marker-color: var(--text2); --et-ol-gap-width: 8px; --et-ol-margin-left: 4px;
+  --et-checkbox-box-color: var(--accent); --et-checkbox-box-size: 18px; --et-checkbox-gap-width: 10px; --et-checkbox-margin-left: 2px;
+}
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font), 'Atkinson Hyperlegible Next', -apple-system, sans-serif;
+  font-size: var(--size);
+  line-height: var(--line);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--selection); }
+#note { max-width: 760px; margin: 0 auto; padding: 28px 24px 120px; box-sizing: border-box; min-height: 100vh; }
+#note[data-mode="read"] #title, #note[data-mode="edit"] #title-view { display: none; }
+#title, #title-view {
+  display: block; width: 100%; margin: 0; padding: 0; border: 0; outline: 0; resize: none; overflow: hidden;
+  background: transparent; color: inherit; font: inherit; font-weight: 700;
+  font-size: var(--title-size); line-height: var(--title-line);
+}
+#title::placeholder, #description::placeholder { color: var(--text3); }
+#title[readonly], #description[readonly] { cursor: default; }
+/* A skill's "when to use it": a line of secondary text under the title. */
+#description {
+  display: block; width: 100%; margin: 6px 0 0; padding: 0; border: 0; outline: 0; resize: none; overflow: hidden;
+  background: transparent; color: var(--text2); font: inherit;
+}
+#description[hidden] { display: none; }
+.rule { border: 0; height: 1px; background: var(--border); margin: 18px 0 20px; }
+#note[data-mode="read"] #title-view[hidden] + .rule { display: none; }
+a { color: var(--link); text-decoration: none; cursor: pointer; }
+
+/* Edit mode. */
+.eti-editor .tiptap { outline: none; white-space: pre-wrap; min-height: 40vh; caret-color: var(--accent); }
+.eti-editor h1, .eti-editor h2, .eti-editor h3, .eti-editor h4, .eti-editor h5, .eti-editor h6 { line-height: 1.3; }
+textarea.plain {
+  display: block; width: 100%; min-height: 40vh; margin: 0; padding: 0; border: 0; outline: 0; resize: none; overflow: hidden;
+  background: transparent; color: inherit; font: inherit; caret-color: var(--accent);
+}
+
+/* Read mode: one rhythm for every block, headings set off by space above. */
+#note[data-mode="read"] #body { overflow-wrap: anywhere; }
+#note[data-mode="read"] #body > :first-child { margin-top: 0; }
+#note[data-mode="read"] p, #note[data-mode="read"] ul, #note[data-mode="read"] ol,
+#note[data-mode="read"] blockquote, #note[data-mode="read"] pre, #note[data-mode="read"] table { margin: 0 0 0.8em; }
+#note[data-mode="read"] h1, #note[data-mode="read"] h2, #note[data-mode="read"] h3,
+#note[data-mode="read"] h4, #note[data-mode="read"] h5, #note[data-mode="read"] h6 { margin: 1.3em 0 0.45em; line-height: 1.3; }
+#note[data-mode="read"] h1 { font-size: var(--et-h1-font-size); }
+#note[data-mode="read"] h2 { font-size: var(--et-h2-font-size); }
+#note[data-mode="read"] h3 { font-size: var(--et-h3-font-size); }
+#note[data-mode="read"] h4 { font-size: var(--et-h4-font-size); }
+#note[data-mode="read"] h5 { font-size: var(--et-h5-font-size); }
+#note[data-mode="read"] h6 { font-size: var(--et-h6-font-size); }
+#note[data-mode="read"] ul, #note[data-mode="read"] ol { padding-left: 1.5em; }
+#note[data-mode="read"] li { margin: 0.2em 0; }
+#note[data-mode="read"] li::marker { color: var(--text2); }
+#note[data-mode="read"] li > p { margin: 0; }
+#note[data-mode="read"] blockquote { border-left: 3px solid var(--border); padding-left: 14px; color: var(--text2); }
+#note[data-mode="read"] code { background: var(--code-bg); border-radius: 5px; padding: 0.1em 0.35em; font-family: var(--mono), Menlo, monospace; font-size: 0.9em; }
+#note[data-mode="read"] pre { background: var(--code-bg); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
+#note[data-mode="read"] pre code { background: none; padding: 0; }
+#note[data-mode="read"] hr { border: 0; height: 1px; background: var(--border); margin: 1.4em 0; }
+#note[data-mode="read"] table { border-collapse: collapse; display: block; overflow-x: auto; }
+#note[data-mode="read"] th, #note[data-mode="read"] td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+#note[data-mode="read"] img { max-width: 100%; border-radius: 8px; }
+.task-item { list-style: none; margin-left: -1.5em !important; }
+.task-item.done { color: var(--text2); }
+.task-box {
+  display: inline-block; box-sizing: border-box; width: 18px; height: 18px; margin-right: 10px; vertical-align: -3px;
+  border: 2px solid var(--text2); border-radius: 5px; cursor: pointer;
+}
+.task-box.checked {
+  border-color: var(--accent);
+  background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center / 12px no-repeat;
+}
+.empty { color: var(--text2); font-size: calc(17px * var(--scale)); }
+
+/* The format toolbar, floating over the selection. */
+#toolbar {
+  position: absolute; top: 0; left: 0; display: none; z-index: 10;
+  background: var(--raised); border: 1px solid var(--border); border-radius: 12px; padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+#toolbar.shown { display: block; }
+#toolbar .buttons { display: flex; align-items: center; gap: 2px; }
+#toolbar.linking .buttons { display: none; }
+#toolbar button {
+  width: 32px; height: 30px; display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; padding: 0;
+}
+#toolbar button:hover { background: var(--hover); }
+#toolbar button svg { width: 16px; height: 16px; }
+#toolbar .sep { width: 1px; height: 18px; margin: 0 2px; background: var(--border); }
+#toolbar .link-form { display: none; }
+#toolbar.linking .link-form { display: block; }
+#toolbar .link-form input {
+  width: 260px; height: 30px; box-sizing: border-box; border: 0; outline: 0; padding: 0 8px;
+  background: transparent; color: var(--text); font: inherit; font-size: 14px;
+}
+</style>
+<style id="theme">:root{ {{THEME}} }</style>
+</head>
+<body>
+<div id="note" data-mode="read">
+  <div id="title-view"></div>
+  <textarea id="title" rows="1" placeholder="Title" maxlength="{{MAX_TITLE}}"></textarea>
+  <textarea id="description" rows="1" hidden></textarea>
+  <hr class="rule">
+  <div id="body"></div>
+</div>
+<div id="toolbar"></div>
+<script>{{SCRIPT}}</script>
+<script>
+FiloNote.show({{SHOW}});
+// Two frames on, the note is on screen: the app drops its skeleton.
+requestAnimationFrame(() => requestAnimationFrame(() => window.ipc.postMessage('{"type":"painted"}')));
+</script>
+</body>
+</html>

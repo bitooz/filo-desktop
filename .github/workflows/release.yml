@@ -1,0 +1,179 @@
+name: Release
+
+# Builds Filo for Mac with scripts/package.sh, one app for Apple silicon and Intel, signed with the Developer ID
+# identity, notarized and stapled, and publishes its disk image (Filo.dmg), its zip (Filo-<build>.zip) and latest.json
+# as a GitHub Release, marked as the latest. That's what people get: installed apps look for updates in the latest
+# release's downloads (…/releases/latest/download/latest.json, built into them by package.sh), and the website's
+# Download button links to …/releases/latest/download/Filo.dmg.
+#
+# Start it by hand (Actions › Release › Run workflow) with a build number: the release's tag is then
+# v<version>-<build> (v0.1.0-21), <version> being Cargo.toml's, made on the commit it ran on. Or push such a tag
+# yourself. Installed apps update to any higher build, so give each release a number above the last one published.
+#
+# Secrets (docs/how-it-works.md, "Checks and releases", says how to make each): MACOS_SIGNING_P12 (base64 of the
+# Developer ID Application certificate and its key, exported as .p12) and MACOS_SIGNING_P12_PASSWORD; APPLE_NOTARY_KEY
+# (base64 of an App Store Connect API key's .p8), APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER. Optional:
+# FILO_POSTHOG_KEY and FILO_POSTHOG_HOST, the PostHog project for the anonymous usage counts (docs/telemetry.md);
+# without them the build sends none.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: Build number, above the last one published
+        required: true
+        type: number
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.90.0
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build number and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_BUILD: ${{ inputs.build }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag=$GITHUB_REF_NAME
+            case "$tag" in
+              "v$version-"*) build=${tag#"v$version-"} ;;
+              *)
+                echo "::error::A release tag is v$version-<build> (Cargo.toml's version is $version), not $tag"
+                exit 1
+                ;;
+            esac
+          else
+            build=$INPUT_BUILD
+            tag="v$version-$build"
+          fi
+          case "$build" in
+            '' | *[!0-9]*) echo "::error::The build number is a whole number, not '$build'"; exit 1 ;;
+          esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::There's a release $tag already"
+            exit 1
+          fi
+          {
+            echo "BUILD=$build"
+            echo "TAG=$tag"
+            echo "VERSION=$version"
+            echo "APP_NAME=Filo"
+            echo "RELEASE_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag"
+            echo "FEED=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download"
+          } >> "$GITHUB_ENV"
+          echo "Releasing Filo $version, build $build, as $tag"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Import the signing identity and the notary key
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          for secret in MACOS_SIGNING_P12 MACOS_SIGNING_P12_PASSWORD APPLE_NOTARY_KEY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER; do
+            if [ -z "$(printenv "$secret")" ]; then
+              echo "::error::The repository secret $secret isn't set (docs/how-it-works.md, \"Checks and releases\")"
+              exit 1
+            fi
+          done
+          keychain="$RUNNER_TEMP/filo-signing.keychain-db"
+          password=$(openssl rand -hex 16)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$MACOS_SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # codesign only finds identities in keychains on the search list.
+          # shellcheck disable=SC2046 # one keychain per word
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # Only a Developer ID Application identity can be notarized, and installed apps only take an update signed
+          # with the key they were signed with.
+          identity=$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application' | grep -Eo '[0-9A-F]{40}' | head -1)
+          if [ -z "$identity" ]; then
+            echo "::error::MACOS_SIGNING_P12 holds no Developer ID Application identity"
+            security find-identity -v -p codesigning "$keychain"
+            exit 1
+          fi
+          echo "$APPLE_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          {
+            echo "SIGN_IDENTITY=$identity"
+            echo "KEYCHAIN=$keychain"
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8"
+            echo "NOTARY_KEY_ID=$APPLE_NOTARY_KEY_ID"
+            echo "NOTARY_ISSUER=$APPLE_NOTARY_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize and package
+        env:
+          TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+          FILO_POSTHOG_KEY: ${{ secrets.FILO_POSTHOG_KEY }}
+          FILO_POSTHOG_HOST: ${{ secrets.FILO_POSTHOG_HOST }}
+        run: scripts/package.sh
+
+      - name: Check the app and the disk image
+        run: |
+          app="dist/$APP_NAME.app"
+          archs=$(lipo -archs "$app/Contents/MacOS/filo")
+          echo "Architectures: $archs"
+          case "$archs" in *arm64*x86_64* | *x86_64*arm64*) ;; *) echo "::error::Not a universal app: $archs"; exit 1 ;; esac
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          xcrun stapler validate dist/Filo.dmg
+          spctl --assess --type execute --verbose=2 "$app"
+          # What installed apps read: this build, its zip in this release.
+          jq -e --argjson build "$BUILD" --arg zip "$RELEASE_URL/Filo-$BUILD.zip" \
+            '.build == $build and .file == $zip and .dmg.file == "Filo.dmg"' dist/latest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filo-${{ env.BUILD }}
+          path: |
+            dist/Filo.dmg
+            dist/Filo-${{ env.BUILD }}.zip
+            dist/latest.json
+          retention-days: 14
+
+      # A tag made here with the workflow's own token starts no other run, so a release started by hand isn't built
+      # twice. --latest: installed apps and the website go by the latest release.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$APP_NAME $VERSION, build $BUILD, from $GITHUB_SHA: one app for Apple silicon and Intel, signed and notarized.
+
+          Download Filo.dmg, open it and drag $APP_NAME onto Applications. Filo-$BUILD.zip is the same app for the in-app updater, and latest.json describes both (sizes and SHA-256)."
+          gh release create "$TAG" dist/Filo.dmg "dist/Filo-$BUILD.zip" dist/latest.json \
+            --target "$GITHUB_SHA" --title "$APP_NAME $VERSION ($BUILD)" --notes "$notes" --latest
+          echo "### [$APP_NAME $VERSION ($BUILD)]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/signing.p12"

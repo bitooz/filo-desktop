@@ -1,0 +1,83 @@
+name: Checks
+
+# On every pull request and every push to main: the formatting (rustfmt.toml), clippy with warnings as errors on the
+# checkout's build (tests and the `dev` feature) and on the packaged app's (`--no-default-features`, as
+# scripts/package.sh builds it), THIRD_PARTY_NOTICES.md against Cargo.lock, and the workspace's tests. The tests that
+# need a signed-in coding tool, the user's data or a secret are `#[ignore]`d (`-- --ignored` runs them on a Mac that
+# has those), so none of this needs a secret. docs/how-it-works.md, "Checks and releases", has the details.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Checked with one Rust release: clippy's lints change from one to the next, so moving to a newer one is a change of
+  # its own (here and in release.yml), with whatever its new lints ask for.
+  RUST_TOOLCHAIN: 1.90.0
+
+jobs:
+  format:
+    name: Format and notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      # The script reads each crate's licence files from Cargo's registry, for the Mac targets the app is built for.
+      - name: THIRD_PARTY_NOTICES.md lists Cargo.lock's crates
+        run: |
+          cargo fetch --locked
+          python3 scripts/third-party-notices.py --check
+
+  clippy:
+    name: Clippy
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+          # Pull requests read main's cache but don't write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy, the checkout's build
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy, the packaged app's build
+        run: cargo clippy --locked --workspace --no-default-features -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The app's tests (cargo test --bin filo), filo-local's with its end-to-end runs against fake CLIs, and
+      # filo-resample's.
+      - name: cargo test
+        run: cargo test --locked --workspace --no-fail-fast

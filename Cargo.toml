@@ -1,0 +1,141 @@
+[package]
+name = "filo-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "filo"
+path = "src/main.rs"
+
+# `dev`: the test runs and fixtures (smoke/drives.rs, the `FILO_OPEN` test windows and their screenshots, the scripted
+# checks in the screens), the developer's command-line modes (`--check`, `--record`, `--update`, `--avatar-colors`) and
+# filo-local's own `dev` (the checkout's computer-use helper and the test-only variables, crates/filo-local/Cargo.toml).
+# Every build has them but the packaged app's: scripts/package.sh builds with `--no-default-features`.
+[features]
+default = ["dev"]
+dev = ["dep:metal", "filo-local/dev"]
+
+# crates/filo-local builds and tests on its own (`cargo test -p filo-local`), without GPUI. The vendored gpui and
+# gpui-component stay out of the workspace.
+[workspace]
+members = [".", "crates/filo-local", "crates/filo-resample"]
+exclude = ["vendor"]
+
+# Clippy runs with warnings as errors on every pull request (.github/workflows/checks.yml). These lints stay off for
+# the whole workspace: they ask for a different shape (fewer arguments, named types for nested generics, boxed enum
+# variants, other method names) rather than pointing at a mistake.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+large_enum_variant = "allow"
+wrong_self_convention = "allow"
+enum_variant_names = "allow"
+# `[id.clone()]` in a test's assertion reads better than `std::slice::from_ref(&id)`, and `&[1..1]` is meant as one range.
+cloned_ref_to_slice_refs = "allow"
+single_range_in_vec_init = "allow"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+chrono = "0.4.45"
+dirs = "6.0.0"
+# Chats on this Mac and the local backend's agent turns: storage, Filo's MCP server and the coding tools' runner
+# (Claude Code, Codex, Muse Code, OpenCode; crates/filo-local).
+filo-local = { path = "crates/filo-local", default-features = false }
+# The picture viewer zoomed in: the part on screen drawn at the screen's pixels (crates/filo-resample).
+filo-resample = { path = "crates/filo-resample" }
+futures = "0.3.34"
+# runtime_shaders compiles GPUI's Metal shaders when the app starts, so building
+# doesn't need Xcode's Metal toolchain. Drop it for release builds once the
+# toolchain is installed (`xcodebuild -downloadComponent MetalToolchain`).
+gpui = { version = "0.2", features = ["runtime_shaders"] }
+gpui-component = { version = "0.5.1", features = ["webview"] }
+gpui-component-assets = "0.5.1"
+gpui_http_client = "0.2.2"
+hex = "0.4"
+iana-time-zone = "0.1.65"
+libc = "0.2"
+# Without `avif`, an encoder (rav1e and ~20 crates) nothing uses: Filo only decodes, and AVIF decoding is
+# `avif-native`. The other default formats stay, as a user can drop any picture into a chat.
+image = { version = "0.25", default-features = false, features = [
+    "rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp",
+] }
+# Round pen strokes in the image editor (GPUI draws paths with it, but doesn't re-export its cap and join types).
+lyon = "1.0"
+# gpui-component's web view. `transparent` lets a page (the note editor, an artifact, a glance) show the
+# window's background until it has drawn, instead of a white flash.
+lb-wry = { version = "0.53.3", default-features = false, features = ["transparent"] }
+open = "5.4.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# debug-embed: debug builds embed the assets too, instead of reading them from the
+# checkout at run time (on the Desktop, macOS asks for Desktop access and Filo waits).
+# include-exclude: the `#[include]` filters in assets.rs.
+rust-embed = { version = "8.12.0", features = ["debug-embed", "include-exclude"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Checks downloaded updates (updater.rs); short names for the scheduler's launch agent (launch_agent.rs), cached link
+# previews (file_preview.rs), and the files a video or a document is opened from (video_player.rs, file_view.rs).
+sha2 = "0.10"
+tokio = { version = "1.53.1", features = ["full"] }
+# Live voice transcription's socket.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+# Keep debug builds small: GPUI and its dependencies are huge with full debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
+# Debug builds are the app day to day; unoptimised, a zoomed-in picture took 10 s to draw sharp.
+[profile.dev.package.filo-resample]
+opt-level = 3
+
+# No symbol table in the app: nothing reads its backtraces, and it's several MB.
+[profile.release]
+strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+# Reading back a test window's frame for its screenshot (window_shot.rs, `dev` builds); the version GPUI draws with.
+metal = { version = "0.29", optional = true }
+# AppKit calls GPUI doesn't make (window dragging from our own title areas, the menu bar item, the pet's and the
+# notices' windows, the pasteboard, …), with objc2 for the newer ones.
+objc = "0.2"
+objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+    "std", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioRecorder", "AVAudioSettings",
+    "AVAudioTime", "AVAudioTypes", "block2",
+] }
+# The framework crates' default features turn on every class they have (and pull in the frameworks those use): only the
+# ones used here are named, for these two above too.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std", "objc2-core-foundation", "NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSString", "NSURL",
+    "NSValue",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "UNError", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotification", "UNNotificationResponse", "UNNotificationTrigger", "UNNotificationSound", "UNNotificationSettings", "UNNotificationAction", "UNNotificationCategory", "block2"] }
+raw-window-handle = "0.6"
+
+[dependencies.resvg]
+# Draws the menu bar item's mark and the app icons (menu_bar.rs, app_icon.rs), and turns on raster images in GPUI's
+# SVG renderer (Cargo unifies features): the Artifacts tab icon is the app's PNG glyph wrapped in SVG.
+version = "0.45"
+default-features = false
+features = ["raster-images"]
+
+# Our copy of gpui-component 0.5.1 with Filo's fixes (its markdown, menus, inputs, scrollbars, web views, …). What
+# changed and why: vendor/gpui-component/FILO.md.
+# And of gpui 0.2.2 with fixes to truncated text and to native views moving with what it draws: vendor/gpui/FILO.md.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+gpui = { path = "vendor/gpui" }
