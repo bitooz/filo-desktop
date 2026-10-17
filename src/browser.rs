@@ -227,6 +227,9 @@ thread_local! {
     /// The tab the browser window shows.
     static SHOWN: RefCell<Option<String>> = const { RefCell::new(None) };
     static SERVING: Cell<bool> = const { Cell::new(false) };
+    /// The socket file this Filo bound (device and inode), the only one `quit` takes away: another Filo on the same
+    /// folder, whose `listen` failed, leaves the first one's socket alone.
+    static BOUND: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
     /// Held while any tab is open (`native::Awake`).
     static AWAKE: RefCell<Option<native::Awake>> = const { RefCell::new(None) };
     /// Tabs whose page closed itself (window.close()), closed by `init`'s task: not inside WebKit's call.
@@ -632,6 +635,7 @@ fn listen(
     let _ = std::fs::remove_file(path);
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    BOUND.with(|bound| bound.set(socket_file(path)));
     std::thread::Builder::new().name("browser-socket".into()).spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -694,9 +698,18 @@ pub async fn remove_test_store(cx: &AsyncApp) {
 
 /// Takes the socket away when Filo quits.
 pub fn quit() {
-    if SERVING.with(Cell::get) {
-        let _ = std::fs::remove_file(filo_local::browser_mcp::socket_path(&local_dir()));
+    take_socket_away(&filo_local::browser_mcp::socket_path(&local_dir()));
+}
+
+fn take_socket_away(path: &std::path::Path) {
+    if BOUND.with(Cell::get).is_some_and(|bound| socket_file(path) == Some(bound)) {
+        let _ = std::fs::remove_file(path);
     }
+}
+
+fn socket_file(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
 }
 
 struct Reply {
@@ -1862,5 +1875,37 @@ mod tests {
         // A short drag still moves in several steps; one that goes nowhere is one move on the spot.
         assert!(drag_path((0., 0.), (6., 0.)).len() >= 6);
         assert_eq!(drag_path((5., 5.), (5., 5.)), vec![(5., 5.)]);
+    }
+
+    /// A second Filo on the same folder, whose `listen` fails, leaves the first one's socket on quit; the first takes
+    /// away only the file it bound. (Each thread stands for one Filo: `BOUND` is thread-local.)
+    #[test]
+    fn quitting_takes_away_only_the_socket_it_bound() {
+        let dir = std::env::temp_dir().join(format!("filo-sock-{}", std::process::id()));
+        let path = dir.join("browser.sock");
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        listen(&path, tx.clone()).unwrap();
+        let second = {
+            let (path, tx) = (path.clone(), tx.clone());
+            std::thread::spawn(move || {
+                assert!(listen(&path, tx).is_err());
+                take_socket_away(&path);
+            })
+        };
+        second.join().unwrap();
+        assert!(path.exists(), "the second Filo took the first one's socket away");
+        take_socket_away(&path);
+        assert!(!path.exists());
+        // The first one's file gone and another Filo's socket in its place: quitting leaves that one too.
+        listen(&path, tx.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let third = {
+            let (path, tx) = (path.clone(), tx.clone());
+            std::thread::spawn(move || listen(&path, tx).unwrap())
+        };
+        third.join().unwrap();
+        take_socket_away(&path);
+        assert!(path.exists(), "the first Filo took another one's socket away");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

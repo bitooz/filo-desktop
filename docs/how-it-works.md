@@ -615,7 +615,8 @@ user opens it from Window › Browser (⇧⌘B); agents work it in the backgroun
   `browser_dialog`, `browser_tabs`, `browser_close` and `browser_ask_user` (`NAMES`, which a test holds to the list
   `tools` gives). The MCP server asks the app over a Unix socket,
   `local/browser.sock` (mode 0600), one JSON line each way; the app answers on its main thread (`browser::init`,
-  `handle`). Without the app open, the tools say Filo has to be open. A screenshot comes back as an image block. Every
+  `handle`). A second Filo on the same folder finds the socket answering and leaves it; on quit, Filo removes only the
+  socket file it bound itself (`BOUND`, its device and inode). Without the app open, the tools say Filo has to be open. A screenshot comes back as an image block. Every
   engine's instructions say the browser is always theirs (engine.rs `capabilities`), and the composer's "@" list offers
   "@browser" (see the skills above).
 - **Reading and acting** (browser/page.js): runs in a JavaScript world of Filo's own (`callAsyncJavaScript` in
