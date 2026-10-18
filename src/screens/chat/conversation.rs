@@ -3136,7 +3136,7 @@ impl Conversation {
         let (media_line, media_only) =
             if has_bubble { (media.map(|media| media.mb(px(space::XS))), None) } else { (None, media) };
         for (index, file) in files.iter().enumerate() {
-            bubble = bubble.child(render_file(&key, index, file, user, cx));
+            bubble = bubble.child(render_file(&key, index, file, user, window, cx));
         }
         if let Some(voice) = &message.voice_recording {
             let url = voice.url.clone().or_else(|| voice::uploading_voice_url(&id));
@@ -5108,13 +5108,13 @@ fn render_media(
     div().flex().flex_col().gap(px(GAP)).children(row_divs)
 }
 
-fn render_file(id: &str, index: usize, file: &Attachment, user: bool, cx: &App) -> AnyElement {
+fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let colors = *cx.colors();
     let fg = if user { colors.on_user_bubble } else { colors.on_assistant_bubble };
-    if file.content_type.starts_with("audio/") {
-        // It plays from this Mac's copy, like a voice message.
-        let url = file.local_file.as_ref().map(|path| format!("file://{}", path.display()));
-        return render_voice(&format!("{id}-{index}"), url, 0., &file.name, user, cx);
+    if file.content_type.starts_with("audio/") || crate::audio_row::is_audio_name(&file.name) {
+        // It plays in place from this Mac's copy (audio_row.rs).
+        let key = format!("{id}-{index}");
+        return crate::audio_row::row(&key, file.local_file.as_deref(), &file.name, 300., fg, window, cx);
     }
     let preview = preview_item(file);
     let row = div()

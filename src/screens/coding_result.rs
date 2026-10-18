@@ -1,7 +1,7 @@
 // A coding round's result (`coding:roundResult`, local_backend/handoff.rs), opened from a chat message's Open proof:
 // the round's result.md as the tool reported it, with the round's screenshots where the markdown puts them, as a repo's README shows them, and its recordings as a frame from each with the play
 // button and its length. Screenshots and recordings open in the app's viewer (media_viewer.rs), where a recording
-// plays and the arrows step through the rest; logs open in Quick Look. Only the round's own uploads
+// plays and the arrows step through the rest; its sounds play in place (audio_row.rs); logs open in Quick Look. Only the round's own uploads
 // become pictures (`segments`); the markdown is drawn untrusted, so a picture it points at elsewhere is a link and
 // nothing else is fetched.
 //
@@ -39,6 +39,8 @@ pub(crate) const PAGE_WIDTH: f32 = 820.;
 const PICTURE_WIDTH: f32 = 640.;
 /// The tallest an inline screenshot is drawn.
 const PICTURE_HEIGHT: f32 = 720.;
+/// A sound's card (audio_row.rs), as wide as a file's.
+const AUDIO_WIDTH: f32 = 420.;
 /// Up to this many rounds the switcher shows each one's number; past it, "‹ Round 5 of 9 ›".
 const ROUND_NUMBERS: u32 = 6;
 /// The switcher's room from the bar's end (which has `space::SM` of its own): it ends as far from the window's right
@@ -487,6 +489,29 @@ impl CodingResultScreen {
                     Some(file) if file.kind == "video" => {
                         crate::smoke::tracked("coding-result-video", inline_video(file, index, opens(file), cx))
                     }
+                    // A sound plays in place (audio_row.rs).
+                    Some(file) if crate::audio_row::is_audio_name(&file.name) => {
+                        let inset = space::SM + 2.;
+                        let file_path = file.local_file();
+                        let row = crate::audio_row::row(
+                            &format!("coding-result-{key}-{index}"),
+                            file_path.as_deref(),
+                            &file.name,
+                            AUDIO_WIDTH - inset * 2.,
+                            colors.text,
+                            window,
+                            cx,
+                        );
+                        div()
+                            .max_w(px(AUDIO_WIDTH))
+                            .p(px(inset))
+                            .rounded(px(radius::LG))
+                            .bg(colors.surface)
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(row)
+                            .into_any_element()
+                    }
                     Some(file) => div()
                         .max_w(px(420.))
                         .p(px(space::SM + 2.))
@@ -744,9 +769,10 @@ fn segments(markdown: &str, files: &[(String, String)], urls: &HashMap<String, S
             continue;
         }
         let name = ref_name(target);
-        // Pictures and recordings show in place; any other file embedded (`![log](tests.log)`) shows as its row.
+        // Pictures, recordings and sounds show in place; any other file embedded (`![log](tests.log)`) shows as its row.
         let kind = kinds.get(name.as_str()).copied();
-        if matches!(kind, Some("image" | "video")) || (embedded && kind.is_some()) {
+        let sound = kind.is_some() && crate::audio_row::is_audio_name(&name);
+        if matches!(kind, Some("image" | "video")) || sound || (embedded && kind.is_some()) {
             // A list item holding only the picture leaves its bullet behind; drop it with the picture.
             let trimmed = text.trim_end_matches([' ', '\t']);
             let line_start = trimmed.rfind('\n').map(|at| at + 1).unwrap_or(0);
@@ -951,6 +977,12 @@ after.png and plan.pdf go as they are: nothing reads them. They may show somethi
         assert_eq!(
             segments("Proof:\n\n![tests.log](<tests.log>)", &files, &urls),
             vec![Segment::Text("Proof:\n\n".into()), Segment::Media("tests.log".into())]
+        );
+        // A sound the round saved plays in place, linked or embedded.
+        let sounds = vec![("take.mp3".to_string(), "file".to_string())];
+        assert_eq!(
+            segments("Listen: [the take](take.mp3)", &sounds, &HashMap::new()),
+            vec![Segment::Text("Listen: ".into()), Segment::Media("take.mp3".into())]
         );
         assert_eq!(strip_title("# Round 1: Fix\n\nBody"), "Body");
     }

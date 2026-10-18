@@ -394,7 +394,11 @@ impl MediaViewer {
             let saved = saving.await;
             this.update(cx, |this, cx| {
                 this.video = match saved.map(|path| Player::open(&path)) {
-                    Ok(Some(player)) => Video::Playing { _ticker: Self::tick(player.clone(), cx), player },
+                    Ok(Some(player)) => {
+                        // One sound at a time: a sound playing in a chat stops for the video.
+                        crate::media::stop(cx);
+                        Video::Playing { _ticker: Self::tick(player.clone(), cx), player }
+                    }
                     Ok(None) => Video::Failed("This video can’t play here.".into()),
                     Err(error) => Video::Failed(format!("Couldn’t load the video: {error}").into()),
                 };

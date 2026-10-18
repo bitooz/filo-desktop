@@ -5,6 +5,7 @@
 mod app;
 mod app_icon;
 mod assets;
+mod audio_row;
 mod avatar_colors;
 mod avatars;
 mod backend;

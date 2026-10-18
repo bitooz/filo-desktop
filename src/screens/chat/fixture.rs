@@ -10,7 +10,9 @@
 // `FILO_FIXTURE_TASKS=<n>` adds that many more working coding tasks (a popover long enough to scroll),
 // `FILO_FIXTURE_REPLIES=1` has two answers say what they answer, one with a reply link and one without, and
 // `FILO_FIXTURE_BROWSER=<name>` (with `:agent`) names the agent <name> and has it work in Filo's browser, its pill at
-// the header's end (agents.rs `browser_pill`).
+// the header's end (agents.rs `browser_pill`). `FILO_FIXTURE_AUDIO=<file>,<file>` ends the chat with those sound files
+// sent, the first by the user and the rest by Filo, each in its audio row (audio_row.rs; a test window plays them
+// muted), and the plan's `audio` step logs the sound playing or paused.
 //
 // `FILO_FIXTURE_DRIVE=1` clicks and types through it with in-app AppKit events (smoke.rs `native_input`), logging each
 // step and saving window screenshots to `FILO_FIXTURE_SHOTS` (and frames for a recording to `FILO_FIXTURE_FRAMES`),
@@ -128,6 +130,7 @@ impl ChatFixture {
             messages.insert(6, again);
         }
         messages.extend(media_messages(now));
+        messages.extend(audio_messages(now));
         let detail: Detail = serde_json::from_value(json!({
             "session": { "_id": "fixture-chat", "title": "Disk space", "seenUntil": now },
             "messages": messages,
@@ -163,8 +166,9 @@ impl ChatFixture {
             // Its two Claude Code tasks.
             conversation.coding_sessions = sessions;
             let mut requests = coding_requests::fixture_requests(now);
-            // With the answers' links (`FILO_FIXTURE_REPLIES`), no open questions: their panel would cover them.
-            if std::env::var_os("FILO_FIXTURE_REPLIES").is_some() {
+            // With the answers' links (`FILO_FIXTURE_REPLIES`) or sounds (`FILO_FIXTURE_AUDIO`), no open questions:
+            // their panel would cover them.
+            if std::env::var_os("FILO_FIXTURE_REPLIES").is_some() || std::env::var_os("FILO_FIXTURE_AUDIO").is_some() {
                 requests.retain(|request| request.state == "answered");
             }
             conversation.load_fixture(detail, requests, cx);
@@ -272,6 +276,25 @@ fn media_messages(now: f64) -> Vec<serde_json::Value> {
         message("m3", 0.8, "user", &["tiny", "dark"]),
         message("m4", 0.4, "assistant", &["wide", "transparent", "light"]),
     ]
+}
+
+/// `FILO_FIXTURE_AUDIO=<file>,<file>`: the first sent by the user, the rest by Filo, played from where they are.
+fn audio_messages(now: f64) -> Vec<serde_json::Value> {
+    let Ok(files) = std::env::var("FILO_FIXTURE_AUDIO") else { return Vec::new() };
+    files
+        .split(',')
+        .filter(|file| !file.is_empty())
+        .enumerate()
+        .map(|(index, file)| {
+            let path = std::path::Path::new(file);
+            let name = path.file_name().map_or_else(|| file.to_string(), |name| name.to_string_lossy().into_owned());
+            let size = std::fs::metadata(path).map_or(0., |meta| meta.len() as f64);
+            let content_type = crate::screens::chat::attachments::content_type_for(path);
+            let attachment = json!({ "storageId": format!("sound-{index}"), "name": name, "contentType": content_type, "size": size, "localFile": file });
+            let role = if index == 0 { "user" } else { "assistant" };
+            json!({ "_id": format!("s{index}"), "_creationTime": now - (0.3 - index as f64 * 0.01) * MINUTE, "role": role, "content": "", "attachments": [attachment] })
+        })
+        .collect()
 }
 
 impl ChatFixture {
@@ -680,6 +703,7 @@ fn drive(fixture: Entity<ChatFixture>, window: &mut Window, cx: &mut App) {
                     eprintln!("fixture: typed {arg:?}: {}", panel(cx));
                 }
                 "panel" => eprintln!("fixture: panel {}", panel(cx)),
+                "audio" => eprintln!("fixture: audio {:?}", cx.update(|cx| crate::media::now_playing(cx)).ok().flatten()),
                 // `layout:<message id>`: the composer's height, the chat's scroll, that message's bubble and the panel's
                 // box, to show what moves (nothing should, as the panel comes, changes and goes).
                 "layout" => {

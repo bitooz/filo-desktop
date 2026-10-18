@@ -5,7 +5,8 @@
 // Esc, Space and the arrows work as they do over a picture. A native view draws above everything GPUI paints, so
 // nothing of the viewer's goes over that box. The view follows the box each frame the element is drawn, and leaves the
 // window with the player. It plays the file on this Mac (file_preview `download`). AVFoundation decodes and draws it, so
-// playing costs GPUI no frames.
+// playing costs GPUI no frames. A sound (an audio file, a voice message: media.rs) plays through the same player, with
+// no view (`open_audio`).
 //
 // Before it plays, a video shows as its poster (`poster`): the still a shared result's page shows for it
 // (result_share.rs) and its length, made once from the file and kept in a temporary folder, with the play button over
@@ -34,6 +35,12 @@ impl Player {
     /// The video at `path`; `None` when AVFoundation can't open it.
     pub fn open(path: &Path) -> Option<Rc<Self>> {
         native::NativePlayer::new(path).map(|native| Rc::new(Player { native }))
+    }
+
+    /// The sound at `path`, with no picture (media.rs `toggle`: an audio file in a chat or on a result page); it plays
+    /// once told to. `None` when AVFoundation can't open it.
+    pub fn open_audio(path: &Path) -> Option<Rc<Self>> {
+        native::NativePlayer::audio(path).map(|native| Rc::new(Player { native }))
     }
 
     /// The box the video shows in: it takes all the room its parent gives it, the picture fitted inside.
@@ -65,6 +72,11 @@ impl Player {
         self.native.play();
     }
 
+    /// Plays at `rate` times its speed (1.5 and 2 for a sound's speed button), keeping its pitch.
+    pub fn play_at(&self, rate: f32) {
+        self.native.set_rate(rate);
+    }
+
     /// Where it is, in seconds.
     pub fn time(&self) -> f64 {
         self.native.time()
@@ -77,8 +89,11 @@ impl Player {
 
     /// To `seconds` in: `exact` lands on that frame, else on the nearest one that's quick to show (while scrubbing).
     pub fn seek(&self, seconds: f64, exact: bool) {
-        let end = self.duration().unwrap_or(0.);
-        self.native.seek(seconds.clamp(0., end.max(0.)), exact);
+        let seconds = match self.duration() {
+            Some(end) => seconds.clamp(0., end),
+            None => seconds.max(0.),
+        };
+        self.native.seek(seconds, exact);
     }
 
     pub fn muted(&self) -> bool {
@@ -162,8 +177,11 @@ impl Element for PlayerElement {
         let player = self.player.clone();
         window.on_next_frame(move |window, _| {
             let over = window.painted_over(index, bounds);
-            // SAFETY: on the main thread; `player` holds its view.
-            unsafe { crate::web_holes::cut_view(player.native.view(), bounds, &over) };
+            let view = player.native.view();
+            if !view.is_null() {
+                // SAFETY: on the main thread; `player` holds its view.
+                unsafe { crate::web_holes::cut_view(view, bounds, &over) };
+            }
         });
     }
 }
@@ -337,7 +355,8 @@ mod native {
     const ITEM_FAILED: isize = 2;
 
     pub struct NativePlayer {
-        view: Retained<AnyObject>,
+        /// The picture's view; a sound has none.
+        view: Option<Retained<AnyObject>>,
         player: Retained<AnyObject>,
     }
 
@@ -363,37 +382,45 @@ mod native {
                 // its default), with nothing behind it, so the viewer's backdrop shows either side.
                 let _: () = msg_send![&*view, setLayer: &*layer?];
                 let _: () = msg_send![&*view, setWantsLayer: true];
-                Some(NativePlayer { view, player })
+                Some(NativePlayer { view: Some(view), player })
             }
+        }
+
+        pub fn audio(path: &Path) -> Option<Self> {
+            let url = file_url(path)?;
+            // SAFETY: as in `new`.
+            let player: Option<Retained<AnyObject>> =
+                unsafe { msg_send![AnyClass::get(c"AVPlayer")?, playerWithURL: &*url] };
+            Some(NativePlayer { view: None, player: player? })
         }
 
         /// Its view, which `place` puts in the window.
         pub fn view(&self) -> *const AnyObject {
-            Retained::as_ptr(&self.view)
+            self.view.as_ref().map_or(std::ptr::null(), Retained::as_ptr)
         }
 
         /// Into the window on the first call (and plays), then onto `bounds` (window points from the top left).
         pub fn place(&self, bounds: Bounds<Pixels>, window: &Window) {
-            let Some(parent) = content_view(window) else { return };
+            let (Some(view), Some(parent)) = (&self.view, content_view(window)) else { return };
             let (x, y) = (f64::from(f32::from(bounds.origin.x)), f64::from(f32::from(bounds.origin.y)));
             let (width, height) = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
             // SAFETY: as in `new`; `parent` is GPUI's view, alive while its window is.
             unsafe {
-                let superview: *mut AnyObject = msg_send![&*self.view, superview];
+                let superview: *mut AnyObject = msg_send![&**view, superview];
                 if superview != parent {
                     if !superview.is_null() {
-                        let _: () = msg_send![&*self.view, removeFromSuperview];
+                        let _: () = msg_send![&**view, removeFromSuperview];
                     }
-                    let _: () = msg_send![parent, addSubview: &*self.view];
+                    let _: () = msg_send![parent, addSubview: &**view];
                     let _: () = msg_send![&*self.player, play];
                 }
                 let flipped: bool = msg_send![parent, isFlipped];
                 let parent_bounds: NSRect = msg_send![parent, bounds];
                 let y = if flipped { y } else { parent_bounds.size.height - y - height };
                 let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
-                let current: NSRect = msg_send![&*self.view, frame];
+                let current: NSRect = msg_send![&**view, frame];
                 if current != frame {
-                    let _: () = msg_send![&*self.view, setFrame: frame];
+                    let _: () = msg_send![&**view, setFrame: frame];
                 }
             }
         }
@@ -411,6 +438,12 @@ mod native {
         pub fn pause(&self) {
             // SAFETY: as in `new`.
             unsafe { msg_send![&*self.player, pause] }
+        }
+
+        /// Plays at `rate` (AVPlayer keeps the pitch).
+        pub fn set_rate(&self, rate: f32) {
+            // SAFETY: as in `new`.
+            unsafe { msg_send![&*self.player, setRate: rate] }
         }
 
         pub fn time(&self) -> f64 {
@@ -463,7 +496,9 @@ mod native {
             // SAFETY: as in `new`.
             unsafe {
                 let _: () = msg_send![&*self.player, pause];
-                let _: () = msg_send![&*self.view, removeFromSuperview];
+                if let Some(view) = &self.view {
+                    let _: () = msg_send![&**view, removeFromSuperview];
+                }
             }
         }
     }

@@ -319,6 +319,26 @@ the composer says so and when voice messages are back (from another app, the pet
 recording made in a chat stays there to send again. If the live stream fails midway, Send turns the saved recording
 into text through the relay instead (`voiceRecordings:send`). In `dev` builds, `FILO_WORKER_ORIGIN` points Filo at another relay.
 
+## Sounds
+
+An audio file (mp3, m4a, wav, aac, ogg, flac and the like) in a chat's or the group's message, or saved by a coding
+round, plays where it is, in one row shared by both (`src/audio_row.rs`): a round play button, its waveform (the part
+played in the accent colour; a click or a drag along it goes there), the time played and its length, and a speed
+button (1×, 1.5×, 2×, for every sound), with the file's name under them. A click or Tab gives the row the keyboard, and
+Space then plays or pauses it. It plays from its file on this Mac, so a big file attached without a copy plays from
+where it is.
+
+Sounds play through the video player's AVFoundation player, with no picture (`video_player.rs` `open_audio`), and one
+at a time across the app (`media.rs` `Audio`): starting one stops the last, and so do recording a voice message and a
+video opening in the viewer. Voice messages play the same way. The waveform is made once per file, off the main thread:
+macOS's `afconvert` turns it into 4,000 8-bit samples a second, and each bar is the loudest of its stretch; it's kept in
+a temporary folder by the file's path, size and time (an hour of mp3 takes about five seconds the first time). Its
+length is the samples', since AVFoundation's can run past a sound's end. Artifact pages play their own `<audio>` in
+their web view (`screens/artifact_media.rs`).
+
+`FILO_FIXTURE_AUDIO=<file>,<file>` with `FILO_OPEN=coding-cards` ends that chat fixture with those files sent, played
+muted (every test window's sounds are), and the plan's `audio` step logs the sound playing or paused.
+
 ## The Feed
 
 The Feed is an optional page (Settings › Pages, off on a new install; Notes too). Topics, posts and the Feed's settings are in `local/filo.db` (crates/filo-local `feed`: `feed_topics`, `feed_posts`,
