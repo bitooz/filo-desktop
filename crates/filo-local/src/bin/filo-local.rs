@@ -79,7 +79,7 @@ fn send(args: &[String]) -> i32 {
     // Kept as the app keeps a file of the user's: a clone, never read.
     let mut files = Vec::new();
     for path in paths {
-        let content_type = content_type_for(&path);
+        let content_type = filo_local::attachments::content_type_for(&path);
         let saved = std::fs::metadata(&path).and_then(|meta| {
             let storage_id = filo_local::attachments::keep(store.root(), &path, content_type, true)?;
             Ok((storage_id, meta.len()))
@@ -157,21 +157,6 @@ fn send(args: &[String]) -> i32 {
     }
     eprintln!("replies: {} · stopped: {} · error: {}", report.replies, report.stopped, report.error.is_some());
     if report.error.is_some() || report.replies == 0 { 1 } else { 0 }
-}
-
-/// A file's content type by its extension, as the app's composer tells it.
-fn content_type_for(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "pdf" => "application/pdf",
-        "txt" | "log" => "text/plain",
-        "md" => "text/markdown",
-        "json" => "application/json",
-        _ => "application/octet-stream",
-    }
 }
 
 fn list() -> i32 {

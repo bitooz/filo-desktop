@@ -73,6 +73,10 @@ again whenever the local data changes.
 A message starts a turn in a worker, a process of its own (`filo --worker turn …`, the app's own binary, in a session of
 its own; `local_backend/workers.rs`) that runs crates/filo-local `turn::run`: the CLI runs with Filo's MCP server
 plugged in (`filo --local-mcp …`) and replies with its `send_message` tool, which appends to the conversation's file.
+Its `files` (up to 5 full paths on this Mac) go with the message: each is kept as Filo's own copy in
+`local/attachments/` (an APFS clone, else a copy, never a link: attachments.rs `keep_sent`), so it stays when the agent
+deletes its file, and shows as the user's attachments do (pictures and videos as tiles, the rest as file chips), in
+its chat or in the group. A path that isn't a full path, isn't there or is a folder sends nothing and says why.
 While turns run, a watcher notices the files growing and the conversation updates. A turn's state (working, done,
 failed) is read from the file, so it survives restarts. Stop asks the worker to end the CLI. In an agent's conversation
 the CLI is told it's that agent, with the agent's instructions.

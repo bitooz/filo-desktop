@@ -2,7 +2,8 @@
 // (`<root>/attachments/<uuid>.<ext>`, the name its storage id), and the user's message keeps it (store.rs
 // `Attachment`). A file from the user's Mac, of any size, is kept without reading it (`keep`): an APFS clone, else a
 // link to it. A turn hands the pictures to the engine as images (`engine::Input`), a text file's words in the prompt,
-// and every file's name and where it's saved.
+// and every file's name and where it's saved. An agent's message carries files the same way (mcp.rs `send_message`'s
+// `files`, `keep_sent`): always Filo's own copy, so they stay when the agent deletes its file.
 
 use std::fs;
 use std::io;
@@ -60,6 +61,54 @@ pub fn keep(root: &Path, path: &Path, content_type: &str, link: bool) -> io::Res
         fs::rename(&part, &target)?;
     }
     Ok(id)
+}
+
+/// Keeps the file at `path` an agent sends with its message (mcp.rs `send_message`), named and typed by its path: an
+/// APFS clone, else a copy, never a link, so it's still there when the agent deletes or changes its file.
+pub fn keep_sent(root: &Path, path: &Path) -> io::Result<Attachment> {
+    let content_type = content_type_for(path);
+    let storage_id = keep(root, path, content_type, false)?;
+    let file = root.join(DIR).join(&storage_id);
+    let size = fs::metadata(&file)?.len();
+    let name = path.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
+    Ok(Attachment { storage_id, name, content_type: content_type.into(), size, file, local_path: None })
+}
+
+/// A file's content type by its extension, as the composer, the CLI's `send --file` and an agent's `files` tell it.
+pub fn content_type_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
 }
 
 /// `clonefile(2)`: `to` shares `from`'s blocks until either changes. Fails across volumes and off APFS.

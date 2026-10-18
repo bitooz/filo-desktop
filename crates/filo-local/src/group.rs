@@ -32,7 +32,8 @@
 //
 // The user's message can come with files and pictures, saved as an agent's chat saves them (attachments.rs): the
 // group shows them, and every member answering in its thread gets them as they would in their own chat
-// (`thread_files`), and reads where they're saved in the group's latest messages (`transcript`).
+// (`thread_files`), and reads where they're saved in the group's latest messages (`transcript`). A member's post can
+// carry files too (`post_files`), which the group shows the same way.
 //
 // Members (Filo and the agents) are the app's agents (app_data.rs; `roster` reads them), so they come in as arguments.
 
@@ -775,6 +776,20 @@ pub fn post(
     post_with(db, speaker, text, asks, turn_id, now, |_, _| Ok(()))
 }
 
+/// `post`, with the files the member sends with it (mcp.rs `send_message`'s `files`, kept as the user's are): its
+/// text can then be empty.
+pub fn post_files(
+    db: &Db,
+    speaker: &str,
+    text: &str,
+    files: Vec<crate::store::Attachment>,
+    asks: Asks,
+    turn_id: Option<&str>,
+    now: i64,
+) -> Result<GroupMessage, String> {
+    post_full(db, speaker, text, files, asks, turn_id, now, |_, _| Ok(()))
+}
+
 /// `post`, with `also` written in the same transaction (a glance's card for the message, glances_mcp.rs).
 pub fn post_with(
     db: &Db,
@@ -785,8 +800,22 @@ pub fn post_with(
     now: i64,
     also: impl FnOnce(&rusqlite::Transaction, &GroupMessage) -> rusqlite::Result<()>,
 ) -> Result<GroupMessage, String> {
+    post_full(db, speaker, text, Vec::new(), asks, turn_id, now, also)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_full(
+    db: &Db,
+    speaker: &str,
+    text: &str,
+    files: Vec<crate::store::Attachment>,
+    asks: Asks,
+    turn_id: Option<&str>,
+    now: i64,
+    also: impl FnOnce(&rusqlite::Transaction, &GroupMessage) -> rusqlite::Result<()>,
+) -> Result<GroupMessage, String> {
     let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() && files.is_empty() {
         return Err("The message is empty.".into());
     }
     if text.chars().count() > MAX_MESSAGE_CHARS {
@@ -813,7 +842,8 @@ pub fn post_with(
                 .optional()?,
             None => None,
         };
-        let message = member_message(speaker, text, asks, thread, turn_id, now);
+        let mut message = member_message(speaker, text, asks, thread, turn_id, now);
+        message.attachments = files;
         insert_message(tx, &message, answers.as_deref())?;
         also(tx, &message)?;
         Ok(message)

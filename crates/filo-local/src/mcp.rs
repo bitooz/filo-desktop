@@ -3,7 +3,9 @@
 // The CLI starts one for each turn (`filo --local-mcp …` from the app, `filo-local mcp …` from a terminal) with the
 // chat and turn it serves, so everything it does lands in that chat. Its tools:
 //
-// - `send_message { text }`: a message to the user in the chat. The only way a reply reaches the chat. In a turn of the
+// - `send_message { text, files }`: a message to the user in the chat. The only way a reply reaches the chat. `files`
+//   are paths on this Mac sent with it: Filo keeps its own copy of each (attachments.rs `keep_sent`), shown as the
+//   user's own attachments are (pictures and videos as tiles, the rest as file chips). In a turn of the
 //   agents' group chat (`--group-speaker <filo or an agent's id>`), it posts in the group in that member's name
 //   (group.rs) instead, with an optional `ask` list of the members (or everyone) who answer next: only they do, never
 //   one its text @-names; the other tools still belong to the member's own conversation (`--chat`). A group turn run in
@@ -83,6 +85,8 @@ const PINNED: [&str; 15] = [
 pub const PROTOCOL: &str = "2025-06-18";
 /// One message at most this long (a runaway tool call shouldn't fill the disk).
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+/// Files one send_message carries at most, as the user's composer sends them.
+const MAX_FILES: usize = 5;
 
 /// Which chat and turn a server writes to.
 #[derive(Clone, Debug)]
@@ -367,11 +371,12 @@ fn tools(pages: Pages) -> Value {
     let mut tools = json!([{
         "name": "send_message",
         "title": "Send message",
-        "description": "Send a message to the user in this Filo chat. This is the only way the user sees anything from you: your plain text output is not shown. Markdown works. Send your whole reply in one message unless it reads better as a few short ones.",
+        "description": "Send a message to the user in this Filo chat. This is the only way the user sees anything from you: your plain text output is not shown. Markdown works. Send your whole reply in one message unless it reads better as a few short ones. To send pictures, videos or other files, list their paths in `files`.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "The message, in Markdown." }
+                "text": { "type": "string", "description": "The message, in Markdown." },
+                "files": files_property()
             },
             "required": ["text"],
             "additionalProperties": false
@@ -665,6 +670,75 @@ fn report_property() -> Value {
     })
 }
 
+/// send_message's `files`: files on this Mac sent with the message.
+fn files_property() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "maxItems": MAX_FILES,
+        "description": format!("Files on this Mac to send with the message, by their full paths (like \"/Users/me/Desktop/chart.png\"), up to {MAX_FILES}. Pictures and videos show in the chat as tiles the user opens to look at or play, other files as file chips they open. Filo keeps its own copy, so you can delete or change yours afterwards. `text` can be empty when you send files.")
+    })
+}
+
+/// The files sent with send_message (`files`), each kept as Filo's own copy. Every path is checked before any is kept,
+/// so a bad one sends nothing.
+fn sent_files(target: &Target, arguments: &Value) -> Result<Vec<store::Attachment>, String> {
+    let paths: Vec<&str> = match arguments.get("files") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(path)) => vec![path.as_str()],
+        Some(Value::Array(paths)) => paths
+            .iter()
+            .map(|path| path.as_str().ok_or("`files` is a list of paths, each a string."))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("`files` is a list of paths to files on this Mac.".into()),
+    };
+    if paths.len() > MAX_FILES {
+        return Err(format!(
+            "Up to {MAX_FILES} files per message ({} given): send the rest in another message.",
+            paths.len()
+        ));
+    }
+    let paths = paths.into_iter().map(checked_file).collect::<Result<Vec<_>, _>>()?;
+    // Beside the user's files (the data folder's attachments/, which turns read without asking), not the chats'.
+    let root = data_dir(target);
+    let mut kept: Vec<store::Attachment> = Vec::new();
+    for path in paths {
+        match crate::attachments::keep_sent(&root, &path) {
+            Ok(file) => kept.push(file),
+            Err(error) => {
+                forget(&kept);
+                return Err(format!("Couldn't keep a copy of {}: {error}. Nothing was sent.", path.display()));
+            }
+        }
+    }
+    Ok(kept)
+}
+
+/// A path in `files`, as a file that's there: a full path (`~/` is the home folder) to a file, not a folder.
+fn checked_file(given: &str) -> Result<PathBuf, String> {
+    let trimmed = given.trim();
+    let path = match trimmed.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest)),
+        None => Some(PathBuf::from(trimmed)),
+    }
+    .filter(|path| path.is_absolute())
+    .ok_or_else(|| {
+        format!("\"{given}\" in `files` isn't a full path: give each file's absolute path, like /Users/me/Desktop/chart.png. Nothing was sent.")
+    })?;
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(path),
+        Ok(meta) if meta.is_dir() => Err(format!(
+            "{} in `files` is a folder, not a file: send the files in it, or a .zip of it. Nothing was sent.",
+            path.display()
+        )),
+        Ok(_) => Err(format!("{} in `files` isn't a regular file. Nothing was sent.", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(format!("There's no file at {} (from `files`). Nothing was sent.", path.display()))
+        }
+        Err(error) => Err(format!("Couldn't open {} (from `files`): {error}. Nothing was sent.", path.display())),
+    }
+}
+
 /// The `ask` list sent with send_message or ask_agents: its names, one name given alone too.
 fn ask_list(arguments: &Value) -> Vec<&str> {
     match arguments.get("ask") {
@@ -678,24 +752,48 @@ const OWN_CHAT_LINE: &str = "Your own chat with the user shows it too, labelled 
 
 fn send_message(target: &Target, arguments: &Value) -> Result<String, String> {
     let text = arguments.get("text").and_then(Value::as_str).map(str::trim).unwrap_or_default();
-    if text.is_empty() {
-        return Err("send_message needs non-empty `text`.".into());
+    let sending_files = arguments.get("files").is_some_and(|files| match files {
+        Value::Array(paths) => !paths.is_empty(),
+        Value::Null => false,
+        _ => true,
+    });
+    if text.is_empty() && !sending_files {
+        return Err("send_message needs non-empty `text` (or `files` to send).".into());
+    }
+    if target.group_speaker.is_none() && text.len() > MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "The message is too long ({} KB, at most {} KB). Send it in parts.",
+            text.len() / 1024,
+            MAX_MESSAGE_BYTES / 1024
+        ));
     }
     if let Some(speaker) = &target.group_speaker {
         let db = Db::open(&target.db).map_err(|error| format!("Filo's database couldn't open: {error}"))?;
         let members = crate::group::members(&db);
         let asks = crate::group::asks(&ask_list(arguments), speaker, &members)?;
         let asked = crate::group::asked_names(&asks, speaker, &members);
-        let posted = crate::group::post(&db, speaker, text, asks, target.turn_id.as_deref(), crate::now_ms() as i64)?;
+        let files = sent_files(target, arguments)?;
+        let posted = crate::group::post_files(
+            &db,
+            speaker,
+            text,
+            files.clone(),
+            asks,
+            target.turn_id.as_deref(),
+            crate::now_ms() as i64,
+        )
+        .inspect_err(|_| forget(&files))?;
         if let Some(report) =
             arguments.get("report").and_then(Value::as_str).map(str::trim).filter(|report| !report.is_empty())
         {
             crate::group::set_report(&db, &posted.id, report)?;
         }
         if target.own_chat {
-            // The chat's line linking to the post; its text is what the chat's turn and later context go by.
+            // The chat's line linking to the post; its text is what the chat's turn and later context go by, its files
+            // the post's (shown while the post is gone too).
             let mut line = target.store.agent_message(&target.chat_id, posted.text, target.turn_id.clone());
             line.in_group = Some(posted.id);
+            line.attachments = posted.attachments;
             target
                 .store
                 .append(&target.chat_id, &line)
@@ -706,16 +804,26 @@ fn send_message(target: &Target, arguments: &Value) -> Result<String, String> {
             None => "Posted in the group. Everyone there sees it; it asks no one.".into(),
         });
     }
-    if text.len() > MAX_MESSAGE_BYTES {
-        return Err(format!(
-            "The message is too long ({} KB, at most {} KB). Send it in parts.",
-            text.len() / 1024,
-            MAX_MESSAGE_BYTES / 1024
-        ));
+    let files = sent_files(target, arguments)?;
+    let count = files.len();
+    let mut message = target.store.agent_message(&target.chat_id, text, target.turn_id.clone());
+    message.attachments = files;
+    target.store.append(&target.chat_id, &message).map_err(|error| {
+        forget(&message.attachments);
+        format!("Couldn't save the message: {error}")
+    })?;
+    Ok(match count {
+        0 => "Sent. The user sees it in the chat.".into(),
+        1 => "Sent with its file. The user sees it in the chat.".into(),
+        count => format!("Sent with its {count} files. The user sees it in the chat."),
+    })
+}
+
+/// Removes the copies kept for a message that wasn't sent.
+fn forget(files: &[store::Attachment]) {
+    for file in files {
+        let _ = std::fs::remove_file(&file.file);
     }
-    let message = target.store.agent_message(&target.chat_id, text, target.turn_id.clone());
-    target.store.append(&target.chat_id, &message).map_err(|error| format!("Couldn't save the message: {error}"))?;
-    Ok("Sent. The user sees it in the chat.".into())
 }
 
 fn memory_tool(target: &Target, name: &str, arguments: &Value) -> Result<String, String> {
@@ -1348,6 +1456,136 @@ mod tests {
             (line.role, line.text.as_str(), line.turn.as_deref(), line.in_group.as_deref()),
             (Role::Assistant, "Pasta tonight.", Some(turn.as_str()), Some(posted.id.as_str()))
         );
+        drop(db);
+        std::fs::remove_dir_all(store.root()).ok();
+    }
+
+    /// Calls send_message with `arguments`; its result.
+    fn send(target: &Target, arguments: Value) -> Value {
+        let request = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "send_message", "arguments": arguments } });
+        run(target, &request.to_string()).remove(0)["result"].clone()
+    }
+
+    fn kept_count(store: &Store) -> usize {
+        std::fs::read_dir(store.root().join(crate::attachments::DIR)).map_or(0, |dir| dir.count())
+    }
+
+    #[test]
+    fn send_message_sends_files_as_filos_own_copies_and_refuses_bad_paths() {
+        // As in the app: the data folder (`data`, with filo.db) and the agents' chats in agents/ below it.
+        let data = temp_store("mcp-files");
+        let store = Store::at(data.root().join("agents"));
+        let chat = store.create_chat(Engine::Claude).unwrap();
+        let target = Target {
+            store: store.clone(),
+            chat_id: chat.id.clone(),
+            turn_id: Some("turn-1".into()),
+            db: data.root().join(db::FILE),
+            group_speaker: None,
+            own_chat: false,
+            part: Part::All,
+        };
+        let listed = run(&target, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let schema = &listed[0]["result"]["tools"][0]["inputSchema"];
+        assert_eq!(
+            (schema["properties"]["files"]["type"].as_str(), schema["required"].clone()),
+            (Some("array"), json!(["text"]))
+        );
+        // The agent's own temp files.
+        let temp = store.root().join("agent-temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let (picture, video, report) = (temp.join("Chart.PNG"), temp.join("clip.mov"), temp.join("report.pdf"));
+        for (path, bytes) in [(&picture, &b"png bytes"[..]), (&video, b"mov bytes"), (&report, b"pdf bytes")] {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let paths = [&picture, &video, &report].map(|path| path.display().to_string());
+        let sent = send(&target, json!({ "text": "Here it is.", "files": paths }));
+        assert_eq!(sent["isError"], false, "{sent}");
+        assert_eq!(sent["content"][0]["text"], "Sent with its 3 files. The user sees it in the chat.");
+        let message = store.messages(&chat.id).unwrap().pop().unwrap();
+        assert_eq!((message.role, message.text.as_str()), (Role::Assistant, "Here it is."));
+        let shown: Vec<(&str, &str, u64)> = message
+            .attachments
+            .iter()
+            .map(|file| (file.name.as_str(), file.content_type.as_str(), file.size))
+            .collect();
+        assert_eq!(
+            shown,
+            [("Chart.PNG", "image/png", 9), ("clip.mov", "video/quicktime", 9), ("report.pdf", "application/pdf", 9)]
+        );
+        // Filo's own copies (clones, never links) beside the user's files, named as storage ids, still there when the
+        // agent deletes its files.
+        std::fs::remove_dir_all(&temp).unwrap();
+        for file in &message.attachments {
+            assert_eq!(crate::attachments::file(data.root(), &file.storage_id).as_ref(), Some(&file.file));
+            assert!(!std::fs::symlink_metadata(&file.file).unwrap().file_type().is_symlink());
+            assert!(file.local_path.is_none());
+        }
+        assert_eq!(std::fs::read(&message.attachments[0].file).unwrap(), b"png bytes");
+        assert!(message.attachments[1].storage_id.ends_with(".mov"));
+
+        // Files alone, `~/` the home folder.
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(&picture, b"png bytes").unwrap();
+        let alone = send(&target, json!({ "text": "", "files": [picture.display().to_string()] }));
+        assert_eq!(alone["content"][0]["text"], "Sent with its file. The user sees it in the chat.", "{alone}");
+        assert_eq!(store.messages(&chat.id).unwrap().pop().unwrap().attachments.len(), 1);
+        assert!(checked_file("~/").is_err_and(|error| error.contains("folder")));
+
+        // A bad path sends nothing and keeps nothing, and says which and why.
+        let (before, kept) = (store.messages(&chat.id).unwrap().len(), kept_count(&data));
+        let ok = picture.display().to_string();
+        let refused = |arguments: Value, says: &str| {
+            let result = send(&target, arguments);
+            let text = result["content"][0]["text"].as_str().unwrap_or_default().to_string();
+            assert!(result["isError"] == true && text.contains(says), "{says}: {result}");
+        };
+        refused(json!({ "text": "x", "files": [ok, "chart.png"] }), "\"chart.png\" in `files` isn't a full path");
+        let missing = temp.join("gone.png").display().to_string();
+        refused(json!({ "text": "x", "files": [ok, missing] }), &format!("There's no file at {missing}"));
+        refused(json!({ "text": "x", "files": [temp.display().to_string()] }), "is a folder, not a file");
+        refused(json!({ "text": "x", "files": vec![ok.clone(); 6] }), "Up to 5 files per message (6 given)");
+        refused(json!({ "text": "x", "files": [ok, 7] }), "each a string");
+        refused(json!({ "text": "x", "files": { "path": ok } }), "list of paths");
+        refused(json!({ "text": " ", "files": [] }), "needs non-empty `text` (or `files` to send)");
+        assert_eq!((store.messages(&chat.id).unwrap().len(), kept_count(&data)), (before, kept));
+        std::fs::remove_dir_all(data.root()).ok();
+    }
+
+    #[test]
+    fn a_group_post_carries_its_files_in_the_group_and_the_speakers_own_chat() {
+        let store = temp_store("mcp-group-files");
+        let chat = store.create_chat(Engine::Claude).unwrap();
+        let db_path = store.root().join(db::FILE);
+        let db = Db::open(&db_path).unwrap();
+        crate::group::add_user_message(&db, "thread-1", "@Chef a photo?", 1).unwrap();
+        let turn = crate::group::enqueue(&db, "thread-1", "chef", 1, "asked", true, 1).unwrap().unwrap();
+        let mut args = args_for(&store, &chat.id, &turn);
+        args.extend(own_chat_group_args("chef"));
+        args.extend(["--db".into(), db_path.display().to_string()]);
+        let target = Target::from_args(&args).unwrap();
+        let photo = store.root().join("pasta.jpg");
+        std::fs::write(&photo, b"jpg bytes").unwrap();
+        let sent = send(&target, json!({ "text": "", "files": [photo.display().to_string()] }));
+        assert_eq!(sent["isError"], false, "{sent}");
+        std::fs::remove_file(&photo).unwrap();
+        let (messages, _) = crate::group::messages(&db, 10).unwrap();
+        let posted = messages.last().unwrap();
+        assert_eq!((posted.speaker.as_deref(), posted.text.as_str()), (Some("chef"), ""));
+        assert_eq!(
+            posted.attachments.iter().map(|file| file.content_type.as_str()).collect::<Vec<_>>(),
+            ["image/jpeg"]
+        );
+        assert_eq!(std::fs::read(&posted.attachments[0].file).unwrap(), b"jpg bytes");
+        // Members read where it's saved; a preview names it.
+        assert!(posted.with_files("").contains("pasta.jpg (image/jpeg), saved at"));
+        assert_eq!(posted.summary(), "pasta.jpg");
+        let line = store.messages(&chat.id).unwrap().pop().unwrap();
+        assert_eq!((line.in_group.as_deref(), &line.attachments), (Some(posted.id.as_str()), &posted.attachments));
+        // A bad path posts nothing.
+        let refused = send(&target, json!({ "text": "Another", "files": ["/nowhere/at/all.png"] }));
+        assert_eq!(refused["isError"], true);
+        assert_eq!(crate::group::messages(&db, 10).unwrap().0.len(), messages.len());
         drop(db);
         std::fs::remove_dir_all(store.root()).ok();
     }

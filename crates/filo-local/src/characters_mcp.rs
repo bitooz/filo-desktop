@@ -196,10 +196,11 @@ fn generate_images(target: &Target, arguments: &Value) -> Result<String, String>
 }
 
 /// The pictures Codex made, shown in the turn's chat as a message of their own with them attached: copies, so what the
-/// user sees stays what Codex drew. Not in a group turn, whose messages carry no pictures.
+/// user sees stays what Codex drew. Not in a group turn, whose posts are the member's own: it sends them there with
+/// send_message's `files`.
 fn show_in_chat(target: &Target, pictures: &[&Path]) -> Result<(), String> {
     if target.group_speaker.is_some() {
-        return Err("the group chat can't show pictures".into());
+        return Err("in the group, send them with send_message's `files`".into());
     }
     let root = target.store.root();
     let attachments = pictures

@@ -433,40 +433,7 @@ pub fn mention(path: &Path) -> String {
 }
 
 pub fn content_type_for(path: &Path) -> String {
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_lowercase();
-    match extension.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "heic" => "image/heic",
-        "heif" => "image/heif",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "webm" => "video/webm",
-        "m4a" => "audio/mp4",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "aac" => "audio/aac",
-        "ogg" => "audio/ogg",
-        "pdf" => "application/pdf",
-        "txt" | "log" => "text/plain",
-        "md" => "text/markdown",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "html" | "htm" => "text/html",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
+    filo_local::attachments::content_type_for(path).to_string()
 }
 
 /// `imagePassesThrough`: a supported type, small enough, and no side over MODEL_IMAGE_MAX_SIDE (Claude's cap once a

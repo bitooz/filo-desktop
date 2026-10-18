@@ -1729,6 +1729,55 @@ mod tests {
     }
 
     #[test]
+    fn files_an_agent_posts_show_in_the_group_and_its_own_chat() {
+        let local = temp();
+        let chef_chat = add_agent(&local, "chef-id", "Chef");
+        let session = local.call("agents:openGroup", &json!({})).unwrap().as_str().unwrap().to_string();
+        let db = local.db().unwrap();
+        // What send_message's `files` keeps (mcp.rs): the agent's temp files, gone right after.
+        let (photo, menu) = (local.root.join("pasta.jpg"), local.root.join("menu.pdf"));
+        std::fs::write(&photo, b"jpg").unwrap();
+        std::fs::write(&menu, b"pdf").unwrap();
+        let files: Vec<_> =
+            [&photo, &menu].map(|path| filo_local::attachments::keep_sent(&local.root, path).unwrap()).into();
+        std::fs::remove_file(&photo).unwrap();
+        std::fs::remove_file(&menu).unwrap();
+        let posted =
+            group::post_files(db, "chef-id", "", files.clone(), group::Asks::default(), None, now_ms()).unwrap();
+        let mut line = Message::new(Role::Assistant, "", None);
+        line.in_group = Some(posted.id.clone());
+        line.attachments = files.clone();
+        local.agent_chats.append(&chef_chat, &line).unwrap();
+        for chat in [&session, &chef_chat] {
+            let detail = local.call("voiceSessions:detail", &json!({ "id": chat })).unwrap();
+            let message = detail["messages"].as_array().unwrap().last().unwrap().clone();
+            assert_eq!(message["role"], "assistant", "{message}");
+            let shown: Vec<(&str, &str, &str)> = message["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| {
+                    (
+                        file["name"].as_str().unwrap(),
+                        file["contentType"].as_str().unwrap(),
+                        file["localFile"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            let expected: Vec<(&str, &str, &str)> = files
+                .iter()
+                .map(|file| (file.name.as_str(), file.content_type.as_str(), file.file.to_str().unwrap()))
+                .collect();
+            assert_eq!(shown, expected);
+            assert_eq!((shown[0].1, shown[1].1), ("image/jpeg", "application/pdf"));
+        }
+        assert!(files.iter().all(|file| file.file.is_file()));
+        // The Agents tab's row names it.
+        assert_eq!(local.call("agents:group", &json!({})).unwrap()["last"]["preview"], "pasta.jpg, menu.pdf");
+        std::fs::remove_dir_all(&local.root).ok();
+    }
+
+    #[test]
     fn what_names_no_one_goes_to_filo_and_at_everyone_to_every_member_at_once() {
         let local = temp();
         let chef_chat = add_agent(&local, "chef-id", "Chef");
