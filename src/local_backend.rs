@@ -204,7 +204,7 @@ const DEFAULT_LIMIT: usize = 100;
 const PREVIEW_CHARS: usize = 120;
 /// A message's files, as the composer limits them (attachments.rs), and the copies it makes (its pictures made fit
 /// for the model): a file of the user's is kept whole, of any size (`keep_attachment`).
-const MAX_ATTACHMENTS: usize = 5;
+const MAX_ATTACHMENTS: usize = filo_local::attachments::MAX_PER_MESSAGE;
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Notes and tasks one message carries (note_share.rs, work_share.rs), and the notes' text together.
 const MAX_SHARED_NOTES: usize = 3;
@@ -359,19 +359,22 @@ fn routine_run(message: &Message) -> Option<filo_local::store::RoutineRun> {
     Some(filo_local::store::RoutineRun { title: title.to_string(), when: when.to_string() })
 }
 
-/// A message's files as the chat shows them (`Attachment`): drawn and opened from the copy saved here.
+/// A message's files as the chat shows them (`Attachment`): drawn and opened from the copy saved here, or an agent's
+/// file where it is. One that's no longer there is `gone`, with no file to draw or open.
 fn attachments_json(files: &[filo_local::store::Attachment]) -> Value {
     Value::Array(
         files
             .iter()
             .map(|file| {
+                let gone = !file.file.is_file();
                 json!({
                     "storageId": file.storage_id,
                     "name": file.name,
                     "contentType": file.content_type,
                     "size": file.size as f64,
                     "localPath": file.local_path,
-                    "localFile": file.file,
+                    "localFile": (!gone).then_some(&file.file),
+                    "gone": gone,
                 })
             })
             .collect(),
@@ -1220,8 +1223,10 @@ impl Local {
         let all = store.shared_messages(id).unwrap_or_default();
         let shown = filo_local::store::shown_of(&all);
         let has_more = shown.len() > limit;
-        let window: Vec<Message> =
+        let mut window: Vec<Message> =
             shown[shown.len().saturating_sub(limit)..].iter().map(|message| (*message).clone()).collect();
+        // An agent's files where they are now, found again when they were renamed or moved.
+        store.find_moved_files(id, &mut window);
         let window = &window[..];
         // A reply that reports a coding round carries its Open proof (local_backend/coding.rs).
         let proof = self.coding_results(window);
@@ -1404,6 +1409,7 @@ impl Local {
                     size,
                     file: saved,
                     local_path: arg(file, "localPath").map(str::to_string),
+                    bookmark: None,
                 })
             })
             .collect()

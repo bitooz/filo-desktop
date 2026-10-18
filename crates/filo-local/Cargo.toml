@@ -56,3 +56,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 # The apps' API keys and sign-in tokens are kept in the login Keychain (secrets.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+# A file an agent sends keeps a bookmark, so it's found again when it's renamed or moved (bookmark.rs); the
+# versions the app uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSError", "NSString", "NSURL"] }

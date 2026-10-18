@@ -3,6 +3,7 @@
 //   <root>/chats/<chat id>/chat.json       title, engine and model, the engine's session (written by the app, replaced whole)
 //   <root>/chats/<chat id>/messages.jsonl  one message per line, only ever appended
 //   <root>/chats/<chat id>/reactions.json  the user's reaction to a message, by its id (the app's, replaced whole)
+//   <root>/chats/<chat id>/moved.json      where an agent's files were found after they moved (the app's, replaced whole)
 //   <root>/workspace/                      the folder the CLI runs in (its sessions are kept per folder)
 //   <root>/workspace/.claude/skills/<name>/           copies of the user's skill folders (skills.rs) for Claude Code, made
 //                                                     by `write_skills`, with Filo's own (desktop-pet, and artifacts with
@@ -14,7 +15,7 @@
 // (replies). Neither rewrites the other's data: messages are appended with O_APPEND, one write per line, and only the
 // app replaces chat.json (through a temporary file and a rename). A torn or unreadable line is skipped on read.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -185,8 +186,9 @@ impl Message {
     }
 }
 
-/// A file sent with a user's message, as the composer uploaded it: a copy saved under the store's root
-/// (attachments.rs), which the chat shows and the turn hands to the engine.
+/// A file sent with a message. The user's, as the composer uploaded it: a copy saved under the store's root
+/// (attachments.rs), which the chat shows and the turn hands to the engine. An agent's (mcp.rs `send_message`'s
+/// `files`): the file where it is on this Mac, no copy (`storage_id` empty), with its `bookmark`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
@@ -194,11 +196,15 @@ pub struct Attachment {
     pub name: String,
     pub content_type: String,
     pub size: u64,
-    /// The saved copy.
+    /// The saved copy; an agent's file itself.
     pub file: PathBuf,
     /// Where the user keeps it: the message's text has this path where the file's chip was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// An agent's file's macOS bookmark (bookmark.rs, base64), which finds it when it's renamed or moved
+    /// (attachments.rs `moved_to`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<String>,
 }
 
 /// Where an agent's chat points at the group: it asked members there (`asked`), or a member asked it (`calledBy`),
@@ -619,6 +625,42 @@ impl Store {
             &dir.join("reactions.json"),
             &serde_json::to_vec_pretty(&reactions).map_err(io::Error::other)?,
         )
+    }
+
+    /// Where an agent's files in chat `id` were found after they moved (`find_moved_files`): by message id, then the
+    /// file's place in the message.
+    fn moved_files(&self, id: &str) -> HashMap<String, BTreeMap<usize, PathBuf>> {
+        let Ok(dir) = self.chat_dir(id) else { return HashMap::new() };
+        fs::read(dir.join("moved.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+    }
+
+    /// `messages` of chat `id` with each agent's file where it is now: where it was last found, else, once it's no
+    /// longer there, where its bookmark finds it (attachments.rs `moved_to`), which is kept for next time. Messages are
+    /// only ever appended, so that's kept beside them, as the reactions are.
+    pub fn find_moved_files(&self, id: &str, messages: &mut [Message]) {
+        if !messages.iter().flat_map(|message| &message.attachments).any(|file| file.bookmark.is_some()) {
+            return;
+        }
+        let mut moved = self.moved_files(id);
+        let mut found = false;
+        for message in messages.iter_mut() {
+            for (index, file) in message.attachments.iter_mut().enumerate() {
+                if let Some(path) = moved.get(&message.id).and_then(|files| files.get(&index)) {
+                    *file = crate::attachments::moved(file, path.clone());
+                }
+                if let Some(path) = crate::attachments::moved_to(file) {
+                    *file = crate::attachments::moved(file, path.clone());
+                    moved.entry(message.id.clone()).or_default().insert(index, path);
+                    found = true;
+                }
+            }
+        }
+        if found
+            && let Ok(dir) = self.chat_dir(id)
+            && let Ok(bytes) = serde_json::to_vec_pretty(&moved)
+        {
+            let _ = crate::files::write_atomic(&dir.join("moved.json"), &bytes);
+        }
     }
 
     /// Changes whenever a message is added (the messages file's size), for cheap polling while a turn runs.
@@ -1260,6 +1302,7 @@ pub(crate) mod tests {
             size: 74_752,
             file: store.root().join("attachments/id.png"),
             local_path: Some("/Users/me/shot.png".into()),
+            bookmark: None,
         };
         store.add_user_message_with(&chat.id, "", "t1", vec![file.clone()]).unwrap();
         let messages = Store::at(store.root()).messages(&chat.id).unwrap();
@@ -1270,6 +1313,41 @@ pub(crate) mod tests {
         let old: Message = serde_json::from_str(r#"{"id":"m","role":"user","text":"hi","at":1}"#).unwrap();
         assert!(old.attachments.is_empty());
         assert!(!serde_json::to_string(&old).unwrap().contains("attachments"));
+        fs::remove_dir_all(store.root()).ok();
+    }
+
+    #[test]
+    fn an_agents_file_that_moved_is_found_and_kept_found() {
+        let store = temp_store("moved-files");
+        let chat = store.create_chat(Engine::Claude).unwrap();
+        let work = store.root().canonicalize().unwrap().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let (chart, notes) = (work.join("chart.png"), work.join("notes.txt"));
+        fs::write(&chart, b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(&notes, b"notes").unwrap();
+        let mut sent = store.agent_message(&chat.id, "Here", None);
+        sent.attachments =
+            vec![crate::attachments::in_place(&chart).unwrap(), crate::attachments::in_place(&notes).unwrap()];
+        store.append(&chat.id, &sent).unwrap();
+        let shown = |store: &Store| {
+            let mut messages = store.messages(&chat.id).unwrap();
+            store.find_moved_files(&chat.id, &mut messages);
+            messages.pop().unwrap().attachments.into_iter().map(|file| (file.name, file.file)).collect::<Vec<_>>()
+        };
+        // Renamed: shown under its new name and path, and kept there (moved.json), not found again each time.
+        let renamed = work.join("chart v2.png");
+        fs::rename(&chart, &renamed).unwrap();
+        let expected = vec![("chart v2.png".to_string(), renamed.clone()), ("notes.txt".to_string(), notes.clone())];
+        assert_eq!(shown(&store), expected);
+        assert!(store.root().join("chats").join(&chat.id).join("moved.json").is_file());
+        assert_eq!(shown(&Store::at(store.root())), expected);
+        // Moved after that: found from where it was last.
+        fs::create_dir_all(work.join("done")).unwrap();
+        let moved = work.join("done/chart v2.png");
+        fs::rename(&renamed, &moved).unwrap();
+        assert_eq!(shown(&store)[0], ("chart v2.png".to_string(), moved.clone()));
+        // The message itself is as it was sent.
+        assert_eq!(store.messages(&chat.id).unwrap().pop().unwrap().attachments[0].file, chart);
         fs::remove_dir_all(store.root()).ok();
     }
 }

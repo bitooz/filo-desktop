@@ -533,23 +533,17 @@ pub fn proof_files(dir: &Path) -> Vec<ProofFile> {
     files
 }
 
+/// A proof file's kind (a picture the page shows, a video, else a file) and type, by its name (attachments.rs's table).
 fn proof_kind(name: &str) -> (&'static str, &'static str) {
-    let extension = name.rsplit_once('.').map(|(_, extension)| extension.to_lowercase()).unwrap_or_default();
-    match extension.as_str() {
-        "png" => ("image", "image/png"),
-        "jpg" | "jpeg" => ("image", "image/jpeg"),
-        "gif" => ("image", "image/gif"),
-        "webp" => ("image", "image/webp"),
-        "mp4" | "m4v" => ("video", "video/mp4"),
-        "mov" => ("video", "video/quicktime"),
-        "webm" => ("video", "video/webm"),
-        "txt" | "log" => ("file", "text/plain"),
-        "md" => ("file", "text/markdown"),
-        "json" => ("file", "application/json"),
-        "html" => ("file", "text/html"),
-        "pdf" => ("file", "application/pdf"),
-        _ => ("file", "application/octet-stream"),
-    }
+    let content_type = crate::attachments::content_type_for(Path::new(name));
+    let kind = if crate::attachments::is_image(content_type) {
+        "image"
+    } else if content_type.starts_with("video/") {
+        "video"
+    } else {
+        "file"
+    };
+    (kind, content_type)
 }
 
 // ---------------------------------------------------------------------------------------------------------------

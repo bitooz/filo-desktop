@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::backend::Backend;
 
-pub const MAX_CHAT_ATTACHMENTS: usize = 5;
+pub const MAX_CHAT_ATTACHMENTS: usize = filo_local::attachments::MAX_PER_MESSAGE;
 /// The most Filo reads into memory for a copy it makes: a picture made fit for the model, a pasted text. A larger
 /// picture goes as it is (the model is told where it is).
 pub const MAX_COPY_BYTES: usize = 25 * 1024 * 1024;
@@ -74,6 +74,7 @@ impl PendingAttachment {
             size: self.size as f64,
             local_path: self.local_path.as_ref().map(|path| path.to_string_lossy().into_owned()),
             local_file: self.preview.clone().filter(|file| decodes_here(file)),
+            gone: false,
         }
     }
 }
@@ -666,6 +667,7 @@ mod tests {
             size: 12.0 * 1024.0,
             local_path: path.map(str::to_string),
             local_file: None,
+            gone: false,
         };
         let pasted = "/Users/me/.config/filo/local/pasted/pasted-image-2026-10-10-191941.png";
         let files = vec![file(Some(pasted)), file(Some("/Users/me/Desktop/Screen Shot.png"))];
@@ -696,6 +698,7 @@ mod tests {
             size: 40.0 * 1024.0,
             local_path: Some(path.into()),
             local_file: None,
+            gone: false,
         };
         let (one, two) =
             ("/Users/me/.config/filo/pasted/pasted-image-1.png", "/Users/me/.config/filo/pasted/pasted-image-2.png");

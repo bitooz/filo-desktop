@@ -279,11 +279,10 @@ fn first_sentence(line: &str) -> &str {
 }
 
 fn chat_entry(message: &Message) -> Entry {
-    let text = [message.text.trim(), &attachments::names(&message.attachments)]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // An agent's own files are named with where they are, so it can find one it sent to change it.
+    let files = attachments::names(&message.attachments, message.role == Role::Assistant);
+    let text =
+        [message.text.trim(), &files].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n\n");
     Entry { id: message.id.clone(), at: message.at as i64, who: chat_who(message), text, short: chat_short(message) }
 }
 

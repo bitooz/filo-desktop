@@ -127,7 +127,9 @@ fn run_inner(store: &Store, runtime: &Runtime, chat_id: &str, turn_id: &str, on_
         Ok(dir) => dir,
         Err(error) => return failed(format!("Couldn't create the chats folder: {error}")),
     };
-    let messages = store.messages(chat_id).unwrap_or_default();
+    let mut messages = store.messages(chat_id).unwrap_or_default();
+    // The agent's files it sent, where they are now (a new session's seed names them).
+    store.find_moved_files(chat_id, &mut messages);
     let resumable = chat.session.as_ref().filter(|session| session.engine == engine);
     let resume = resumable.map(|session| session.id.clone());
     let known_instructions = resumable.and_then(|session| session.instructions.clone());
@@ -787,12 +789,14 @@ fn attended(messages: &[Message], turn_id: &str) -> bool {
 
 /// Filo's folders a turn's CLI reads without asking short of Full access (engine.rs `TurnSpec::readable`): the chats'
 /// files under `store_root` (the history its instructions point to), the files the user sent and the artifacts' pages,
-/// beside the database `db`.
+/// beside the database `db` (without one, the store's own, as the MCP server takes it: mcp.rs `Target::from_args`).
 pub(crate) fn readable(store_root: &Path, db: Option<&Path>) -> Vec<PathBuf> {
-    let beside_db = db
-        .into_iter()
-        .flat_map(|db| [crate::computer::root_of_db(db).join(crate::attachments::DIR), artifacts::folder_for(db)]);
-    std::iter::once(store_root.join("chats")).chain(beside_db).collect()
+    let db = db.map_or_else(|| store_root.join(crate::db::FILE), Path::to_path_buf);
+    vec![
+        store_root.join("chats"),
+        crate::computer::root_of_db(&db).join(crate::attachments::DIR),
+        artifacts::folder_for(&db),
+    ]
 }
 
 #[cfg(test)]
@@ -1255,6 +1259,7 @@ mod tests {
             size: 3,
             file: path.to_path_buf(),
             local_path: None,
+            bookmark: None,
         };
         let mut earlier = Message::new(Role::User, "see this", Some("t1".into()));
         earlier.attachments = vec![file("old.png", "image/png", &picture)];

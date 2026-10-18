@@ -517,6 +517,10 @@ impl Local {
     /// round's Open proof and a glance's card. An agent's own chat shows its posts this way too (local_backend.rs
     /// `detail`).
     pub(super) fn group_rows(&self, session: &str, messages: &[group::GroupMessage]) -> Result<Vec<Value>, String> {
+        // A member's files where they are now, found again when they were renamed or moved.
+        let mut messages = messages.to_vec();
+        group::find_moved_files(self.db()?, &mut messages);
+        let messages = &messages[..];
         // A member's post reporting a coding round carries its Open proof (local_backend/coding.rs).
         let proof = self.coding_results_by_turn(
             messages
@@ -1729,51 +1733,77 @@ mod tests {
     }
 
     #[test]
-    fn files_an_agent_posts_show_in_the_group_and_its_own_chat() {
+    fn files_an_agent_posts_show_where_they_are_found_when_moved_and_gone_when_deleted() {
         let local = temp();
         let chef_chat = add_agent(&local, "chef-id", "Chef");
         let session = local.call("agents:openGroup", &json!({})).unwrap().as_str().unwrap().to_string();
         let db = local.db().unwrap();
-        // What send_message's `files` keeps (mcp.rs): the agent's temp files, gone right after.
-        let (photo, menu) = (local.root.join("pasta.jpg"), local.root.join("menu.pdf"));
-        std::fs::write(&photo, b"jpg").unwrap();
+        // What send_message's `files` sends (mcp.rs): the agent's files, where they are.
+        let work = local.root.canonicalize().unwrap().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (photo, menu) = (work.join("pasta.jpg"), work.join("menu.pdf"));
+        std::fs::write(&photo, b"\xFF\xD8\xFF jpg").unwrap();
         std::fs::write(&menu, b"pdf").unwrap();
-        let files: Vec<_> =
-            [&photo, &menu].map(|path| filo_local::attachments::keep_sent(&local.root, path).unwrap()).into();
-        std::fs::remove_file(&photo).unwrap();
-        std::fs::remove_file(&menu).unwrap();
+        let files: Vec<_> = [&photo, &menu].map(|path| filo_local::attachments::in_place(path).unwrap()).into();
         let posted =
             group::post_files(db, "chef-id", "", files.clone(), group::Asks::default(), None, now_ms()).unwrap();
         let mut line = Message::new(Role::Assistant, "", None);
         line.in_group = Some(posted.id.clone());
         line.attachments = files.clone();
         local.agent_chats.append(&chef_chat, &line).unwrap();
-        for chat in [&session, &chef_chat] {
+        // Each file's name, type, the file shown (none once it's gone) and whether it's gone, in both places.
+        let shown_in = |chat: &str| -> Vec<(String, String, Option<String>, bool)> {
             let detail = local.call("voiceSessions:detail", &json!({ "id": chat })).unwrap();
             let message = detail["messages"].as_array().unwrap().last().unwrap().clone();
             assert_eq!(message["role"], "assistant", "{message}");
-            let shown: Vec<(&str, &str, &str)> = message["attachments"]
+            message["attachments"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|file| {
                     (
-                        file["name"].as_str().unwrap(),
-                        file["contentType"].as_str().unwrap(),
-                        file["localFile"].as_str().unwrap(),
+                        file["name"].as_str().unwrap().to_string(),
+                        file["contentType"].as_str().unwrap().to_string(),
+                        file["localFile"].as_str().map(str::to_string),
+                        file["gone"] == true,
                     )
                 })
-                .collect();
-            let expected: Vec<(&str, &str, &str)> = files
-                .iter()
-                .map(|file| (file.name.as_str(), file.content_type.as_str(), file.file.to_str().unwrap()))
-                .collect();
-            assert_eq!(shown, expected);
-            assert_eq!((shown[0].1, shown[1].1), ("image/jpeg", "application/pdf"));
+                .collect()
+        };
+        let row = |name: &str, content_type: &str, file: Option<&std::path::Path>| {
+            (name.to_string(), content_type.to_string(), file.map(|file| file.display().to_string()), file.is_none())
+        };
+        for chat in [&session, &chef_chat] {
+            assert_eq!(
+                shown_in(chat),
+                [row("pasta.jpg", "image/jpeg", Some(&photo)), row("menu.pdf", "application/pdf", Some(&menu))]
+            );
         }
-        assert!(files.iter().all(|file| file.file.is_file()));
         // The Agents tab's row names it.
         assert_eq!(local.call("agents:group", &json!({})).unwrap()["last"]["preview"], "pasta.jpg, menu.pdf");
+        // Renamed, and moved to another folder: still shown, under the names they have now.
+        let renamed = work.join("pasta night.jpg");
+        std::fs::rename(&photo, &renamed).unwrap();
+        std::fs::create_dir_all(work.join("old")).unwrap();
+        let moved = work.join("old/menu.pdf");
+        std::fs::rename(&menu, &moved).unwrap();
+        for chat in [&session, &chef_chat] {
+            assert_eq!(
+                shown_in(chat),
+                [
+                    row("pasta night.jpg", "image/jpeg", Some(&renamed)),
+                    row("menu.pdf", "application/pdf", Some(&moved))
+                ]
+            );
+        }
+        // Kept where they were found: the group's row has the new paths.
+        let (messages, _) = group::messages(db, 10).unwrap();
+        assert_eq!(messages.last().unwrap().attachments[0].file, renamed);
+        // Deleted: shown as no longer there, with nothing to open.
+        std::fs::remove_file(&renamed).unwrap();
+        for chat in [&session, &chef_chat] {
+            assert_eq!(shown_in(chat)[0], row("pasta night.jpg", "image/jpeg", None));
+        }
         std::fs::remove_dir_all(&local.root).ok();
     }
 

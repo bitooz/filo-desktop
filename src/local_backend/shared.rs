@@ -157,6 +157,7 @@ mod tests {
                 size: 5,
                 file: filo_local::attachments::file(&local.root, &storage_id).unwrap(),
                 local_path: None,
+                bookmark: None,
             }
         };
         let files = vec![

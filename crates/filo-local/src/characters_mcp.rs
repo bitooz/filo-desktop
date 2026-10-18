@@ -188,45 +188,73 @@ fn generate_images(target: &Target, arguments: &Value) -> Result<String, String>
         .filter(|(_, result)| result.is_ok())
         .map(|(request, _)| request.path.as_path())
         .collect();
-    lines.push(match show_in_chat(target, &made) {
-        Ok(()) => "The user sees these in the chat now, as Codex drew them. If you change one yourself (trace, redraw, edit), call yours a traced or redrawn version, not Codex's.".into(),
-        Err(why) => format!("They aren't shown in the chat ({why}): show the user Codex's pictures before any version of your own, and call yours a traced or redrawn version, not Codex's."),
-    });
+    lines.extend(told_after(target, &made));
     Ok(lines.join("\n"))
 }
 
-/// The pictures Codex made, shown in the turn's chat as a message of their own with them attached: copies, so what the
-/// user sees stays what Codex drew. Not in a group turn, whose posts are the member's own: it sends them there with
-/// send_message's `files`.
-fn show_in_chat(target: &Target, pictures: &[&Path]) -> Result<(), String> {
+/// What generate_images' result says after its pictures: they're in the chat now (`show_in_chat`), or, in a group
+/// turn, whose posts are the member's own, to post them itself.
+fn told_after(target: &Target, made: &[&Path]) -> Vec<String> {
+    const OWN_VERSION: &str = "call yours a traced or redrawn version, not Codex's.";
     if target.group_speaker.is_some() {
-        return Err("in the group, send them with send_message's `files`".into());
+        return vec![
+            "In the group, post them yourself: send_message with `files` set to these paths.".into(),
+            format!("Show the user Codex's pictures before any version of your own, and {OWN_VERSION}"),
+        ];
     }
-    // With the user's files and send_message's, not in the chats' folder.
+    vec![match show_in_chat(target, made) {
+        Ok(()) => format!(
+            "The user sees these in the chat now, as Codex drew them. If you change one yourself (trace, redraw, edit), {OWN_VERSION}"
+        ),
+        Err(why) => format!(
+            "They aren't shown in the chat ({why}): show the user Codex's pictures before any version of your own, and {OWN_VERSION}"
+        ),
+    }]
+}
+
+/// The pictures Codex made, shown in the turn's chat as a message of their own with them attached: copies (clones
+/// where the disk can), so what the user sees stays what Codex drew. Not for a group turn, whose member posts them.
+fn show_in_chat(target: &Target, pictures: &[&Path]) -> Result<(), String> {
+    // With the user's files, not in the chats' folder.
     let root = crate::mcp::data_dir(target);
-    let attachments = pictures
-        .iter()
-        .map(|path| {
-            let bytes = std::fs::read(path).map_err(|error| format!("couldn't read {}: {error}", path.display()))?;
-            let storage_id = crate::attachments::save(&root, "image/png", &bytes)
-                .map_err(|error| format!("couldn't keep a copy: {error}"))?;
-            Ok(Attachment {
-                file: root.join(crate::attachments::DIR).join(&storage_id),
-                storage_id,
-                name: path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "picture.png".into()),
-                content_type: "image/png".into(),
-                size: bytes.len() as u64,
-                local_path: None,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut message =
-        target.store.agent_message(&target.chat_id, drawn_caption(attachments.len()), target.turn_id.clone());
-    message.attachments = attachments;
-    target.store.append(&target.chat_id, &message).map_err(|error| format!("couldn't save the message: {error}"))
+    let mut kept: Vec<Attachment> = Vec::new();
+    for path in pictures {
+        match keep_picture(&root, path) {
+            Ok(picture) => kept.push(picture),
+            Err(error) => {
+                forget(&kept);
+                return Err(format!("couldn't keep a copy of {}: {error}", path.display()));
+            }
+        }
+    }
+    let mut message = target.store.agent_message(&target.chat_id, drawn_caption(kept.len()), target.turn_id.clone());
+    message.attachments = kept;
+    target.store.append(&target.chat_id, &message).map_err(|error| {
+        forget(&message.attachments);
+        format!("couldn't save the message: {error}")
+    })
+}
+
+/// Filo's copy of Codex's picture at `path`, in `root`'s attachments/ (attachments.rs `keep`, which doesn't read it).
+fn keep_picture(root: &Path, path: &Path) -> std::io::Result<Attachment> {
+    let storage_id = crate::attachments::keep(root, path, "image/png", false)?;
+    let file = root.join(crate::attachments::DIR).join(&storage_id);
+    Ok(Attachment {
+        size: std::fs::metadata(&file).map_or(0, |meta| meta.len()),
+        name: path.file_name().map_or_else(|| "picture.png".into(), |name| name.to_string_lossy().into_owned()),
+        content_type: "image/png".into(),
+        storage_id,
+        file,
+        local_path: None,
+        bookmark: None,
+    })
+}
+
+/// Removes the copies kept for pictures that weren't shown.
+fn forget(pictures: &[Attachment]) {
+    for picture in pictures {
+        let _ = std::fs::remove_file(&picture.file);
+    }
 }
 
 fn drawn_caption(count: usize) -> String {
@@ -445,14 +473,21 @@ mod tests {
             (1, "idle.png", "image/png")
         );
         assert_eq!(std::fs::read(&shown.attachments[0].file).unwrap(), b"codex's png");
-        // Kept with the user's files (data/attachments/), as send_message's `files` are, not in the chats' folder.
+        // Kept with the user's files (data/attachments/), not in the chats' folder.
         let kept = &shown.attachments[0];
         assert_eq!(crate::attachments::file(data.root(), &kept.storage_id).as_ref(), Some(&kept.file));
         assert!(crate::attachments::file(store.root(), &kept.storage_id).is_none());
         assert_eq!(drawn_caption(3), "Drawn by Codex (3 pictures).");
-        // In the group, the agent posts them itself with send_message's `files`.
+        // A picture that can't be kept shows none of them, and leaves no copy behind.
+        let before = std::fs::read_dir(data.root().join(crate::attachments::DIR)).unwrap().count();
+        let missing = store.root().join("pet/gone.png");
+        assert!(show_in_chat(&target, &[drawn.as_path(), missing.as_path()]).is_err());
+        assert_eq!(std::fs::read_dir(data.root().join(crate::attachments::DIR)).unwrap().count(), before);
+        assert_eq!(store.messages(&chat.id).unwrap().len(), messages.len());
+        // In the group, the agent posts them itself with send_message's `files`, told so on a line of its own.
         target.group_speaker = Some(crate::apps::FILO_AGENT.into());
-        assert!(show_in_chat(&target, &[drawn.as_path()]).is_err_and(|why| why.contains("`files`")));
+        let told = told_after(&target, &[drawn.as_path()]);
+        assert_eq!(told[0], "In the group, post them yourself: send_message with `files` set to these paths.");
         assert_eq!(store.messages(&chat.id).unwrap().len(), messages.len());
         std::fs::remove_dir_all(data.root()).ok();
     }

@@ -263,6 +263,9 @@ pub struct Attachment {
     /// from): drawn and opened from disk.
     #[serde(default)]
     pub local_file: Option<std::path::PathBuf>,
+    /// The file is no longer there (an agent's, shown where it was, deleted since): shown as such, nothing to open.
+    #[serde(default)]
+    pub gone: bool,
 }
 
 /// An artifact a reply made in this chat (local_backend/artifacts.rs `chat_tasks`): its card, which opens it.

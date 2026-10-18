@@ -1687,6 +1687,8 @@ dependencies = [
  "chrono",
  "image",
  "libc",
+ "objc2",
+ "objc2-foundation",
  "reqwest",
  "rusqlite",
  "security-framework",

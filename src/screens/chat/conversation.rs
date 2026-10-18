@@ -4953,7 +4953,9 @@ fn render_media(
             (attachment.content_type.starts_with("video/"), picture(attachment).or(poster))
         })
         .collect();
-    let sizes: Vec<(f32, f32)> = if single {
+    let sizes: Vec<(f32, f32)> = if single && media[0].gone {
+        vec![GONE_TILE]
+    } else if single {
         let (is_video, source) = &sources[0];
         vec![media_box(source.as_ref().and_then(|picture| loaded_size(picture, window, cx)), *is_video)]
     } else {
@@ -5001,6 +5003,7 @@ fn render_media(
             let (top, bottom, left, right) = places[index];
             let corner = |outer: bool| px(if single || outer { OUTER } else { INNER });
             let shown_at = shown_at[index];
+            let gone = media[index].gone;
             let tile = div()
                 .id(SharedString::from(format!("media-{id}-{index}")))
                 .relative()
@@ -5012,7 +5015,8 @@ fn render_media(
                 .rounded_br(corner(bottom && right))
                 .overflow_hidden()
                 .bg(colors.surface_strong)
-                .cursor_pointer()
+                .when(!gone, |this| this.cursor_pointer())
+                .when(gone, |this| this.child(gone_tile(&media[index].name, colors)))
                 // The picture takes the corners itself: clipping to the tile is rectangular.
                 .when_some(source, |this, picture| {
                     this.child(
@@ -5055,7 +5059,7 @@ fn render_media(
                         .border_1()
                         .border_color(colors.border),
                 )
-                .when(is_video, |this| {
+                .when(is_video && !gone, |this| {
                     let duration = posters[index].as_ref().and_then(|poster| poster.duration_ms);
                     this.child(crate::video_player::badge(duration, cx))
                 })
@@ -5108,10 +5112,32 @@ fn render_media(
     div().flex().flex_col().gap(px(GAP)).children(row_divs)
 }
 
+/// The size of a lone picture's or video's tile once its file is gone (`gone_tile`).
+const GONE_TILE: (f32, f32) = (240., 150.);
+
+/// What a picture's or video's tile shows once its file is no longer there (an agent's, deleted since it was sent):
+/// its name, said to be gone, in place of the picture.
+fn gone_tile(name: &str, colors: crate::theme::Palette) -> gpui::Div {
+    div()
+        .absolute()
+        .inset_0()
+        .p(px(space::MD))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(space::XS))
+        .text_color(colors.text_secondary)
+        .child(ui::icon("file-x").size(px(22.)).text_color(colors.text_tertiary))
+        .child(div().footnote().semibold().child("No longer there"))
+        .child(div().caption().max_w_full().truncate().child(name.to_string()))
+}
+
 fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let colors = *cx.colors();
     let fg = if user { colors.on_user_bubble } else { colors.on_assistant_bubble };
-    if file.content_type.starts_with("audio/") || crate::audio_row::is_audio_name(&file.name) {
+    // A sound that's gone shows as a file that's gone: there's nothing to play.
+    if (file.content_type.starts_with("audio/") || crate::audio_row::is_audio_name(&file.name)) && !file.gone {
         // It plays in place from this Mac's copy (audio_row.rs).
         let key = format!("{id}-{index}");
         return crate::audio_row::row(&key, file.local_file.as_deref(), &file.name, 300., fg, window, cx);
@@ -5122,7 +5148,7 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
         .flex()
         .items_center()
         .gap(px(space::SM))
-        .cursor_pointer()
+        .when(!file.gone, |this| this.cursor_pointer())
         .child(
             div()
                 .size(px(36.))
@@ -5132,7 +5158,7 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(ui::icon("file-text").size(px(18.)).text_color(fg)),
+                .child(ui::icon(if file.gone { "file-x" } else { "file-text" }).size(px(18.)).text_color(fg)),
         )
         .child(
             div()
@@ -5140,7 +5166,11 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
                 .flex()
                 .flex_col()
                 .child(div().footnote().semibold().truncate().child(file.name.clone()))
-                .child(div().caption().opacity(0.7).child(format::file_size(file.size))),
+                .child(div().caption().opacity(0.7).child(if file.gone {
+                    "No longer there".to_string()
+                } else {
+                    format::file_size(file.size)
+                })),
         )
         .on_click(move |_, window, cx| {
             if let Some(item) = &preview {

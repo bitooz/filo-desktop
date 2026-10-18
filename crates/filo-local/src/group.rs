@@ -33,7 +33,8 @@
 // The user's message can come with files and pictures, saved as an agent's chat saves them (attachments.rs): the
 // group shows them, and every member answering in its thread gets them as they would in their own chat
 // (`thread_files`), and reads where they're saved in the group's latest messages (`transcript`). A member's post can
-// carry files too (`post_files`), which the group shows the same way.
+// carry files too (`post_files`), files where they are on this Mac, which the group shows the same way (found again
+// when they move, `find_moved_files`).
 //
 // Members (Filo and the agents) are the app's agents (app_data.rs; `roster` reads them), so they come in as arguments.
 
@@ -446,7 +447,8 @@ pub struct GroupMessage {
     pub thread: Option<String>,
     /// The turn that posted it.
     pub turn: Option<String>,
-    /// The files the user sent with it (store.rs `Attachment`), kept as JSON beside it.
+    /// The files sent with it (store.rs `Attachment`): the user's, or a member's (send_message's `files`), kept as JSON
+    /// beside it.
     pub attachments: Vec<crate::store::Attachment>,
     /// Whom a member's message asks (none for the user's, whose @Names do), kept as JSON beside it.
     pub asks: Asks,
@@ -614,6 +616,25 @@ pub fn messages(db: &Db, limit: usize) -> Result<(Vec<GroupMessage>, bool), Stri
     })
 }
 
+/// `messages` with each member's file where it is now: once it's no longer at its path, where its bookmark finds it
+/// (attachments.rs `moved_to`), kept in the message's row for next time.
+pub fn find_moved_files(db: &Db, messages: &mut [GroupMessage]) {
+    for message in messages {
+        let mut found = false;
+        for file in &mut message.attachments {
+            if let Some(path) = crate::attachments::moved_to(file) {
+                *file = crate::attachments::moved(file, path);
+                found = true;
+            }
+        }
+        if found && let Ok(attachments) = serde_json::to_string(&message.attachments) {
+            let _ = db.write(|tx| {
+                tx.execute("UPDATE group_messages SET attachments = ?1 WHERE id = ?2", params![attachments, message.id])
+            });
+        }
+    }
+}
+
 /// The replies among `ids`: each one's id and the id of the message it answers (the user's pick with Reply, a member's
 /// call, `post_with`).
 pub fn replies_to(db: &Db, ids: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
@@ -776,7 +797,7 @@ pub fn post(
     post_with(db, speaker, text, asks, turn_id, now, |_, _| Ok(()))
 }
 
-/// `post`, with the files the member sends with it (mcp.rs `send_message`'s `files`, kept as the user's are): its
+/// `post`, with the files the member sends with it (mcp.rs `send_message`'s `files`, where they are on this Mac): its
 /// text can then be empty.
 pub fn post_files(
     db: &Db,

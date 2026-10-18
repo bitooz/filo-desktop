@@ -26,7 +26,8 @@
 //   and owns what belongs to no agent.
 // - `markdown`: a message's Markdown as one line of plain text (the chat list's preview, notifications).
 // - `store`: chats and their messages as files on this Mac (`~/.config/filo/local`, or `FILO_LOCAL_DIR`).
-// - `attachments`: files sent with a message, saved beside the chats, and what a turn's prompt says of them.
+// - `attachments`: files sent with a message, saved beside the chats (an agent's shown where they are, found again
+//   with their `bookmark` when they move), and what a turn's prompt says of them.
 // - `mcp`: the stdio MCP server the CLI starts for each turn, with Filo's tools (the list is at its top). A reply
 //   reaches the chat only through its `send_message`.
 // - `engine`: runs a turn's CLI (`claude -p`, `codex app-server`, Muse Code's or OpenCode's) with that server plugged in,
@@ -74,6 +75,7 @@ pub mod artifacts;
 mod artifacts_mcp;
 pub mod attachments;
 pub mod backup;
+mod bookmark;
 pub mod browser_import;
 pub mod browser_mcp;
 pub mod characters;

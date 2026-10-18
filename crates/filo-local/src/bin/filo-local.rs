@@ -100,6 +100,7 @@ fn send(args: &[String]) -> i32 {
             size,
             file,
             local_path: Some(path.display().to_string()),
+            bookmark: None,
         });
     }
     let chat = match chat_id {
