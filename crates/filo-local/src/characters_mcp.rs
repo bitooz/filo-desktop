@@ -202,12 +202,13 @@ fn show_in_chat(target: &Target, pictures: &[&Path]) -> Result<(), String> {
     if target.group_speaker.is_some() {
         return Err("in the group, send them with send_message's `files`".into());
     }
-    let root = target.store.root();
+    // With the user's files and send_message's, not in the chats' folder.
+    let root = crate::mcp::data_dir(target);
     let attachments = pictures
         .iter()
         .map(|path| {
             let bytes = std::fs::read(path).map_err(|error| format!("couldn't read {}: {error}", path.display()))?;
-            let storage_id = crate::attachments::save(root, "image/png", &bytes)
+            let storage_id = crate::attachments::save(&root, "image/png", &bytes)
                 .map_err(|error| format!("couldn't keep a copy: {error}"))?;
             Ok(Attachment {
                 file: root.join(crate::attachments::DIR).join(&storage_id),
@@ -414,13 +415,15 @@ mod tests {
     #[test]
     fn codexs_pictures_show_in_the_chat_as_drawn() {
         use crate::mcp::Part;
-        let store = crate::store::tests::temp_store("characters-mcp");
+        // As in the app: the data folder (`data`, with filo.db) and the agents' chats in agents/ below it.
+        let data = crate::store::tests::temp_store("characters-mcp");
+        let store = crate::store::Store::at(data.root().join("agents"));
         let chat = store.create_chat(Engine::Claude).unwrap();
         let mut target = Target {
             store: store.clone(),
             chat_id: chat.id.clone(),
             turn_id: Some("t1".into()),
-            db: store.root().join(crate::db::FILE),
+            db: data.root().join(crate::db::FILE),
             group_speaker: None,
             own_chat: false,
             part: Part::All,
@@ -442,12 +445,16 @@ mod tests {
             (1, "idle.png", "image/png")
         );
         assert_eq!(std::fs::read(&shown.attachments[0].file).unwrap(), b"codex's png");
+        // Kept with the user's files (data/attachments/), as send_message's `files` are, not in the chats' folder.
+        let kept = &shown.attachments[0];
+        assert_eq!(crate::attachments::file(data.root(), &kept.storage_id).as_ref(), Some(&kept.file));
+        assert!(crate::attachments::file(store.root(), &kept.storage_id).is_none());
         assert_eq!(drawn_caption(3), "Drawn by Codex (3 pictures).");
-        // The group's messages carry no pictures.
+        // In the group, the agent posts them itself with send_message's `files`.
         target.group_speaker = Some(crate::apps::FILO_AGENT.into());
-        assert!(show_in_chat(&target, &[drawn.as_path()]).is_err());
+        assert!(show_in_chat(&target, &[drawn.as_path()]).is_err_and(|why| why.contains("`files`")));
         assert_eq!(store.messages(&chat.id).unwrap().len(), messages.len());
-        std::fs::remove_dir_all(store.root()).ok();
+        std::fs::remove_dir_all(data.root()).ok();
     }
 
     #[test]

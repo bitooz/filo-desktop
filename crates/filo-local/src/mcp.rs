@@ -575,8 +575,9 @@ fn artifact_origin(target: &Target) -> crate::artifacts::Origin {
     crate::artifacts::Origin { author, chat_id: Some(chat_id), turn_id: target.turn_id.clone() }
 }
 
-/// The local data folder: the database's.
-fn data_dir(target: &Target) -> PathBuf {
+/// The local data folder: the database's. Files a message carries are kept in its attachments/ (send_message's
+/// `files`, generate_images' pictures), with the user's.
+pub(crate) fn data_dir(target: &Target) -> PathBuf {
     target.db.parent().map(PathBuf::from).unwrap_or_default()
 }
 
