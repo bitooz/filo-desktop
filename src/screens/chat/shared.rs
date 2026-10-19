@@ -7,8 +7,8 @@
 // (a picture, in the chat's image editor), Select, and Delete for the files Filo keeps (`deletable`: its copies and voice
 // messages' recordings, never a file shown where it is on this Mac). ⌘-click and Shift-click pick several, the Mac way;
 // the menu's Select starts picking (`selecting`): a plain click then picks or lets go of a file too, instead of opening
-// it, until the last one is let go, Esc or Clear. The menu, the bar over the list and the Delete key act on all picked,
-// and Esc lets them go. Deleting frees the room they take, and their messages show them as no longer kept.
+// it, until the last one is let go or Esc. Picked tiles show a mark and their size. The menu and the Delete key act on
+// all picked, and Esc lets them go. Deleting frees the room they take, and their messages show them as no longer kept.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -182,9 +182,8 @@ pub struct SharedPanel {
     selecting: bool,
     /// Takes the Delete key while files are picked.
     focus: FocusHandle,
-    /// The picked files are being deleted; why that failed, last time.
+    /// The picked files are being deleted.
     deleting: bool,
-    delete_error: Option<String>,
     _live: Task<()>,
 }
 
@@ -216,7 +215,6 @@ impl SharedPanel {
             selecting: false,
             focus: cx.focus_handle(),
             deleting: false,
-            delete_error: None,
             _live,
         }
     }
@@ -315,13 +313,12 @@ impl SharedPanel {
         }
     }
 
-    /// Lets go of the files picked (Esc, Clear, a plain click), and ends picking with plain clicks.
+    /// Lets go of the files picked (Esc, a plain click), and ends picking with plain clicks.
     fn clear_picks(&mut self, cx: &mut Context<Self>) {
-        if !self.picked.is_empty() || self.selecting || self.delete_error.is_some() {
+        if !self.picked.is_empty() || self.selecting {
             self.picked.clear();
             self.anchor = None;
             self.selecting = false;
-            self.delete_error = None;
             cx.notify();
         }
     }
@@ -345,7 +342,6 @@ impl SharedPanel {
         self.anchor = Some(key);
         // The last one let go ends picking: a plain click opens a file again.
         self.selecting &= !self.picked.is_empty();
-        self.delete_error = None;
         cx.notify();
     }
 
@@ -355,6 +351,12 @@ impl SharedPanel {
         if !self.picked.contains(&key) {
             self.pick(key, Pick::Toggle, cx);
         }
+    }
+
+    /// How many files are picked (`FILO_OPEN=shared-delete-drive`).
+    #[cfg(feature = "dev")]
+    pub fn drive_picked(&self) -> usize {
+        self.picked.len()
     }
 
     /// The menu's Show in Chat for `message` (`FILO_OPEN=shared-show-drive`).
@@ -392,17 +394,10 @@ impl SharedPanel {
         self.selecting &= !self.picked.is_empty();
     }
 
-    /// The picked files, newest first, and their size together.
-    fn picked_items(&self) -> (Vec<&SharedItem>, f64) {
-        let items: Vec<&SharedItem> = self.items.iter().filter(|item| self.picked.contains(&item.key())).collect();
-        let size = items.iter().filter_map(|item| item.size).sum();
-        (items, size)
-    }
-
-    /// The Delete key and the bar's Delete: the picked files Filo keeps.
+    /// The Delete key: the picked files Filo keeps.
     fn delete_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (picked, _) = self.picked_items();
-        let items: Vec<SharedItem> = picked.into_iter().filter(|item| item.deletable).cloned().collect();
+        let items: Vec<SharedItem> =
+            self.items.iter().filter(|item| self.picked.contains(&item.key()) && item.deletable).cloned().collect();
         self.confirm_delete(items, window, cx);
     }
 
@@ -425,19 +420,19 @@ impl SharedPanel {
             format::file_size(size)
         );
         let this = cx.entity().downgrade();
-        ui::confirm(window, cx, title, message, "Delete", "Cancel", true, move |_, cx| {
-            this.update(cx, |this, cx| this.delete(files.clone(), cx)).ok();
+        ui::confirm(window, cx, title, message, "Delete", "Cancel", true, move |window, cx| {
+            this.update(cx, |this, cx| this.delete(files.clone(), window, cx)).ok();
         });
     }
 
-    fn delete(&mut self, files: Vec<serde_json::Value>, cx: &mut Context<Self>) {
+    /// Deletes them; why it couldn't, in a toast.
+    fn delete(&mut self, files: Vec<serde_json::Value>, window: &mut Window, cx: &mut Context<Self>) {
         let gone: HashSet<Key> = files
             .iter()
             .filter_map(|file| Some((file["messageId"].as_str()?.to_string(), file["url"].as_str()?.to_string())))
             .collect();
         self.deleting = true;
-        self.delete_error = None;
-        cx.notify();
+        let handle = window.window_handle();
         let args = json!({ "sessionId": self.session_id, "files": files });
         backend::call(
             cx,
@@ -457,7 +452,7 @@ impl SharedPanel {
                     }
                     Err(error) => {
                         eprintln!("chatShared:deleteFiles failed: {error}");
-                        this.delete_error = Some(error);
+                        handle.update(cx, |_, window, cx| ui::toast_error(window, cx, "Couldn’t delete", error)).ok();
                     }
                 }
                 cx.notify();
@@ -1090,79 +1085,6 @@ impl Render for SharedPanel {
                 }
             }))
             .child(tabs)
-            // A drive reads how many are picked from the bar's id.
-            .children((!self.picked.is_empty()).then(|| {
-                crate::smoke::tracked_fill(format!("shared-picks-{}", self.picked.len()), self.render_pick_bar(cx))
-            }))
             .child(body)
-    }
-}
-
-impl SharedPanel {
-    /// While files are picked: how many and their size, Delete (for those Filo keeps), and a word on any picked that are
-    /// shown where they are.
-    fn render_pick_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = *cx.colors();
-        let (picked, size) = self.picked_items();
-        let summary = match picked.len() {
-            1 => format!("1 file picked · {}", format::file_size(size)),
-            count => format!("{count} files picked · {}", format::file_size(size)),
-        };
-        let deletable = picked.iter().filter(|item| item.deletable).count();
-        let shown_in_place = picked.len() - deletable;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::XS))
-            .px(px(space::SM))
-            .py(px(space::SM))
-            .rounded(px(radius::MD))
-            .bg(colors.surface)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(space::SM))
-                    .child(div().flex_1().min_w_0().callout().medium().truncate().child(summary))
-                    .when(deletable > 0, |this| {
-                        this.child(crate::smoke::tracked(
-                            "shared-delete",
-                            Button::danger("shared-delete", if self.deleting { "Deleting…" } else { "Delete" })
-                                .small()
-                                .icon("trash-2")
-                                .disabled(self.deleting)
-                                .on_click(
-                                    cx.listener(|this, _: &ClickEvent, window, cx| this.delete_picked(window, cx)),
-                                ),
-                        ))
-                    })
-                    .child(crate::smoke::tracked(
-                        "shared-clear",
-                        Button::ghost("shared-clear", "Clear")
-                            .small()
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.clear_picks(cx))),
-                    )),
-            )
-            .when_some(self.delete_error.clone(), |this, error| {
-                this.child(div().footnote().text_color(colors.danger).child(format!("Couldn’t delete: {error}")))
-            })
-            .when(self.selecting, |this| {
-                this.child(
-                    div()
-                        .footnote()
-                        .text_color(colors.text_secondary)
-                        .child("Click files to pick them or let them go."),
-                )
-            })
-            .when(shown_in_place > 0, |this| {
-                let which = if shown_in_place == 1 { "One is" } else { "Some are" };
-                this.child(
-                    div()
-                        .footnote()
-                        .text_color(colors.text_secondary)
-                        .child(format!("{which} shown where it is on this Mac: Filo keeps no copy to delete.")),
-                )
-            })
-            .into_any_element()
     }
 }
