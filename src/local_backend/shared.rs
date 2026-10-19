@@ -81,10 +81,10 @@ fn links_in(text: &str) -> Vec<(String, Option<String>)> {
     links
 }
 
-fn kind_of(content_type: &str) -> &'static str {
+fn kind_of(content_type: &str, name: &str) -> &'static str {
     if content_type.starts_with("image/") || content_type.starts_with("video/") {
         "media"
-    } else if content_type.starts_with("audio/") {
+    } else if crate::media::is_audio(content_type, name) {
         "voice"
     } else {
         "file"
@@ -108,7 +108,7 @@ fn shared_in(root: &Path, message: &Message) -> Vec<Value> {
         items.push(row);
     }
     for file in message.attachments.iter().filter(|file| file.file.is_file()) {
-        let mut row = item(kind_of(&file.content_type), format!("file://{}", file.file.display()));
+        let mut row = item(kind_of(&file.content_type, &file.name), format!("file://{}", file.file.display()));
         row["name"] = json!(file.name);
         row["contentType"] = json!(file.content_type);
         row["size"] = json!(file.size as f64);
@@ -127,6 +127,15 @@ fn shared_in(root: &Path, message: &Message) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sound_is_a_voice_item_by_its_type_or_its_name() {
+        assert_eq!(kind_of("audio/mpeg", "take"), "voice");
+        // A FLAC an older Filo sent untyped.
+        assert_eq!(kind_of("application/octet-stream", "interview.flac"), "voice");
+        assert_eq!(kind_of("application/octet-stream", "notes.txt"), "file");
+        assert_eq!(kind_of("video/mp4", "clip.mp4"), "media");
+    }
 
     #[test]
     fn finds_links_once_with_their_titles() {

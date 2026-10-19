@@ -39,8 +39,10 @@ pub(crate) const PAGE_WIDTH: f32 = 820.;
 const PICTURE_WIDTH: f32 = 640.;
 /// The tallest an inline screenshot is drawn.
 const PICTURE_HEIGHT: f32 = 720.;
-/// A sound's card (audio_row.rs), as wide as a file's.
-const AUDIO_WIDTH: f32 = 420.;
+/// A file's card on the page: a sound's (audio_row.rs) or another file's row.
+const FILE_CARD_WIDTH: f32 = 420.;
+/// Inside a file's card, round its row.
+const FILE_CARD_INSET: f32 = space::SM + 2.;
 /// Up to this many rounds the switcher shows each one's number; past it, "‹ Round 5 of 9 ›".
 const ROUND_NUMBERS: u32 = 6;
 /// The switcher's room from the bar's end (which has `space::SM` of its own): it ends as far from the window's right
@@ -452,7 +454,11 @@ impl CodingResultScreen {
     ) -> AnyElement {
         let colors = *cx.colors();
         let column = div().flex().flex_col().gap(px(space::LG)).child(hero).children(shared);
-        let known: Vec<(String, String)> = files.iter().map(|file| (file.name.clone(), file.kind.clone())).collect();
+        // Sounds are placed as pictures and recordings are (`segments`).
+        let known: Vec<(String, String)> = files
+            .iter()
+            .map(|file| (file.name.clone(), if file.is_audio() { "audio".into() } else { file.kind.clone() }))
+            .collect();
         let urls: HashMap<String, String> = files.iter().map(|file| (file.name.clone(), file.url.clone())).collect();
         let by_name: HashMap<&str, &Proof> = files.iter().map(|file| (file.name.as_str(), file)).collect();
         let segments = segments(markdown, &known, &urls);
@@ -490,37 +496,20 @@ impl CodingResultScreen {
                         crate::smoke::tracked("coding-result-video", inline_video(file, index, opens(file), cx))
                     }
                     // A sound plays in place (audio_row.rs).
-                    Some(file) if crate::audio_row::is_audio_name(&file.name) => {
-                        let inset = space::SM + 2.;
+                    Some(file) if file.is_audio() => {
                         let file_path = file.local_file();
                         let row = crate::audio_row::row(
                             &format!("coding-result-{key}-{index}"),
                             file_path.as_deref(),
                             &file.name,
-                            AUDIO_WIDTH - inset * 2.,
+                            FILE_CARD_WIDTH - FILE_CARD_INSET * 2.,
                             colors.text,
                             window,
                             cx,
                         );
-                        div()
-                            .max_w(px(AUDIO_WIDTH))
-                            .p(px(inset))
-                            .rounded(px(radius::LG))
-                            .bg(colors.surface)
-                            .border_1()
-                            .border_color(colors.border)
-                            .child(row)
-                            .into_any_element()
+                        file_card(row, cx)
                     }
-                    Some(file) => div()
-                        .max_w(px(420.))
-                        .p(px(space::SM + 2.))
-                        .rounded(px(radius::LG))
-                        .bg(colors.surface)
-                        .border_1()
-                        .border_color(colors.border)
-                        .child(proof_row(file, cx))
-                        .into_any_element(),
+                    Some(file) => file_card(proof_row(file, cx), cx),
                     // `segments` only places the round's own files.
                     None => div().into_any_element(),
                 },
@@ -544,6 +533,20 @@ impl CodingResultScreen {
             )
             .into_any_element()
     }
+}
+
+/// A file's card on the page, round `row`.
+fn file_card(row: impl IntoElement, cx: &gpui::App) -> AnyElement {
+    let colors = *cx.colors();
+    div()
+        .max_w(px(FILE_CARD_WIDTH))
+        .p(px(FILE_CARD_INSET))
+        .rounded(px(radius::LG))
+        .bg(colors.surface)
+        .border_1()
+        .border_color(colors.border)
+        .child(row)
+        .into_any_element()
 }
 
 /// The page's head: the round's tool or the agent (`mark`), a line saying who and when (`meta`), and the title.
@@ -771,8 +774,7 @@ fn segments(markdown: &str, files: &[(String, String)], urls: &HashMap<String, S
         let name = ref_name(target);
         // Pictures, recordings and sounds show in place; any other file embedded (`![log](tests.log)`) shows as its row.
         let kind = kinds.get(name.as_str()).copied();
-        let sound = kind.is_some() && crate::audio_row::is_audio_name(&name);
-        if matches!(kind, Some("image" | "video")) || sound || (embedded && kind.is_some()) {
+        if matches!(kind, Some("image" | "video" | "audio")) || (embedded && kind.is_some()) {
             // A list item holding only the picture leaves its bullet behind; drop it with the picture.
             let trimmed = text.trim_end_matches([' ', '\t']);
             let line_start = trimmed.rfind('\n').map(|at| at + 1).unwrap_or(0);
@@ -979,7 +981,7 @@ after.png and plan.pdf go as they are: nothing reads them. They may show somethi
             vec![Segment::Text("Proof:\n\n".into()), Segment::Media("tests.log".into())]
         );
         // A sound the round saved plays in place, linked or embedded.
-        let sounds = vec![("take.mp3".to_string(), "file".to_string())];
+        let sounds = vec![("take.mp3".to_string(), "audio".to_string())];
         assert_eq!(
             segments("Listen: [the take](take.mp3)", &sounds, &HashMap::new()),
             vec![Segment::Text("Listen: ".into()), Segment::Media("take.mp3".into())]

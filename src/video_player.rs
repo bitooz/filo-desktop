@@ -109,6 +109,12 @@ impl Player {
         self.native.failed()
     }
 
+    /// A sound (`open_audio`) played to its end, as AVFoundation tells it: sometimes before the length it gives, or the
+    /// one its samples make (a FLAC's). Always false for a video.
+    pub fn ended(&self) -> bool {
+        self.native.ended()
+    }
+
     fn place(&self, bounds: Bounds<Pixels>, window: &Window) {
         self.native.place(bounds, window);
     }
@@ -235,16 +241,8 @@ pub fn poster(item: &Item, cx: &mut App) -> Option<Poster> {
 /// The poster for the video file at `video` (result_share.rs `poster`, Quick Look's still of it) and its length: made
 /// once per file (by its path, size and time), then read back.
 fn make_poster(video: &Path) -> Option<Poster> {
-    use sha2::Digest as _;
-    let meta = std::fs::metadata(video).ok()?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |time| time.as_millis());
-    let id = sha2::Sha256::digest(format!("{}\n{}\n{modified}", video.display(), meta.len()).as_bytes());
-    let name: String = id[..10].iter().map(|byte| format!("{byte:02x}")).collect();
-    let folder = std::env::temp_dir().join("filo-desktop-posters");
+    let name = crate::media::file_key(video)?;
+    let folder = crate::media::kept_folder("posters");
     let picture = folder.join(format!("{name}.jpg"));
     let facts = folder.join(format!("{name}.json"));
     if let Some(poster) = std::fs::read(&facts)
@@ -310,6 +308,9 @@ pub fn badge(duration_ms: Option<f64>, cx: &App) -> gpui::Div {
 
 mod native {
     use std::path::Path;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use gpui::{Bounds, Pixels, Window};
     use objc2::msg_send;
@@ -358,6 +359,8 @@ mod native {
         /// The picture's view; a sound has none.
         view: Option<Retained<AnyObject>>,
         player: Retained<AnyObject>,
+        /// A sound's end: set by AVPlayerItemDidPlayToEndTimeNotification, through the observer kept here.
+        end: Option<(Arc<AtomicBool>, Retained<AnyObject>)>,
     }
 
     fn file_url(path: &Path) -> Option<Retained<AnyObject>> {
@@ -382,7 +385,7 @@ mod native {
                 // its default), with nothing behind it, so the viewer's backdrop shows either side.
                 let _: () = msg_send![&*view, setLayer: &*layer?];
                 let _: () = msg_send![&*view, setWantsLayer: true];
-                Some(NativePlayer { view: Some(view), player })
+                Some(NativePlayer { view: Some(view), player, end: None })
             }
         }
 
@@ -391,7 +394,18 @@ mod native {
             // SAFETY: as in `new`.
             let player: Option<Retained<AnyObject>> =
                 unsafe { msg_send![AnyClass::get(c"AVPlayer")?, playerWithURL: &*url] };
-            Some(NativePlayer { view: None, player: player? })
+            let player = player?;
+            let ended = Arc::new(AtomicBool::new(false));
+            let told = ended.clone();
+            let block = block2::RcBlock::new(move |_: NonNull<AnyObject>| told.store(true, Ordering::Relaxed));
+            let name = NSString::from_str("AVPlayerItemDidPlayToEndTimeNotification");
+            // SAFETY: as in `new`; the center keeps the block, and `Drop` takes the observer away.
+            let observer: Option<Retained<AnyObject>> = unsafe {
+                let center: Retained<AnyObject> = msg_send![AnyClass::get(c"NSNotificationCenter")?, defaultCenter];
+                let item: Option<Retained<AnyObject>> = msg_send![&*player, currentItem];
+                msg_send![&*center, addObserverForName: &*name, object: item.as_deref(), queue: std::ptr::null::<AnyObject>(), usingBlock: &*block]
+            };
+            Some(NativePlayer { view: None, player, end: observer.map(|observer| (ended, observer)) })
         }
 
         /// Its view, which `place` puts in the window.
@@ -464,6 +478,10 @@ mod native {
             duration.as_seconds().filter(|seconds| *seconds > 0.)
         }
 
+        pub fn ended(&self) -> bool {
+            self.end.as_ref().is_some_and(|(ended, _)| ended.load(Ordering::Relaxed))
+        }
+
         pub fn failed(&self) -> bool {
             self.item().is_some_and(|item| {
                 // SAFETY: as in `new`.
@@ -498,6 +516,12 @@ mod native {
                 let _: () = msg_send![&*self.player, pause];
                 if let Some(view) = &self.view {
                     let _: () = msg_send![&**view, removeFromSuperview];
+                }
+                if let Some((_, observer)) = &self.end
+                    && let Some(class) = AnyClass::get(c"NSNotificationCenter")
+                {
+                    let center: Retained<AnyObject> = msg_send![class, defaultCenter];
+                    let _: () = msg_send![&*center, removeObserver: &**observer];
                 }
             }
         }

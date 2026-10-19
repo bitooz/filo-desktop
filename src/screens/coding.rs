@@ -538,6 +538,11 @@ impl Proof {
         }
     }
 
+    /// A sound, played in place on the result page (media.rs `is_audio`).
+    pub(crate) fn is_audio(&self) -> bool {
+        crate::media::is_audio(&self.content_type, &self.name)
+    }
+
     /// The file on this Mac when the proof is one (a coding task handed off from a chat saves its proof here, and its
     /// `url` is the file's path), not an address.
     pub(crate) fn local_file(&self) -> Option<std::path::PathBuf> {

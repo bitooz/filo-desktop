@@ -524,7 +524,7 @@ impl SharedPanel {
             duration,
             {
                 let url = item.url.clone();
-                Box::new(move |_, _, cx| media::toggle(audio_id.clone(), url.clone(), cx))
+                Box::new(move |_, _, cx| media::toggle(audio_id.clone(), url.clone(), None, cx))
             },
             cx,
         )

@@ -12,7 +12,7 @@
 // `FILO_FIXTURE_BROWSER=<name>` (with `:agent`) names the agent <name> and has it work in Filo's browser, its pill at
 // the header's end (agents.rs `browser_pill`). `FILO_FIXTURE_AUDIO=<file>,<file>` ends the chat with those sound files
 // sent, the first by the user and the rest by Filo, each in its audio row (audio_row.rs; a test window plays them
-// muted), and the plan's `audio` step logs the sound playing or paused.
+// muted), and the plan's `audio` step logs the sound playing or paused; `clickat:<x>x<y>` clicks at a point.
 //
 // `FILO_FIXTURE_DRIVE=1` clicks and types through it with in-app AppKit events (smoke.rs `native_input`), logging each
 // step and saving window screenshots to `FILO_FIXTURE_SHOTS` (and frames for a recording to `FILO_FIXTURE_FRAMES`),
@@ -645,6 +645,14 @@ fn drive(fixture: Entity<ChatFixture>, window: &mut Window, cx: &mut App) {
                     if let Some((x, y)) = point {
                         eprintln!("fixture: hover {arg}");
                         native_input::hover(width, x, y);
+                    }
+                    wait(600).await;
+                }
+                // `clickat:<x>x<y>`: a click that many points from the window's top left (the message box).
+                "clickat" => {
+                    if let Some((x, y)) = arg.split_once('x').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
+                        eprintln!("fixture: click at {x},{y}");
+                        native_input::click(width, x, y);
                     }
                     wait(600).await;
                 }

@@ -396,7 +396,7 @@ impl MediaViewer {
                 this.video = match saved.map(|path| Player::open(&path)) {
                     Ok(Some(player)) => {
                         // One sound at a time: a sound playing in a chat stops for the video.
-                        crate::media::stop(cx);
+                        crate::media::video_plays(&player, cx);
                         Video::Playing { _ticker: Self::tick(player.clone(), cx), player }
                     }
                     Ok(None) => Video::Failed("This video can’t play here.".into()),
@@ -443,8 +443,11 @@ impl MediaViewer {
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
-        if let Some(player) = self.player() {
+        if let Some(player) = self.player().cloned() {
             player.toggle();
+            if player.playing() {
+                crate::media::video_plays(&player, cx);
+            }
             cx.notify();
         }
     }
@@ -494,10 +497,11 @@ impl MediaViewer {
     /// The drag let go: on the very frame it ended on, playing again if it was.
     fn end_scrub(&mut self, cx: &mut Context<Self>) {
         let Some(scrub) = self.scrub.take() else { return };
-        if let Some(player) = self.player() {
+        if let Some(player) = self.player().cloned() {
             player.seek(scrub.at, true);
             if scrub.resume {
                 player.play();
+                crate::media::video_plays(&player, cx);
             }
         }
         cx.notify();

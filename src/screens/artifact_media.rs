@@ -29,26 +29,10 @@ pub fn register(id: &str, from: Vec<PathBuf>) {
     folders().lock().unwrap().insert(id.to_string(), from);
 }
 
-/// What a file is, by its extension: only pictures, videos and sounds are answered.
+/// What a file is, by its extension (filo-local's one table): only pictures, videos, sounds and captions are answered.
 fn content_type(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match extension.as_str() {
-        "mp4" | "m4v" => "video/mp4",
-        "mov" => "video/quicktime",
-        "webm" => "video/webm",
-        "mp3" => "audio/mpeg",
-        "m4a" | "aac" => "audio/mp4",
-        "wav" => "audio/wav",
-        "ogg" | "oga" | "opus" => "audio/ogg",
-        "flac" => "audio/flac",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "vtt" => "text/vtt",
-        _ => return None,
-    })
+    let kind = filo_local::attachments::content_type_for(path);
+    (["image/", "video/", "audio/"].iter().any(|media| kind.starts_with(media)) || kind == "text/vtt").then_some(kind)
 }
 
 /// A path the page names that's a file next to it: no scheme, not from the root, not an anchor, and not a script

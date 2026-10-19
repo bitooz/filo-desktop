@@ -2,23 +2,31 @@
 // round play button, the sound's waveform (the part played in the accent colour; a press or a drag along it goes
 // there), the time played and its length, and a speed button (1×, 1.5×, 2×, for every sound), with the file's name under
 // them. It plays from its file on this Mac through media.rs (one sound at a time, AVFoundation's player), so a file
-// attached without a copy plays from where it is. The row takes the keyboard when clicked or tabbed to, and Space
-// plays or pauses it then.
+// attached without a copy plays from where it is. A click anywhere on the row (or Tab) gives it the keyboard, and Space
+// plays or pauses it then; a letter typed there goes back to where the keyboard was before (the message box), with
+// the letter, so typing never goes nowhere (`Keyboard`).
 //
-// The waveform is made once per file (`wave`), off the main thread: macOS's `afconvert` turns the sound into 4,000
-// 8-bit samples a second, mono, in a temporary folder, and the loudest of each stretch is a bar; it's kept there by the
-// file's path, size and time, as video_player.rs keeps a video's poster. Until then, or for a file it can't read, the
-// bars are all one height.
+// The waveform is made once per file (`wave`), one file at a time on a thread of its own: macOS's `afconvert` turns the
+// sound into 4,000 8-bit samples a second, mono, in a temporary file of its own, and the loudest of each stretch is a
+// bar (read in pieces, so a long sound takes little memory). A conversion that runs past `CONVERT_TIMEOUT` (a file on a
+// stalled network volume) is stopped. The waveform is kept in a temporary folder by the file's path, size and time
+// (media.rs `file_key`, as video_player.rs keeps a video's poster), and in memory by the same key, so a file that
+// changes is made again. Until then, or for a file it can't read (tried again after `RETRY`), the bars are all one
+// height.
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext as _, Bounds, DragMoveEvent, FocusHandle, Global, Hsla, InteractiveElement as _, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
+    StatefulInteractiveElement as _, Styled as _, WeakFocusHandle, Window, canvas, div, px,
 };
 
 use crate::theme::{ActiveTheme as _, Typography as _, radius, space};
@@ -28,15 +36,10 @@ use crate::ui;
 const PEAKS: usize = 240;
 /// Samples a second the waveform is made from.
 const RATE: usize = 4000;
-
-/// Whether `name` is a sound the row plays, by its extension (as AVFoundation reads them on macOS 13 and later).
-pub fn is_audio_name(name: &str) -> bool {
-    let extension = Path::new(name).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "mp3" | "m4a" | "wav" | "aac" | "ogg" | "oga" | "opus" | "flac" | "aif" | "aiff" | "caf"
-    )
-}
+/// The longest a waveform's conversion may take (an hour of mp3 takes about five seconds).
+const CONVERT_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a file whose waveform couldn't be made waits before it's tried again.
+const RETRY: Duration = Duration::from_secs(60);
 
 /// A sound's waveform: how loud each of its `PEAKS` stretches is, from 0 to 1, and how long it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,28 +48,41 @@ pub struct Wave {
     pub seconds: f64,
 }
 
-/// Waveforms by file: `None` while one is being made, or when none could be.
+enum Made {
+    Making,
+    Done(Wave),
+    Failed(Instant),
+}
+
+/// Waveforms by file (`media::file_key`).
 #[derive(Default)]
-struct Waves(HashMap<PathBuf, Option<Wave>>);
+struct Waves(HashMap<String, Made>);
 
 impl Global for Waves {}
 
 /// `file`'s waveform once it's made; the first ask starts making it, and the windows draw again when it's there.
 pub fn wave(file: &Path, cx: &mut App) -> Option<Wave> {
+    let key = crate::media::file_key(file)?;
     let waves = cx.default_global::<Waves>();
-    if let Some(known) = waves.0.get(file) {
-        return known.clone();
+    match waves.0.get(&key) {
+        Some(Made::Done(wave)) => return Some(wave.clone()),
+        Some(Made::Making) => return None,
+        Some(Made::Failed(at)) if at.elapsed() < RETRY => return None,
+        _ => {}
     }
-    waves.0.insert(file.to_path_buf(), None);
-    let file = file.to_path_buf();
+    waves.0.insert(key.clone(), Made::Making);
+    let (reply, made) = futures::channel::oneshot::channel();
+    if maker().send((file.to_path_buf(), key.clone(), reply)).is_err() {
+        waves.0.insert(key, Made::Failed(Instant::now()));
+        return None;
+    }
     cx.spawn(async move |cx| {
-        let made = {
-            let file = file.clone();
-            cx.background_executor().spawn(async move { make_wave(&file) }).await
-        };
+        let made = made.await.ok().flatten();
         cx.update(|cx| {
-            if made.is_some() {
-                cx.default_global::<Waves>().0.insert(file, made);
+            let done = made.is_some();
+            let made = made.map_or_else(|| Made::Failed(Instant::now()), Made::Done);
+            cx.default_global::<Waves>().0.insert(key, made);
+            if done {
                 cx.refresh_windows();
             }
         })
@@ -76,19 +92,29 @@ pub fn wave(file: &Path, cx: &mut App) -> Option<Wave> {
     None
 }
 
-/// The waveform of the sound at `file`, made once per file (by its path, size and time), then read back.
-fn make_wave(file: &Path) -> Option<Wave> {
-    use sha2::Digest as _;
-    let meta = std::fs::metadata(file).ok()?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |time| time.as_millis());
-    let id = sha2::Sha256::digest(format!("{}\n{}\n{modified}", file.display(), meta.len()).as_bytes());
-    let name: String = id[..10].iter().map(|byte| format!("{byte:02x}")).collect();
-    let folder = std::env::temp_dir().join("filo-desktop-waves");
-    let kept = folder.join(format!("{name}.json"));
+type Job = (PathBuf, String, futures::channel::oneshot::Sender<Option<Wave>>);
+
+/// The thread that makes waveforms, one at a time, in the order they're asked for.
+fn maker() -> &'static mpsc::Sender<Job> {
+    static MAKER: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+    MAKER.get_or_init(|| {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("waveforms".into())
+            .spawn(move || {
+                for (file, key, reply) in queue {
+                    let _ = reply.send(make_wave(&file, &key));
+                }
+            })
+            .expect("waveform thread");
+        jobs
+    })
+}
+
+/// The waveform of the sound at `file`, kept under `key` (its `file_key`): read back, or made and kept.
+fn make_wave(file: &Path, key: &str) -> Option<Wave> {
+    let folder = crate::media::kept_folder("waves");
+    let kept = folder.join(format!("{key}.json"));
     if let Some(wave) = std::fs::read(&kept).ok().and_then(|bytes| {
         let kept: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         let peaks: Option<Vec<f32>> =
@@ -98,58 +124,91 @@ fn make_wave(file: &Path) -> Option<Wave> {
         return Some(wave);
     }
     std::fs::create_dir_all(&folder).ok()?;
-    let samples = folder.join(format!("{name}.wav"));
-    let converted = std::process::Command::new("/usr/bin/afconvert")
-        .args(["-f", "WAVE", "-d", &format!("UI8@{RATE}"), "-c", "1"])
-        .arg(file)
-        .arg(&samples)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    let bytes = converted.then(|| std::fs::read(&samples).ok()).flatten();
+    // Its own name: another Filo on this Mac may be making the same file's waveform.
+    static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let samples = folder.join(format!("{key}-{}-{made}.wav", std::process::id()));
+    let converted = convert(file, &samples);
+    let wave = converted.then(|| std::fs::File::open(&samples).ok().and_then(wave_from)).flatten();
     let _ = std::fs::remove_file(&samples);
-    let wave = peaks(wav_data(&bytes?)?)?;
+    let wave = wave?;
+    // Written aside and moved in, so a half-written file is never read back.
+    let part = folder.join(format!("{key}-{}-{made}.json.part", std::process::id()));
     let written = serde_json::json!({ "peaks": wave.peaks, "seconds": wave.seconds });
-    std::fs::write(&kept, written.to_string()).ok()?;
+    if std::fs::write(&part, written.to_string()).and_then(|_| std::fs::rename(&part, &kept)).is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
     Some(wave)
 }
 
-/// The samples of a WAVE file: its `data` chunk.
-fn wav_data(bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.get(0..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
-        return None;
-    }
-    let mut at = 12;
-    while at + 8 <= bytes.len() {
-        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
-        let body = at + 8;
-        if &bytes[at..at + 4] == b"data" {
-            return bytes.get(body..(body + size).min(bytes.len()));
+/// `afconvert` from `file` to 8-bit mono samples at `RATE` in the WAVE file `samples`; false when it failed or ran past
+/// `CONVERT_TIMEOUT` (it's stopped then).
+fn convert(file: &Path, samples: &Path) -> bool {
+    let Ok(mut child) = std::process::Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", &format!("UI8@{RATE}"), "-c", "1"])
+        .arg(file)
+        .arg(samples)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < CONVERT_TIMEOUT => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
         }
-        at = body + size + size % 2;
     }
-    None
 }
 
-/// Unsigned 8-bit samples at `RATE` as `PEAKS` stretches, each its loudest sample, the loudest stretch 1.
-fn peaks(samples: &[u8]) -> Option<Wave> {
-    if samples.is_empty() {
+/// The waveform of a WAVE file of unsigned 8-bit samples at `RATE`: `PEAKS` stretches of its `data` chunk, each its
+/// loudest sample, the loudest stretch 1. Read in pieces.
+fn wave_from(mut wave: impl Read + Seek) -> Option<Wave> {
+    let mut header = [0; 12];
+    wave.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
         return None;
     }
-    let mut peaks: Vec<f32> = (0..PEAKS)
-        .map(|index| {
-            let (start, end) = (samples.len() * index / PEAKS, (samples.len() * (index + 1) / PEAKS).max(1));
-            let stretch = &samples[start.min(samples.len() - 1)..end.min(samples.len())];
-            stretch.iter().map(|sample| (f32::from(*sample) - 128.).abs() / 128.).fold(0., f32::max)
-        })
-        .collect();
+    let size = loop {
+        let mut chunk = [0; 8];
+        wave.read_exact(&mut chunk).ok()?;
+        let size = u32::from_le_bytes(chunk[4..8].try_into().ok()?) as usize;
+        if &chunk[0..4] == b"data" {
+            break size;
+        }
+        wave.seek(SeekFrom::Current((size + size % 2) as i64)).ok()?;
+    };
+    let mut peaks = vec![0f32; PEAKS];
+    let mut read = 0;
+    let mut piece = vec![0; 64 << 10];
+    let mut data = wave.take(size as u64);
+    loop {
+        let count = data.read(&mut piece).ok()?;
+        if count == 0 {
+            break;
+        }
+        for sample in &piece[..count] {
+            let peak = &mut peaks[(read * PEAKS / size.max(1)).min(PEAKS - 1)];
+            *peak = peak.max((f32::from(*sample) - 128.).abs() / 128.);
+            read += 1;
+        }
+    }
+    if read == 0 {
+        return None;
+    }
     let loudest = peaks.iter().copied().fold(0., f32::max);
     if loudest > 0. {
         peaks.iter_mut().for_each(|peak| *peak /= loudest);
     }
-    Some(Wave { peaks, seconds: samples.len() as f64 / RATE as f64 })
+    Some(Wave { peaks, seconds: read as f64 / RATE as f64 })
 }
 
 /// `count` bars from `peaks`: each the loudest of its share.
@@ -171,6 +230,80 @@ impl gpui::Render for Scrub {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+/// The rows' keyboard focus, and where the keyboard last was outside every row (the message box, mostly): a letter
+/// typed on a row goes back there.
+#[derive(Default)]
+struct Keyboard {
+    rows: Vec<WeakFocusHandle>,
+    elsewhere: Option<WeakFocusHandle>,
+    /// Keys typed on a row, on their way back there (`on_row_key`).
+    typed: Vec<gpui::Keystroke>,
+}
+
+impl Global for Keyboard {}
+
+/// A row's focus, made the first time it's drawn; and where the keyboard is now, when that's outside every row.
+fn row_focus(sound: &SharedString, window: &mut Window, cx: &mut App) -> FocusHandle {
+    let focus = window.use_keyed_state(SharedString::from(format!("{sound}-focus")), cx, |_, cx| {
+        let focus = cx.focus_handle().tab_stop(true);
+        let keyboard = cx.default_global::<Keyboard>();
+        keyboard.rows.retain(|row| row.upgrade().is_some());
+        keyboard.rows.push(focus.downgrade());
+        focus
+    });
+    let focus = focus.read(cx).clone();
+    if let Some(now) = window.focused(cx) {
+        let keyboard = cx.default_global::<Keyboard>();
+        if !keyboard.rows.iter().any(|row| *row == now) {
+            keyboard.elsewhere = Some(now.downgrade());
+        }
+    }
+    focus
+}
+
+/// A key on a focused row: Space plays or pauses it; a letter (no ⌘ or ⌃) goes back to where the keyboard was before
+/// the row had it. The row keeps the keyboard until the next frame, gathering what's typed meanwhile (a space too); then
+/// the keyboard goes back, and once the window has drawn with it there (its text input is set up as it draws), the keys
+/// are typed there in order.
+fn on_row_key(event: &KeyDownEvent, toggle: &dyn Fn(&mut App), window: &mut Window, cx: &mut App) {
+    let keystroke = &event.keystroke;
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform || modifiers.control || modifiers.function {
+        return;
+    }
+    let handing_back = cx.try_global::<Keyboard>().is_some_and(|keyboard| !keyboard.typed.is_empty());
+    if keystroke.key == "space" && !handing_back {
+        if !modifiers.modified() {
+            cx.stop_propagation();
+            toggle(cx);
+        }
+        return;
+    }
+    let typed =
+        keystroke.key_char.as_ref().is_some_and(|typed| !typed.is_empty() && !typed.chars().any(char::is_control));
+    let elsewhere = cx.try_global::<Keyboard>().and_then(|keyboard| keyboard.elsewhere.as_ref()?.upgrade());
+    if !typed || elsewhere.is_none() {
+        return;
+    }
+    cx.stop_propagation();
+    cx.default_global::<Keyboard>().typed.push(keystroke.clone());
+    if handing_back {
+        return;
+    }
+    window.on_next_frame(|window, cx| {
+        let back = cx.try_global::<Keyboard>().and_then(|keyboard| keyboard.elsewhere.as_ref()?.upgrade());
+        match back {
+            Some(back) => window.focus(&back),
+            None => return cx.default_global::<Keyboard>().typed.clear(),
+        }
+        window.on_next_frame(|window, cx| {
+            for keystroke in std::mem::take(&mut cx.default_global::<Keyboard>().typed) {
+                window.dispatch_keystroke(keystroke, cx);
+            }
+        })
+    });
 }
 
 /// Where a row's waveform was drawn, and where a press or a drag along it last went (until it's let go).
@@ -203,18 +336,18 @@ pub fn row(
     let sound: SharedString = format!("audio-{id}").into();
     let url = file.map(|file| file.display().to_string());
     let wave = file.and_then(|file| wave(file, cx));
+    crate::media::shown_in(&sound, window, cx);
     let state = crate::media::state(&sound, cx);
     let playing = state.is_some_and(|state| state.playing);
     // The samples' length over the player's: AVFoundation's can run past the sound's end (a FLAC's).
-    let duration = wave.as_ref().map(|wave| wave.seconds).or(state.and_then(|state| state.duration));
+    let length = wave.as_ref().map(|wave| wave.seconds);
+    let duration = length.or(state.and_then(|state| state.duration));
     let track =
         window.use_keyed_state(SharedString::from(format!("{sound}-track")), cx, |_, _| Rc::new(Track::default()));
     let track = track.read(cx).clone();
     let time = track.scrubbing.get().or(state.map(|state| state.time)).unwrap_or(0.);
     let fraction = duration.map_or(0., |duration| (time / duration.max(0.001)).clamp(0., 1.)) as f32;
-    let focus = window
-        .use_keyed_state(SharedString::from(format!("{sound}-focus")), cx, |_, cx| cx.focus_handle().tab_stop(true));
-    let focus: FocusHandle = focus.read(cx).clone();
+    let focus = row_focus(&sound, window, cx);
     let focused = focus.is_focused(window);
 
     let wave_width = (width - BUTTON - TIME_WIDTH - SPEED_WIDTH - space::SM * 3.).max(60.);
@@ -225,7 +358,7 @@ pub fn row(
         let (sound, url) = (sound.clone(), url.clone());
         move |cx: &mut App| {
             if let Some(url) = &url {
-                crate::media::toggle(sound.clone(), url.clone(), cx);
+                crate::media::toggle(sound.clone(), url.clone(), length, cx);
             }
         }
     };
@@ -243,7 +376,7 @@ pub fn row(
         move |seconds: f64, exact: bool, cx: &mut App| {
             let Some(url) = &url else { return };
             track.scrubbing.set((!exact).then_some(seconds));
-            crate::media::seek(sound.clone(), url, seconds, exact, cx);
+            crate::media::seek(sound.clone(), url, length, seconds, exact, cx);
         }
     };
     let let_go = {
@@ -298,9 +431,12 @@ pub fn row(
                 .bg(if index < played { colors.accent } else { fg.opacity(0.28) })
         }))
         .on_mouse_down(MouseButton::Left, {
-            let (at, seek_to, toggle) = (at.clone(), seek_to.clone(), toggle.clone());
-            move |event: &MouseDownEvent, _, cx| {
+            let (at, seek_to, toggle, focus) = (at.clone(), seek_to.clone(), toggle.clone(), focus.clone());
+            move |event: &MouseDownEvent, window, cx| {
+                // The press stops here, so the row's own focusing on a press doesn't run: the row takes the keyboard
+                // itself, for Space.
                 cx.stop_propagation();
+                window.focus(&focus);
                 match at(event.position.x) {
                     Some(seconds) => seek_to(seconds, false, cx),
                     // Its length isn't known yet: it plays from the start.
@@ -356,12 +492,7 @@ pub fn row(
     let row = div()
         .id(SharedString::from(format!("{sound}-row")))
         .track_focus(&focus)
-        .on_key_down(move |event: &KeyDownEvent, _, cx| {
-            if event.keystroke.key == "space" && !event.keystroke.modifiers.modified() {
-                cx.stop_propagation();
-                toggle(cx);
-            }
-        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| on_row_key(event, &toggle, window, cx))
         .w(px(width))
         .max_w_full()
         .flex()
@@ -408,16 +539,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sounds_are_known_by_their_extension() {
-        for name in ["a.mp3", "b.M4A", "c.wav", "d.aac", "e.ogg", "f.flac"] {
-            assert!(is_audio_name(name), "{name}");
+    fn sounds_are_known_by_their_type_or_name() {
+        for name in ["a.mp3", "b.M4A", "c.wav", "d.aac", "e.ogg", "f.flac", "g.opus", "h.aiff"] {
+            assert!(crate::media::is_audio("application/octet-stream", name), "{name}");
         }
-        assert!(!is_audio_name("clip.mp4") && !is_audio_name("notes.txt") && !is_audio_name("mp3"));
+        assert!(crate::media::is_audio("audio/mp4", "recording"));
+        assert!(!crate::media::is_audio("video/mp4", "clip.mp4") && !crate::media::is_audio("text/plain", "mp3"));
     }
 
     #[test]
     fn a_wave_file_gives_its_loudest_stretches() {
-        // 8,000 samples (two seconds): quiet, then loud.
+        // 8,000 samples (two seconds): quiet, then loud, after a chunk that isn't the samples.
         let mut samples = vec![128 + 16; RATE];
         samples.extend(vec![255; RATE]);
         let mut file = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0".to_vec();
@@ -425,11 +557,48 @@ mod tests {
         file.extend(b"data");
         file.extend((samples.len() as u32).to_le_bytes());
         file.extend(&samples);
-        let wave = peaks(wav_data(&file).unwrap()).unwrap();
+        let wave = wave_from(std::io::Cursor::new(file)).unwrap();
         assert_eq!(wave.seconds, 2.);
         assert_eq!(wave.peaks.len(), PEAKS);
         assert!((wave.peaks[0] - 16. / 127.).abs() < 0.01 && wave.peaks[PEAKS - 1] == 1.);
         assert_eq!(bars(&wave.peaks, 4), vec![wave.peaks[0], wave.peaks[0], 1., 1.]);
-        assert!(wav_data(b"not a wave file").is_none());
+        assert!(wave_from(std::io::Cursor::new(b"not a wave file".to_vec())).is_none());
+    }
+
+    #[test]
+    fn a_waveform_is_made_from_a_sound_file_and_kept() {
+        let folder = std::env::temp_dir().join(format!("filo-audio-row-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        // One second of a loud square wave, as a 16-bit WAVE file afconvert reads.
+        let pcm: Vec<u8> =
+            (0..8000).flat_map(|at: i32| (if at % 40 < 20 { 20000_i16 } else { -20000 }).to_le_bytes()).collect();
+        let mut file = b"RIFF".to_vec();
+        file.extend((36 + pcm.len() as u32).to_le_bytes());
+        file.extend(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        file.extend(8000_u32.to_le_bytes());
+        file.extend(16000_u32.to_le_bytes());
+        file.extend(b"\x02\0\x10\0data");
+        file.extend((pcm.len() as u32).to_le_bytes());
+        file.extend(pcm);
+        let sound = folder.join("beep.wav");
+        std::fs::write(&sound, file).unwrap();
+        let key = format!("test-{}", std::process::id());
+        let wave = make_wave(&sound, &key).expect("waveform");
+        assert!((wave.seconds - 1.).abs() < 0.01, "{}", wave.seconds);
+        assert!(wave.peaks.iter().all(|peak| *peak > 0.5));
+        let kept = crate::media::kept_folder("waves").join(format!("{key}.json"));
+        assert!(kept.is_file());
+        // No samples or half-written files left behind.
+        let left = std::fs::read_dir(crate::media::kept_folder("waves"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&format!("{key}-")))
+            .count();
+        assert_eq!(left, 0);
+        // Read back the second time.
+        std::fs::remove_file(&sound).unwrap();
+        assert_eq!(make_wave(&sound, &key), Some(wave));
+        let _ = std::fs::remove_file(kept);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

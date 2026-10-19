@@ -5137,7 +5137,7 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
     let colors = *cx.colors();
     let fg = if user { colors.on_user_bubble } else { colors.on_assistant_bubble };
     // A sound that's gone shows as a file that's gone: there's nothing to play.
-    if (file.content_type.starts_with("audio/") || crate::audio_row::is_audio_name(&file.name)) && !file.gone {
+    if media::is_audio(&file.content_type, &file.name) && !file.gone {
         // It plays in place from this Mac's copy (audio_row.rs).
         let key = format!("{id}-{index}");
         return crate::audio_row::row(&key, file.local_file.as_deref(), &file.name, 300., fg, window, cx);
@@ -5218,7 +5218,7 @@ fn render_voice_sized(
                 .child(ui::icon(if playing { "pause" } else { "play" }).size(px(16.)).text_color(fg))
                 .on_click(move |_, _, cx| {
                     if let Some(url) = &url {
-                        media::toggle(audio_id.clone(), url.clone(), cx);
+                        media::toggle(audio_id.clone(), url.clone(), None, cx);
                     }
                 }),
         )

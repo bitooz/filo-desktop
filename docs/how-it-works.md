@@ -328,17 +328,25 @@ into text through the relay instead (`voiceRecordings:send`). In `dev` builds, `
 An audio file (mp3, m4a, wav, aac, ogg, flac and the like) in a chat's or the group's message, or saved by a coding
 round, plays where it is, in one row shared by both (`src/audio_row.rs`): a round play button, its waveform (the part
 played in the accent colour; a click or a drag along it goes there), the time played and its length, and a speed
-button (1×, 1.5×, 2×, for every sound), with the file's name under them. A click or Tab gives the row the keyboard, and
-Space then plays or pauses it. It plays from its file on this Mac, so a big file attached without a copy plays from
-where it is.
+button (1×, 1.5×, 2×, for every sound), with the file's name under them. A click anywhere on the row (or Tab) gives it
+the keyboard, and Space then plays or pauses it; a letter typed while it has the keyboard goes back to where the
+keyboard was before (the message box), letter and all. It plays from its file on this Mac, so a big file attached
+without a copy plays from where it is. Which files are sounds is one check, `media::is_audio` (the content type, or
+the name by crates/filo-local `attachments::content_type_for`, the one table of types), used by the chat, the result
+page, Shared and artifact pages' files.
 
-Sounds play through the video player's AVFoundation player, with no picture (`video_player.rs` `open_audio`), and one
-at a time across the app (`media.rs` `Audio`): starting one stops the last, and so do recording a voice message and a
-video opening in the viewer. Voice messages play the same way. The waveform is made once per file, off the main thread:
-macOS's `afconvert` turns it into 4,000 8-bit samples a second, and each bar is the loudest of its stretch; it's kept in
-a temporary folder by the file's path, size and time (an hour of mp3 takes about five seconds the first time). Its
-length is the samples', since AVFoundation's can run past a sound's end. Artifact pages play their own `<audio>` in
-their web view (`screens/artifact_media.rs`).
+Sounds play through the video player's AVFoundation player, with no picture (`video_player.rs` `open_audio`), and one at
+a time across the app (`media.rs` `Audio`): starting one stops the last and pauses a video playing in the viewer, a
+video playing stops the sound, and nothing plays while the microphone records (`recorder::recording`). Voice messages
+play the same way. While a sound plays, only the views that show its row are drawn again, and only when its clock or its
+played part moves. A sound ends when AVFoundation says it played to its end (a FLAC can, before its length) or the
+player stops within a moment of its length; stopped anywhere else, it stays paused where it was. The waveform is made
+one file at a time on a thread of its own: macOS's `afconvert` turns it into 4,000 8-bit samples a second in a temporary
+file of its own (stopped after three minutes), read in pieces, and each bar is the loudest of its stretch. It's kept in
+a temporary folder and in memory by the file's path, size and time (`media::file_key`, shared with the videos' posters),
+so a changed file is made again, and a file that couldn't be read is tried again after a minute (an hour of mp3 takes
+about five seconds the first time). Its length is the samples', since AVFoundation's can run past a sound's end.
+Artifact pages play their own `<audio>` in their web view (`screens/artifact_media.rs`).
 
 `FILO_FIXTURE_AUDIO=<file>,<file>` with `FILO_OPEN=coding-cards` ends that chat fixture with those files sent, played
 muted (every test window's sounds are), and the plan's `audio` step logs the sound playing or paused.

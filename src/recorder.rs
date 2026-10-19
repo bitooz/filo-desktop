@@ -70,6 +70,14 @@ pub struct Recorder {
     path: PathBuf,
 }
 
+/// Recorders alive now (one from `start` until it's dropped).
+static RECORDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the microphone records now: no sound may play then (media.rs), or it would be in the recording.
+pub fn recording() -> bool {
+    RECORDING.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 impl Recorder {
     /// Starts recording to a new temp file.
     pub fn start() -> Result<Recorder> {
@@ -102,6 +110,7 @@ impl Recorder {
                 return Err(anyhow!("The microphone could not start"));
             }
         }
+        RECORDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Recorder { inner, path })
     }
 
@@ -138,6 +147,7 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        RECORDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // `finish` and `cancel` already stopped it; this covers a chat closed mid-recording.
         unsafe {
             if self.inner.isRecording() {
