@@ -35,6 +35,15 @@ pub(crate) struct Scene {
 }
 
 impl Scene {
+    /// Filo: the shortest step of the sprites turning in this frame (`MonochromeSprite::spin`), if any turn.
+    pub(crate) fn spin_step(&self) -> Option<f32> {
+        self.monochrome_sprites
+            .iter()
+            .filter(|sprite| sprite.spin != 0.)
+            .map(|sprite| sprite.spin_step)
+            .reduce(f32::min)
+    }
+
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
@@ -626,6 +635,28 @@ pub(crate) struct MonochromeSprite {
     pub color: Hsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    /// Filo: turns a second about its middle (0: still), in steps `spin_step` seconds apart (`Svg::with_spin`). The
+    /// renderer turns it as it draws the frame, so a spinner moves with no view drawn again (`spin_turn`).
+    pub spin: f32,
+    pub spin_step: f32,
+}
+
+/// Filo: how far round a sprite turning `spin` times a second in steps `step` seconds apart is now, 0 to 1. One clock
+/// for every window, so everything turning turns together.
+pub(crate) fn spin_turn(spin: f32, step: f32) -> f32 {
+    let at = spin_clock();
+    let step = f64::from(step.max(0.001));
+    ((at / step).floor() * step * f64::from(spin)).fract() as f32
+}
+
+/// Filo: which step of `step` seconds the clock is in, to present a frame again when it moves on.
+pub(crate) fn spin_index(step: f32) -> u64 {
+    (spin_clock() / f64::from(step.max(0.001))) as u64
+}
+
+fn spin_clock() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 impl From<MonochromeSprite> for Primitive {

@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Div, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement as _, Styled, Svg, Transformation, Window, div, percentage,
+    SharedString, StatefulInteractiveElement as _, Styled, Svg, Window, div,
     prelude::FluentBuilder as _, px, relative, svg,
 };
 use gpui_component::WindowExt as _;
@@ -37,25 +37,22 @@ pub fn spinner(size: f32, cx: &App) -> impl IntoElement {
     turning(icon("loader-circle").size(px(size)).text_color(cx.colors().accent), 1.)
 }
 
-/// `glyph` turning `turns_per_second`, in steps (`ticker`), or still with reduce motion on.
+/// `glyph` turning `turns_per_second`, in the ticker's steps, or still with reduce motion on. It turns as the window
+/// presents its last frame again at each step (vendor/gpui `Svg::with_spin`): no view is drawn again for it. Drawing the
+/// views it's in at each step, a working ring in the Agents list drew the whole list and the chat beside it twelve
+/// times a second, about a fifth of a core in a debug build while any agent worked.
 fn turning(glyph: Svg, turns_per_second: f32) -> AnyElement {
     if reduce_motion() {
-        return glyph.into_any_element();
+        return glyph.flex_none().into_any_element();
     }
-    let turn = (ticker::seconds() * turns_per_second).fract();
-    div()
-        .relative()
-        .flex_none()
-        .child(glyph.with_transformation(Transformation::rotate(percentage(turn))))
-        .child(gpui::canvas(|_, window, cx| ticker::keep(window, cx), |_, _, _, _| {}).absolute().size_0())
-        .into_any_element()
+    glyph.flex_none().with_spin(turns_per_second, ticker::STEP).into_any_element()
 }
 
-/// The clock spinners, working rings and the pet's bob move by: a dozen steps a second, shared. GPUI's
-/// `with_animation(...repeat())` asks for a frame every frame, and with no cached views that re-rendered the whole
-/// window at display rate for as long as one showed (a coding task's ring, for an hour). Each one drawn asks for the
-/// view it's in to be drawn again at the next step (only it and the views around it, not a view kept as drawn beside
-/// it: `AnyView::cached`); a step with none drawn stops the clock.
+/// The steps the pet's bob, the pictures waiting to be shown and the thinking dots move by (and the spinners and
+/// working rings turn in, `turning`): a dozen a second, shared. GPUI's `with_animation(...repeat())` asks for a frame
+/// every frame, and with no cached views that re-rendered the whole window at display rate for as long as one showed.
+/// Each one drawn asks for the view it's in to be drawn again at the next step (only it and the views around it, not a
+/// view kept as drawn beside it: `AnyView::cached`); a step with none drawn stops the clock.
 pub mod ticker {
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
@@ -64,7 +61,7 @@ pub mod ticker {
 
     use gpui::{AnyWindowHandle, App, EntityId, Window};
 
-    const STEP: Duration = Duration::from_millis(83);
+    pub const STEP: Duration = Duration::from_millis(83);
 
     #[derive(Default)]
     struct Ticker {

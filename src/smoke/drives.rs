@@ -977,6 +977,46 @@ fn run_chat_scroll_timing(window: &mut Window, cx: &mut Context<AppShell>) {
         // Its glances, pictures and coding rows come in.
         wait(4000).await;
         drawn(cx).await;
+        // `FILO_TIMING_IDLE=<seconds>`: the chat left alone that long, as it sits while agents work.
+        if let Some(seconds) = std::env::var("FILO_TIMING_IDLE").ok().and_then(|seconds| seconds.parse::<u64>().ok()) {
+            eprintln!("chat-scroll-timing: idle from here");
+            let (idle_from, cpu, main_cpu) = (std::time::Instant::now(), process_cpu(), thread_cpu());
+            // Recorded, every frame presented (a turning spinner's steps are presented with nothing drawn).
+            let width = cx.update(|window, _| f64::from(f32::from(window.viewport_size().width))).unwrap_or(0.);
+            let recording = std::env::var("FILO_DRIVE_VIDEO").ok().and_then(|file| {
+                crate::window_shot::Recording::start(native_input::window_number(width)?, std::path::Path::new(&file))
+            });
+            match &recording {
+                Some(recording) => {
+                    while idle_from.elapsed() < Duration::from_secs(seconds) {
+                        let (tx, rx) = futures::channel::oneshot::channel();
+                        cx.update(|window, _| {
+                            window.on_next_frame(move |_, _| {
+                                let _ = tx.send(());
+                            })
+                        })
+                        .ok();
+                        if rx.await.is_err() {
+                            break;
+                        }
+                        recording.frame();
+                    }
+                }
+                None => wait(seconds * 1000).await,
+            }
+            if let Some(recording) = recording {
+                eprintln!("chat-scroll-timing: video saved: {}", recording.finish());
+            }
+            let idle = idle_from.elapsed().as_secs_f64();
+            eprintln!("chat-scroll-timing: idle to here");
+            eprintln!(
+                "chat-scroll-timing: CPU idle {:.1}% (main thread {:.1}%) over {idle:.0} s",
+                100. * (process_cpu() - cpu).as_secs_f64() / idle,
+                100. * (thread_cpu() - main_cpu).as_secs_f64() / idle
+            );
+            eprintln!("chat-scroll-timing: done");
+            return quit(cx);
+        }
         let size = cx.update(|window, _| window.viewport_size()).unwrap_or_default();
         let (width, height) = (f64::from(f32::from(size.width)), f64::from(f32::from(size.height)));
         let read = |cx: &mut gpui::AsyncWindowContext| {

@@ -129,8 +129,13 @@ with it, so:
 - The Agents list is a view of its own kept as drawn (agents.rs `AgentList`, `AnyView::cached`), drawn again when the
   Agents screen changes, a chat's draft or reply starts or ends, and every half minute (its times). Scrolling a chat
   drew all its rows every frame, about half of each frame. Drives draw it afresh each frame (`smoke::cache_views`).
-- Spinners and working rings (`ui::ticker`) draw only the view they're in at each step, not the whole window; a step
-  of one the Agents screen draws (a chat's header) leaves the list as it was.
+- Spinners and working rings turn on the GPU (`ui::turning`, vendor/gpui `Svg::with_spin`): at each of the ticker's
+  steps the window presents its last frame again with them turned further, and no view is drawn. Drawing the views they
+  were in, a working ring in the Agents list (even one scrolled out of sight) drew the list and the chat twelve times a
+  second, about a fifth of a core in a debug build while any agent worked; now about 6%, most of it the desktop pet. The
+  ticker still draws again the views of what moves otherwise (the pet's bob, the thinking dots, pictures coming into
+  view), only those views and not one kept as drawn beside them; a step of one the Agents screen draws leaves the list
+  as it was.
 - A page of older history is taken in by splicing only the rows that changed (feed_rows.rs `splices`, the rows both
   have at the start and the end left out of the comparison), and the message on screen keeps its place
   (`sync_list_anchored`): only a message's row holds the place (conversation.rs `holds_place`), not the "loading" row,
@@ -146,6 +151,8 @@ pages as they load. It logs each frame's draw and the main thread's CPU in it, t
 how long each page took in, whether each page kept the message on screen, any jump against the input and any frame
 with messages out of order. `FILO_DRIVE_VIDEO=<file.mp4>` records the window from its own frames meanwhile (window_shot.rs
 `Recording`, through `ffmpeg`; it slows the window), and `FILO_TIMING_TRACE=1` logs every frame's place.
+`FILO_TIMING_IDLE=<seconds>` instead leaves the chat alone that long and logs the CPU used (with `ZED_MEASUREMENTS=1`
+GPUI logs each frame it draws; with `FILO_DRIVE_VIDEO` every frame presented is recorded).
 
 A chat runs one turn at a time. A message sent while one works goes into it (crates/filo-local `steer`, turn.rs
 `Steering`): the turn's CLI runs as a session it's kept talking to, as a coding task's does (coding_session.rs), so the

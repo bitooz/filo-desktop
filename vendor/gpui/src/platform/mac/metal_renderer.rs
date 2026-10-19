@@ -934,6 +934,30 @@ impl MetalRenderer {
         if sprites.is_empty() {
             return true;
         }
+        // Filo: sprites that turn, turned as far as the clock says now (`MonochromeSprite::spin`).
+        let turned: Vec<MonochromeSprite>;
+        let sprites = if sprites.iter().any(|sprite| sprite.spin != 0.) {
+            turned = sprites
+                .iter()
+                .map(|sprite| {
+                    let mut sprite = sprite.clone();
+                    if sprite.spin != 0. {
+                        let turn = crate::scene::spin_turn(sprite.spin, sprite.spin_step);
+                        let middle = sprite.bounds.center();
+                        sprite.transformation = sprite.transformation.compose(
+                            crate::TransformationMatrix::unit()
+                                .translate(middle)
+                                .rotate(crate::radians(turn * std::f32::consts::TAU))
+                                .translate(point(ScaledPixels(-middle.x.0), ScaledPixels(-middle.y.0))),
+                        );
+                    }
+                    sprite
+                })
+                .collect();
+            &turned[..]
+        } else {
+            sprites
+        };
         align_offset(instance_offset);
 
         let sprite_bytes_len = mem::size_of_val(sprites);

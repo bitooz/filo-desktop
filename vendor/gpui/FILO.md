@@ -41,6 +41,14 @@ Changes, all marked `Filo:` in the source:
   see-through fill over the whole view (a dialog's dim) is a tint to lay over it, and a see-through gradient (a fade at
   an edge, like the one under a page's header) a fade to lay over it (`PaintedFade`: its line in the shown part's unit
   space, the shader's, and its stops).
+- `src/elements/svg.rs` (`Svg::with_spin`), `src/scene.rs` (`MonochromeSprite::spin`, `spin_turn`), `src/window.rs`
+  (`paint_svg_spinning`, the frame callback, `present`), `src/platform/mac/metal_renderer.rs`
+  (`draw_monochrome_sprites`): an SVG can turn without being drawn again. Its sprite carries how many turns a second
+  and in what steps; the renderer turns it about its middle by a shared clock as it copies the frame's sprites to the
+  GPU, and while the frame on screen has one, the window presents that frame again each time the clock moves on a step
+  (nothing is laid out or painted). Filo's spinners and working rings turned by drawing their view again at each
+  step, and GPUI draws a view's parents with it: a ring in a list row drew the Agents screen, its list and the chat
+  twelve times a second.
 - `Cargo.toml`: the default features are only `font-kit`, the one the macOS code reads. Upstream's `wayland` and `x11`
   turn on blade-graphics, blade-macros, blade-util and bytemuck, which have no target filter, so a Mac build compiled
   the Linux renderer (blade, a second naga, hidden-trait, syn 1, mint, codespan-reporting) without linking it. And

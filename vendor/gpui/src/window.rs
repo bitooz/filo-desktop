@@ -949,6 +949,10 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Filo: the step of the sprites turning in the frame on screen, and the step of the clock it was presented at
+    /// (`MonochromeSprite::spin`): the frame is presented again as the clock moves on, nothing drawn anew.
+    spin_step: Rc<Cell<Option<f32>>>,
+    spin_presented: Rc<Cell<u64>>,
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
@@ -1077,6 +1081,8 @@ impl Window {
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let spin_step = Rc::new(Cell::new(None));
+        let spin_presented = Rc::new(Cell::new(0));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
@@ -1109,6 +1115,7 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
+            let (spin_step, spin_presented) = (spin_step.clone(), spin_presented.clone());
             move |request_frame_options| {
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
@@ -1123,10 +1130,14 @@ impl Window {
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
+                // Filo: and again when sprites in it turn and the clock has moved on a step.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || (active.get()
-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1))
+                    || spin_step
+                        .get()
+                        .is_some_and(|step| crate::scene::spin_index(step) != spin_presented.get());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1332,6 +1343,8 @@ impl Window {
             active,
             hovered,
             needs_present,
+            spin_step,
+            spin_presented,
             last_input_timestamp,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
@@ -2246,6 +2259,11 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        let spin_step = self.rendered_frame.scene.spin_step();
+        self.spin_step.set(spin_step);
+        if let Some(step) = spin_step {
+            self.spin_presented.set(crate::scene::spin_index(step));
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
@@ -3235,6 +3253,8 @@ impl Window {
                 color: color.opacity(element_opacity),
                 tile,
                 transformation: TransformationMatrix::unit(),
+                spin: 0.,
+                spin_step: 0.,
             });
         }
         Ok(())
@@ -3311,6 +3331,19 @@ impl Window {
         color: Hsla,
         cx: &App,
     ) -> Result<()> {
+        self.paint_svg_spinning(bounds, path, transformation, None, color, cx)
+    }
+
+    /// Filo: `paint_svg`, turning (turns a second, step in seconds) as the frame is presented (`Svg::with_spin`).
+    pub fn paint_svg_spinning(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        transformation: TransformationMatrix,
+        spin: Option<(f32, f32)>,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -3358,6 +3391,8 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
+            spin: spin.map_or(0., |(turns, _)| turns),
+            spin_step: spin.map_or(0., |(_, step)| step),
         });
 
         Ok(())

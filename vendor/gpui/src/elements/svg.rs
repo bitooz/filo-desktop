@@ -11,6 +11,7 @@ pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
     path: Option<SharedString>,
+    spin: Option<(f32, f32)>,
 }
 
 /// Create a new SVG element.
@@ -20,6 +21,7 @@ pub fn svg() -> Svg {
         interactivity: Interactivity::new(),
         transformation: None,
         path: None,
+        spin: None,
     }
 }
 
@@ -34,6 +36,13 @@ impl Svg {
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
         self.transformation = Some(transformation);
+        self
+    }
+
+    /// Filo: turn the SVG about its middle `turns_per_second` times a second, in steps `step` apart. It turns as the
+    /// window presents its frame again at each step, with nothing drawn again, rather than by drawing the view anew.
+    pub fn with_spin(mut self, turns_per_second: f32, step: std::time::Duration) -> Self {
+        self.spin = Some((turns_per_second, step.as_secs_f32()));
         self
     }
 }
@@ -117,7 +126,7 @@ impl Element for Svg {
                         .unwrap_or_default();
 
                     window
-                        .paint_svg(bounds, path.clone(), transformation, color, cx)
+                        .paint_svg_spinning(bounds, path.clone(), transformation, self.spin, color, cx)
                         .log_err();
                 }
             },
