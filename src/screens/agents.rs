@@ -3609,7 +3609,9 @@ impl AgentsScreen {
             let row = items.remove(&key)?;
             Some((SharedString::from(key), row))
         });
-        let list = crate::sliding_rows::sliding_rows("agents-rows", colors.background, rows);
+        // The list's background, which the rows on their way are drawn on.
+        let background = colors.background;
+        let list = crate::sliding_rows::sliding_rows("agents-rows", background, rows);
         self.list_newest = working_panel::newest_time(working_since);
         div()
             .relative()
@@ -3618,6 +3620,7 @@ impl AgentsScreen {
             .h_full()
             .flex()
             .flex_col()
+            .bg(background)
             .border_r_1()
             .border_color(colors.surface_strong)
             .child(
