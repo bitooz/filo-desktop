@@ -690,13 +690,16 @@ mod tests {
             };
             local.run_job(Job::Wake(wake), false);
         };
-        let last = |chat: &str| {
-            local.agent_chats.messages(chat).unwrap().last().map(|message| message.text.clone()).unwrap_or_default()
+        // The check-in's own line, wherever it lands: a turn that can't start (no coding tool, as on CI) adds its
+        // error after it.
+        let texts = |chat: &str| -> Vec<String> {
+            local.agent_chats.messages(chat).unwrap().into_iter().map(|message| message.text).collect()
         };
+        let has = |chat: &str, said: &str| texts(chat).iter().any(|text| text.contains(said));
         run("Did the lesson stick?", Some(&tutor));
-        assert!(last(&tutors).contains("Did the lesson stick?"), "{}", last(&tutors));
+        assert!(has(&tutors, "Did the lesson stick?"), "{:?}", texts(&tutors));
         run("Water the plants", None);
-        assert!(last(&main).contains("Water the plants"), "{}", last(&main));
+        assert!(has(&main, "Water the plants"), "{:?}", texts(&main));
         assert_eq!(local.agent_chats.list_chats().len(), chats_before);
         std::fs::remove_dir_all(&local.root).ok();
     }
