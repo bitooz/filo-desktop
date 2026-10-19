@@ -930,7 +930,8 @@ fn thread_cpu() -> Duration {
 /// of order. `FILO_DRIVE_VIDEO=<file.mp4>` records the window meanwhile (window_shot.rs `Recording`, needs `ffmpeg`);
 /// `FILO_TIMING_TRACE=1` logs every frame's place.
 fn run_chat_scroll_timing(window: &mut Window, cx: &mut Context<AppShell>) {
-    let session = std::env::var("FILO_TIMING_CHATS").unwrap_or_default().split(',').next().unwrap_or("").trim().to_string();
+    let session =
+        std::env::var("FILO_TIMING_CHATS").unwrap_or_default().split(',').next().unwrap_or("").trim().to_string();
     let step: f32 = std::env::var("FILO_SCROLL_STEP").ok().and_then(|step| step.parse().ok()).unwrap_or(60.);
     let scrubbing = std::env::var_os("FILO_TIMING_SCRUB").is_some();
     let backend = backend(cx);

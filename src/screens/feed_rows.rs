@@ -257,8 +257,7 @@ mod tests {
             (seed >> 33) % below
         };
         for _ in 0..400 {
-            let old: Vec<RowSig> =
-                (0..next(14)).map(|k| RowSig { key: format!("k{k}"), sig: next(3) }).collect();
+            let old: Vec<RowSig> = (0..next(14)).map(|k| RowSig { key: format!("k{k}"), sig: next(3) }).collect();
             let mut new: Vec<RowSig> = old.iter().filter(|_| next(5) > 0).cloned().collect();
             for _ in 0..next(4) {
                 let at = next(new.len() as u64 + 1) as usize;

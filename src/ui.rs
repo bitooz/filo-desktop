@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Div, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement as _, Styled, Svg, Window, div,
-    prelude::FluentBuilder as _, px, relative, svg,
+    SharedString, StatefulInteractiveElement as _, Styled, Svg, Window, div, prelude::FluentBuilder as _, px, relative,
+    svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::notification::Notification;

@@ -434,7 +434,18 @@ unsafe fn frame_bgra(layer: *mut AnyObject) -> Result<((usize, usize), Vec<u8>),
     let blit = commands.new_blit_command_encoder();
     let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
     let size = metal::MTLSize { width, height, depth: 1 };
-    blit.copy_from_texture_to_buffer(texture, 0, 0, origin, size, &buffer, 0, row, row * height, metal::MTLBlitOption::empty());
+    blit.copy_from_texture_to_buffer(
+        texture,
+        0,
+        0,
+        origin,
+        size,
+        &buffer,
+        0,
+        row,
+        row * height,
+        metal::MTLBlitOption::empty(),
+    );
     blit.end_encoding();
     commands.commit();
     commands.wait_until_completed();

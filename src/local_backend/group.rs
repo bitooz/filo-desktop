@@ -1846,7 +1846,7 @@ mod tests {
         let mut said = Message::new(Role::User, "Pasta tonight?", None);
         said.voice = Some(recording(b"chat m4a"));
         local.agent_chats.append(&chef_chat, &said).unwrap();
-        let (asked, _) = group::add_user_message(db, "thread-1", "Dinner?", now_ms() as i64).unwrap();
+        let (asked, _) = group::add_user_message(db, "thread-1", "Dinner?", now_ms()).unwrap();
         let group_voice = recording(b"group voice m4a");
         group::set_voice(db, &asked.id, &group_voice).unwrap();
         // Each is in its Voice tab, deletable, with its size.
