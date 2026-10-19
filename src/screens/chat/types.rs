@@ -247,6 +247,9 @@ impl Message {
 pub struct VoiceRecording {
     pub duration_ms: f64,
     pub url: Option<String>,
+    /// The user deleted the recording from the Shared list: shown as no longer kept, nothing to play.
+    #[serde(default)]
+    pub gone: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

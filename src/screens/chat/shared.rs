@@ -3,8 +3,8 @@
 // files in Quick Look, voice plays in place, and links open in the browser. An agent's profile (the Agents tab's edit
 // page) shows its chat's under the form, Group settings the group's; the page around it scrolls it.
 // The newest page is live; older ones load as the list needs them, one at a time.
-// Select picks files to delete, each with its size: Filo's copies only (`deletable`), to free the room they take; their
-// messages then show them as no longer kept. A file shown where it is on this Mac (an agent's) can't be picked.
+// Select picks files to delete, each with its size: Filo's copies only (`deletable`) and voice messages' recordings, to
+// free the room they take; their messages then show them as no longer kept. A file shown where it is on this Mac (an agent's) can't be picked.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -708,11 +708,13 @@ impl SharedPanel {
             Some(sender) => sender.clone(),
             None => self.agent_name.clone(),
         };
-        // An audio file's size while picking files to delete.
-        let size = item.size.filter(|_| self.selecting && item.name.is_some()).map(format::file_size);
+        // Its size while picking files to delete.
+        let size = item.size.filter(|_| self.selecting).map(format::file_size);
         let (title, subtitle) = match &item.name {
             Some(name) => (name.clone(), format!("{sender} · {}", size.unwrap_or_else(|| format::short_date(item.at)))),
-            None => (format::short_date_time(item.at), sender),
+            None => {
+                (format::short_date_time(item.at), size.map_or(sender.clone(), |size| format!("{sender} · {size}")))
+            }
         };
         let duration = item.duration_ms.map(format::duration_clock);
         let width = self.text_width() - if duration.is_some() { 40. } else { 0. };
@@ -720,7 +722,7 @@ impl SharedPanel {
             let url = item.url.clone();
             Box::new(move |_, _, cx| media::toggle(audio_id.clone(), url.clone(), None, cx))
         });
-        row(
+        let row = row(
             format!("shared-voice-{index}"),
             picture.into_any_element(),
             div().w(px(width)).truncate().callout().medium().child(title).into_any_element(),
@@ -735,7 +737,8 @@ impl SharedPanel {
             on_click,
             pick,
             cx,
-        )
+        );
+        crate::smoke::tracked_fill(format!("shared-voice-{index}"), row)
     }
 
     fn render_list(&self, items: &[&SharedItem], cx: &mut App) -> AnyElement {
@@ -857,8 +860,14 @@ impl Render for SharedPanel {
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_selecting(!selecting, cx))),
             )
         });
-        let header =
-            div().flex().items_center().gap(px(space::SM)).child(div().flex_1().min_w_0().child(tabs)).children(select);
+        // A drive picks a tab by its place on the bar.
+        let tabs_tracked = crate::smoke::tracked_fill("shared-tabs", tabs);
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(space::SM))
+            .child(div().flex_1().min_w_0().child(tabs_tracked))
+            .children(select);
         div()
             .w(px(self.width))
             .flex()

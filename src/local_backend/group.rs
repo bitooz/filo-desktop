@@ -1832,6 +1832,77 @@ mod tests {
     }
 
     #[test]
+    fn voice_recordings_go_from_the_shared_list_in_a_chat_and_the_group() {
+        let local = temp();
+        let chef_chat = add_agent(&local, "chef-id", "Chef");
+        let session = local.call("agents:openGroup", &json!({})).unwrap().as_str().unwrap().to_string();
+        let db = local.db().unwrap();
+        let recording = |bytes: &[u8]| {
+            let storage_id = filo_local::attachments::reserve("audio/mp4");
+            filo_local::attachments::save_as(&local.root, &storage_id, bytes).unwrap();
+            filo_local::store::Voice { storage_id, duration_ms: 4200 }
+        };
+        // A voice message in the chef's chat, and one in the group.
+        let mut said = Message::new(Role::User, "Pasta tonight?", None);
+        said.voice = Some(recording(b"chat m4a"));
+        local.agent_chats.append(&chef_chat, &said).unwrap();
+        let (asked, _) = group::add_user_message(db, "thread-1", "Dinner?", now_ms() as i64).unwrap();
+        let group_voice = recording(b"group voice m4a");
+        group::set_voice(db, &asked.id, &group_voice).unwrap();
+        // Each is in its Voice tab, deletable, with its size.
+        let voices = |session: &str| -> Vec<(String, bool, f64, String)> {
+            let page = local.call("chatShared:list", &json!({ "sessionId": session })).unwrap();
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["kind"] == "voice")
+                .map(|item| {
+                    (
+                        item["messageId"].as_str().unwrap().to_string(),
+                        item["deletable"] == true,
+                        item["size"].as_f64().unwrap(),
+                        item["url"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let in_chat = voices(&chef_chat);
+        assert_eq!((in_chat.len(), &in_chat[0].0, in_chat[0].1, in_chat[0].2), (1, &said.id, true, 8.));
+        let in_group = voices(&session);
+        assert_eq!((in_group.len(), &in_group[0].0, in_group[0].1, in_group[0].2), (1, &asked.id, true, 15.));
+        // Deleted: gone from the list, its message shows it as no longer kept.
+        let shown = |session: &str, id: &str| {
+            let detail = local.call("voiceSessions:detail", &json!({ "id": session })).unwrap();
+            detail["messages"].as_array().unwrap().iter().find(|message| message["_id"] == id).unwrap()
+                ["voiceRecording"]
+                .clone()
+        };
+        assert_eq!(shown(&chef_chat, &said.id)["gone"], false);
+        for (session, (id, _, size, url)) in [(&chef_chat, &in_chat[0]), (&session, &in_group[0])] {
+            let picked = json!([{ "messageId": id, "url": url }]);
+            let deleted =
+                local.call("chatShared:deleteFiles", &json!({ "sessionId": session, "files": picked })).unwrap();
+            assert_eq!((deleted["deleted"].as_f64(), deleted["freed"].as_f64()), (Some(1.), Some(*size)));
+            assert!(voices(session).is_empty());
+            let voice = shown(session, id);
+            assert_eq!(
+                (&voice["gone"], &voice["url"], &voice["durationMs"]),
+                (&json!(true), &Value::Null, &json!(4200.))
+            );
+        }
+        // A recording still on its way (sent, not saved yet) isn't taken for one deleted.
+        let mut sending = Message::new(Role::User, "", None);
+        sending.voice = Some(filo_local::store::Voice {
+            storage_id: filo_local::attachments::reserve("audio/mp4"),
+            duration_ms: 900,
+        });
+        local.agent_chats.append(&chef_chat, &sending).unwrap();
+        assert_eq!(shown(&chef_chat, &sending.id)["gone"], false);
+        std::fs::remove_dir_all(&local.root).ok();
+    }
+
+    #[test]
     fn files_an_agent_posts_show_where_they_are_found_when_moved_and_gone_when_deleted() {
         let local = temp();
         let chef_chat = add_agent(&local, "chef-id", "Chef");

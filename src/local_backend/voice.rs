@@ -248,13 +248,16 @@ impl Local {
         Ok(Sent { message_id: message.id, turn_id: turn_id.to_string(), voice })
     }
 
-    /// A voice message's recording as the chat shows it (`voiceRecording`): it plays from this Mac once it's saved.
+    /// A voice message's recording as the chat shows it (`voiceRecording`): it plays from this Mac once it's saved;
+    /// `gone` once the user deleted it from the Shared list (attachments.rs `delete_recording`).
     pub(super) fn voice_json(&self, voice: &Voice) -> Value {
         let saved = attachments::file(&self.root, &voice.storage_id);
+        let gone = saved.is_none() && attachments::recording_deleted(&self.root, &voice.storage_id);
         json!({
             "storageId": saved.as_ref().map(|_| voice.storage_id.clone()),
             "durationMs": voice.duration_ms as f64,
             "url": saved.map(|path| format!("file://{}", path.display())),
+            "gone": gone,
         })
     }
 }
@@ -342,7 +345,10 @@ mod tests {
             (sent["messageId"].as_str(), Some("Check the build, please."))
         );
         // Until the recording is saved, the bubble plays the app's own copy.
-        assert_eq!(message["voiceRecording"], json!({ "storageId": null, "durationMs": 2400.0, "url": null }));
+        assert_eq!(
+            message["voiceRecording"],
+            json!({ "storageId": null, "durationMs": 2400.0, "url": null, "gone": false })
+        );
         assert_eq!(detail["session"]["title"].as_str(), Some("Check the build, please."));
 
         local.upload_voice(sent["token"].as_str().unwrap(), b"m4a bytes").unwrap();

@@ -4,8 +4,9 @@
 // cursor is the last message it read (`<at>:<id>`), and the next page starts just before it, so messages added
 // meanwhile don't shift what's older.
 //
-// The user can delete the files Filo keeps copies of from there (`chatShared:deleteFiles`, attachments.rs
-// `delete_copy`), to free the room they take: the messages then show them as no longer kept. A file shown where it
+// The user can delete the files Filo keeps copies of from there, and voice messages' recordings
+// (`chatShared:deleteFiles`, attachments.rs `delete_copy`, `delete_recording`), to free the room they take: the messages
+// then show them as no longer kept. A file shown where it
 // is on this Mac (an agent's, attachments.rs `in_place`) isn't Filo's to delete. A chat's copies also go with the chat
 // (`delete_chat_files`).
 
@@ -78,7 +79,8 @@ impl Local {
 
     /// `chatShared:deleteFiles { sessionId, files: [{ messageId, url }] }`: deletes Filo's copies of those files of the
     /// conversation's messages (the Shared list's picks), each only when it's one (attachments.rs `delete_copy`), never a
-    /// file shown where it is. How many it deleted and the room that freed.
+    /// file shown where it is, and their voice messages' recordings (`delete_recording`). How many it deleted and the
+    /// room that freed.
     pub(super) fn delete_shared_files(&self, args: &Value) -> Result<Value, String> {
         let id = super::required(args, "sessionId")?;
         let picked: HashSet<(&str, &str)> = args
@@ -90,6 +92,20 @@ impl Local {
             .collect();
         let (mut deleted, mut freed) = (0, 0u64);
         for message in self.shared_messages_of(id).0 {
+            // Its voice message's recording, Filo's too.
+            if let Some((voice, file)) = message
+                .voice
+                .as_ref()
+                .and_then(|voice| Some((voice, filo_local::attachments::file(&self.root, &voice.storage_id)?)))
+                && picked.contains(&(message.id.as_str(), file_url(&file).as_str()))
+            {
+                let size = std::fs::metadata(&file).map_or(0, |meta| meta.len());
+                match filo_local::attachments::delete_recording(&self.root, &voice.storage_id) {
+                    Ok(true) => (deleted, freed) = (deleted + 1, freed + size),
+                    Ok(false) => {}
+                    Err(error) => return Err(format!("Couldn't delete the voice message: {error}")),
+                }
+            }
             for file in &message.attachments {
                 if !picked.contains(&(message.id.as_str(), file_url(&file.file).as_str())) {
                     continue;
@@ -224,6 +240,7 @@ fn shared_in(root: &Path, message: &Message, sender: Option<&str>) -> Vec<Value>
         row["contentType"] = json!("audio/mp4");
         row["size"] = json!(std::fs::metadata(&file).map_or(0., |meta| meta.len() as f64));
         row["durationMs"] = json!(voice.duration_ms as f64);
+        row["deletable"] = json!(true);
         items.push(row);
     }
     for file in &message.attachments {

@@ -55,6 +55,12 @@ fn seed(local: &Path, chat: &str) -> Result<(PathBuf, PathBuf), String> {
         inode: None,
     };
     say("Warmer, more like this.", Role::User, vec![sketch.clone()])?;
+    // A voice message, its recording saved as the app saves one.
+    let storage_id = filo_local::attachments::reserve("audio/mp4");
+    filo_local::attachments::save_as(local, &storage_id, &[0; 2048]).map_err(|error| error.to_string())?;
+    let mut voice = Message::new(Role::User, "And make the corners rounder.", None);
+    voice.voice = Some(filo_local::store::Voice { storage_id, duration_ms: 3400 });
+    store.append(chat, &voice).map_err(|error| error.to_string())?;
     picture(&logo, [239, 108, 0]);
     std::fs::write(&brief, "# Logo brief\n\nWarm, round, friendly.\n").map_err(|error| error.to_string())?;
     say("And v2, warmer, with the brief.", Role::Assistant, vec![sent(&logo)?, sent(&brief)?])?;
@@ -76,7 +82,8 @@ fn seed(local: &Path, chat: &str) -> Result<(PathBuf, PathBuf), String> {
 
 /// Seeds the main agent's chat (`seed`), opens its profile, scrolls to Shared, clicks Select, picks v1 and the sketch,
 /// Delete and the dialog's Return, then checks only those copies went (the logo and brief where the agent has them
-/// stay), and shows the chat (v1 and the sketch no longer kept, v2 and the brief there) and Group settings' Shared.
+/// stay); then the same on the Voice tab for the voice message. It shows the chat (v1, the sketch and the voice message
+/// no longer kept, v2 and the brief there) and Group settings' Shared.
 /// Pictures with `FILO_DRIVE_SHOTS=<folder>`. Run it with a `FILO_CONFIG_DIR` of its own.
 pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
     let backend = backend(cx);
@@ -162,7 +169,34 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
             if kept { "still there" } else { "gone" },
             if ok { "PASS" } else { "FAIL" }
         );
+        // The voice message, from the Voice tab.
+        if let Some(tabs) = on_screen("shared-tabs") {
+            let x = f32::from(tabs.origin.x) + f32::from(tabs.size.width) * 7. / 8.;
+            native_input::click(width, f64::from(x), f64::from(f32::from(tabs.center().y)));
+        }
+        wait(800).await;
+        click(&this, cx, "shared-select");
+        wait(600).await;
+        click(&this, cx, "shared-voice-0");
+        wait(600).await;
+        shot("5b-voice-picked");
+        click(&this, cx, "shared-delete");
+        wait(1000).await;
+        native_input::key(width, "\r", 36, 0);
+        wait(2000).await;
+        shot("5c-voice-deleted");
         let detail = backend.call_raw("voiceSessions:detail", json!({ "id": chat })).await.unwrap_or_default();
+        let voice_gone = detail["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message.get("voiceRecording"))
+            .any(|voice| voice["gone"] == true);
+        eprintln!(
+            "shared-delete-drive: the voice message {} {}",
+            if voice_gone { "shows as no longer kept" } else { "still has its recording" },
+            if voice_gone { "PASS" } else { "FAIL" }
+        );
         let labels: Vec<String> = detail["messages"]
             .as_array()
             .into_iter()

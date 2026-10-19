@@ -332,7 +332,7 @@ impl PendingSend {
             creation_time: at,
             role: "user".into(),
             content: self.text.clone(),
-            voice_recording: self.voice_ms.map(|duration_ms| VoiceRecording { duration_ms, url: None }),
+            voice_recording: self.voice_ms.map(|duration_ms| VoiceRecording { duration_ms, url: None, gone: false }),
             reaction: None,
             reply_to_message_id: self.reply.as_ref().map(|reply| reply.message_id.clone()),
             turn: None,
@@ -3138,7 +3138,9 @@ impl Conversation {
         for (index, file) in files.iter().enumerate() {
             bubble = bubble.child(render_file(&key, index, file, user, window, cx));
         }
-        if let Some(voice) = &message.voice_recording {
+        if let Some(voice) = message.voice_recording.as_ref().filter(|voice| voice.gone) {
+            bubble = bubble.child(gone_voice(voice.duration_ms, user, cx));
+        } else if let Some(voice) = &message.voice_recording {
             let url = voice.url.clone().or_else(|| voice::uploading_voice_url(&id));
             bubble = bubble.child(render_voice(&id, url, voice.duration_ms, "Voice message", user, cx));
         }
@@ -5180,6 +5182,37 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
             }
         });
     crate::smoke::tracked(format!("chat-file-{}", file.name), row)
+}
+
+/// A voice message whose recording the user deleted from the Shared list: said to be no longer kept, as a file is,
+/// with its length.
+fn gone_voice(duration_ms: f64, user: bool, cx: &App) -> AnyElement {
+    let colors = *cx.colors();
+    let fg = if user { colors.on_user_bubble } else { colors.on_assistant_bubble };
+    let length = (duration_ms > 0.).then(|| format!(" · {}", format::duration_clock(duration_ms)));
+    div()
+        .flex()
+        .items_center()
+        .gap(px(space::SM))
+        .child(
+            div()
+                .size(px(32.))
+                .flex_none()
+                .rounded(px(radius::FULL))
+                .bg(fg.opacity(0.1))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ui::icon("file-x").size(px(16.)).text_color(fg)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(div().footnote().semibold().child("Voice message"))
+                .child(div().caption().opacity(0.7).child(format!("No longer kept{}", length.unwrap_or_default()))),
+        )
+        .into_any_element()
 }
 
 fn render_voice(id: &str, url: Option<String>, duration_ms: f64, label: &str, user: bool, cx: &App) -> AnyElement {

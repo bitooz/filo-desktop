@@ -253,6 +253,28 @@ pub fn delete_copy(file: &Attachment) -> io::Result<bool> {
     }
 }
 
+/// The storage ids of the voice messages' recordings the user deleted (`delete_recording`), one a line, beside them: a
+/// message whose recording isn't there shows it as no longer kept only when it's listed, as one just sent is saved a
+/// moment after its message.
+const DELETED_RECORDINGS: &str = "deleted-recordings.txt";
+
+/// Deletes the voice message's recording `storage_id` in `root`'s `DIR` (the Shared list), noted as deleted
+/// (`recording_deleted`). Whether there was one to delete.
+pub fn delete_recording(root: &Path, storage_id: &str) -> io::Result<bool> {
+    let Some(path) = file(root, storage_id) else { return Ok(false) };
+    // Noted first, so the message never shows it as still on its way.
+    let mut list = fs::OpenOptions::new().create(true).append(true).open(root.join(DIR).join(DELETED_RECORDINGS))?;
+    io::Write::write_all(&mut list, format!("{storage_id}\n").as_bytes())?;
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+/// Whether the user deleted the recording `storage_id` (`delete_recording`).
+pub fn recording_deleted(root: &Path, storage_id: &str) -> bool {
+    fs::read_to_string(root.join(DIR).join(DELETED_RECORDINGS))
+        .is_ok_and(|list| list.lines().any(|line| line == storage_id))
+}
+
 /// Where an agent is told a message's file is: for an agent's frozen copy (`sent`), which turns don't read without
 /// asking, where the agent had it when it sent it; else the file itself (one shown in place, the user's copy). Without
 /// control characters, so a folder's name can't start a line of its own.
@@ -589,6 +611,19 @@ mod tests {
         assert!(!delete_copy(&posing).unwrap() && notes.is_file());
         assert!(delete_copy(&picture).unwrap() && !picture.file.exists() && logo.is_file());
         assert!(!delete_copy(&picture).unwrap());
+    }
+
+    #[test]
+    fn a_deleted_recording_is_noted_as_deleted() {
+        let root = crate::test_support::temp_dir("attachments-recording");
+        let (kept, later) = (reserve("audio/mp4"), reserve("audio/mp4"));
+        save_as(&root, &kept, b"m4a").unwrap();
+        // One still on its way isn't deleted, nor is a name that isn't a storage id.
+        assert!(!delete_recording(&root, &later).unwrap() && !recording_deleted(&root, &later));
+        assert!(!delete_recording(&root, DELETED_RECORDINGS).unwrap());
+        assert!(delete_recording(&root, &kept).unwrap());
+        assert!(file(&root, &kept).is_none() && recording_deleted(&root, &kept));
+        assert!(!delete_recording(&root, &kept).unwrap());
     }
 
     #[test]
