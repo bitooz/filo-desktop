@@ -7,8 +7,9 @@
 // (a picture, in the chat's image editor), Select, and Delete for the files Filo keeps (`deletable`: its copies and voice
 // messages' recordings, never a file shown where it is on this Mac). ⌘-click and Shift-click pick several, the Mac way;
 // the menu's Select starts picking (`selecting`): a plain click then picks or lets go of a file too, instead of opening
-// it, until the last one is let go or Esc. Picked tiles show a mark and their size. The menu and the Delete key act on
-// all picked, and Esc lets them go. Deleting frees the room they take, and their messages show them as no longer kept.
+// it, until the last one is let go or Esc. While picking, each file Filo can delete shows a circle (`check_mark`), ticked
+// once it's picked, as Photos does; picked files show their size too. The menu and the Delete key act on all picked,
+// and Esc lets them go. Deleting frees the room they take, and their messages show them as no longer kept.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -32,7 +33,7 @@ use crate::{format, media};
 const FILL: usize = 30;
 const GRID_GAP: f32 = 2.;
 const ROW_TILE: f32 = 40.;
-/// A picked tile's mark.
+/// A file's circle while picking.
 const CHECK: f32 = 20.;
 
 /// What the Shared list asks of the page around it: its menu's Show in Chat (the message's id, and how many messages
@@ -509,9 +510,11 @@ fn month_heading(label: String, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The files picked, and the panel a click picks them in and a right-click opens a file's menu for.
+/// The files picked, whether picking is on, and the panel a click picks them in and a right-click opens a file's menu
+/// for.
 struct Picks<'a> {
     picked: &'a HashSet<Key>,
+    picking: bool,
     panel: WeakEntity<SharedPanel>,
 }
 
@@ -549,6 +552,11 @@ impl Picks<'_> {
 
     fn picked(&self, item: &SharedItem) -> bool {
         self.picked.contains(&item.key())
+    }
+
+    /// `item`'s circle while picking (`check_mark`), when Filo can delete it: none for a file shown in place.
+    fn mark(&self, item: &SharedItem, over_media: bool, cx: &App) -> Option<gpui::Div> {
+        (self.picking && item.deletable).then(|| check_mark(self.picked(item), over_media, cx))
     }
 
     /// `element` with `item`'s right-click menu (`item_menu`), under an id of its own: gpui-component names every
@@ -643,26 +651,28 @@ fn show_in_finder(files: &[std::path::PathBuf]) {
     }
 }
 
-/// A picked tile's round mark, filled and ticked.
-fn check_mark(cx: &App) -> gpui::Div {
+/// A file's round mark while picking: filled and ticked once it's picked, else empty (white over a picture, as Photos'
+/// is).
+fn check_mark(picked: bool, over_media: bool, cx: &App) -> gpui::Div {
     let colors = *cx.colors();
-    div()
-        .size(px(CHECK))
-        .flex_none()
-        .rounded(px(radius::FULL))
-        .border_2()
-        .border_color(colors.accent)
-        .bg(colors.accent)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(ui::icon_sized("check", 12., colors.on_accent))
+    let mark = div().size(px(CHECK)).flex_none().rounded(px(radius::FULL)).border_2();
+    match (picked, over_media) {
+        (true, _) => mark
+            .border_color(colors.accent)
+            .bg(colors.accent)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(ui::icon_sized("check", 12., colors.on_accent)),
+        (false, true) => mark.border_color(colors.on_media).bg(colors.media.opacity(0.2)),
+        (false, false) => mark.border_color(colors.border_strong),
+    }
 }
 
 /// Three square tiles a row across the column; a video shows its frame and length. A tile opens the app's viewer on
 /// `gallery` (the tab's pictures and videos) at its place, so the arrows step through the rest. A row far off screen
-/// leaves its pictures out (`on_screen`). ⌘- or Shift-click picks a tile instead (`picks`): a picked one shows a mark,
-/// its outline and its size. Each has its right-click menu.
+/// leaves its pictures out (`on_screen`). ⌘- or Shift-click picks a tile instead (`picks`): while picking, one Filo can
+/// delete shows its circle at the top right, and a picked one its outline and its size. Each has its right-click menu.
 fn media_grid(
     items: &[&SharedItem],
     first: usize,
@@ -703,6 +713,7 @@ fn media_grid(
                         .or_else(|| poster.map(|poster| gpui::Resource::Path(poster.picture.as_path().into())));
                     let duration = poster.and_then(|poster| poster.duration_ms);
                     let picked = picks.picked(item);
+                    let mark = picks.mark(item, true, cx);
                     let at = first + row * 3 + column;
                     let square = div()
                         .id(SharedString::from(format!("shared-media-{at}")))
@@ -744,7 +755,7 @@ fn media_grid(
                                     .when_some(duration, |this, duration| this.child(format::duration_clock(duration))),
                             )
                         })
-                        .when(picked, |this| {
+                        .when(picked || mark.is_some(), |this| {
                             this.child(
                                 div()
                                     .absolute()
@@ -754,10 +765,9 @@ fn media_grid(
                                     .flex_col()
                                     .justify_between()
                                     .items_end()
-                                    .border_2()
-                                    .border_color(colors.accent)
-                                    .child(check_mark(cx))
-                                    .when_some(item.size, |this, size| {
+                                    .when(picked, |this| this.border_2().border_color(colors.accent))
+                                    .child(mark.unwrap_or_else(div))
+                                    .when_some(item.size.filter(|_| picked), |this, size| {
                                         this.child(
                                             div()
                                                 .px(px(space::XS + 2.))
@@ -792,7 +802,8 @@ fn media_grid(
 }
 
 /// A list row: a 40 px tile, a title and a line under it, and what goes at the end. A file's (`menu`: the panel's
-/// picks and the item) is drawn picked when it is, and has its right-click menu; a link's has neither.
+/// picks and the item) is drawn picked when it is, has its right-click menu, and ends with its circle while picking
+/// (the circle's room, empty, for a file shown in place, so the rows line up); a link's has none of these.
 #[allow(clippy::too_many_arguments)]
 fn row(
     id: String,
@@ -806,6 +817,9 @@ fn row(
 ) -> AnyElement {
     let colors = *cx.colors();
     let picked = menu.is_some_and(|(picks, item)| picks.picked(item));
+    let mark = menu
+        .filter(|(picks, _)| picks.picking)
+        .map(|(picks, item)| picks.mark(item, false, cx).unwrap_or_else(|| div().size(px(CHECK)).flex_none()));
     let row = div()
         .id(SharedString::from(id.clone()))
         .flex()
@@ -824,6 +838,7 @@ fn row(
         .when_some(trailing, |this, trailing| {
             this.child(div().flex_none().caption().text_color(colors.text_tertiary).child(trailing))
         })
+        .children(mark)
         .on_click(on_click);
     match menu {
         Some((picks, item)) => picks.with_menu(id, item, row),
@@ -846,18 +861,25 @@ fn tile(round: bool, cx: &App) -> gpui::Div {
 }
 
 impl SharedPanel {
-    /// The text width of a row: the column less the row's padding, the tile and the gap.
-    fn text_width(&self) -> f32 {
-        (self.width - 2. * space::SM - ROW_TILE - space::MD).max(0.)
+    /// The text width of a row: the column less the row's padding, the tile and the gap, and a file's circle and its
+    /// gap while picking (`file`).
+    fn text_width(&self, file: bool) -> f32 {
+        let mark = if file && self.picking() { CHECK + space::MD } else { 0. };
+        (self.width - 2. * space::SM - ROW_TILE - space::MD - mark).max(0.)
+    }
+
+    /// Picking is on: files are picked, or the menu's Select started it.
+    fn picking(&self) -> bool {
+        self.selecting || !self.picked.is_empty()
     }
 
     fn picks(&self) -> Picks<'_> {
-        Picks { picked: &self.picked, panel: self.weak.clone() }
+        Picks { picked: &self.picked, picking: self.picking(), panel: self.weak.clone() }
     }
 
     /// One line, cut with "…" at the row's text width (a flexible width isn't known in time in a scrolling page).
-    fn line(&self, text: impl Into<SharedString>) -> gpui::Div {
-        div().w(px(self.text_width())).truncate().child(text.into())
+    fn line(&self, file: bool, text: impl Into<SharedString>) -> gpui::Div {
+        div().w(px(self.text_width(file))).truncate().child(text.into())
     }
 
     fn file_row(&self, index: usize, item: &SharedItem, cx: &App) -> AnyElement {
@@ -872,8 +894,8 @@ impl SharedPanel {
         row(
             format!("shared-file-{index}"),
             picture.into_any_element(),
-            self.line(name).callout().medium().into_any_element(),
-            self.line(details).footnote().text_color(colors.text_secondary).into_any_element(),
+            self.line(true, name).callout().medium().into_any_element(),
+            self.line(true, details).footnote().text_color(colors.text_secondary).into_any_element(),
             None,
             picks.on_click(item, preview(item)),
             Some((&picks, item)),
@@ -890,8 +912,8 @@ impl SharedPanel {
         row(
             format!("shared-link-{index}"),
             picture.into_any_element(),
-            self.line(item.title.clone().unwrap_or(host)).callout().semibold().into_any_element(),
-            self.line(item.url.clone()).footnote().text_color(colors.link).into_any_element(),
+            self.line(false, item.title.clone().unwrap_or(host)).callout().semibold().into_any_element(),
+            self.line(false, item.url.clone()).footnote().text_color(colors.link).into_any_element(),
             None,
             open_url(item.url.clone()),
             None,
@@ -923,7 +945,7 @@ impl SharedPanel {
             }
         };
         let duration = item.duration_ms.map(format::duration_clock);
-        let width = self.text_width() - if duration.is_some() { 40. } else { 0. };
+        let width = self.text_width(true) - if duration.is_some() { 40. } else { 0. };
         let picks = self.picks();
         let on_click = picks.on_click(item, {
             let url = item.url.clone();

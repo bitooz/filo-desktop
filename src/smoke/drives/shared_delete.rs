@@ -292,6 +292,7 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
             native_input::click_with(width, f64::from(f32::from(center.x)), f64::from(f32::from(center.y)), COMMAND);
         }
         wait(600).await;
+        shot("5b-voice-picked");
         native_input::key(width, "\u{7f}", 51, 0);
         wait(1000).await;
         native_input::key(width, "\r", 36, 0);

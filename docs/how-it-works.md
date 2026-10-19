@@ -92,8 +92,10 @@ Filo's copies (the user's in `local/attachments/`, agents' pictures and videos i
 other chat or the group has too), and from a chat's Shared list (the agent's profile, Group settings;
 screens/chat/shared.rs). A right-click on a picture, video, file or recording opens its menu (`item_menu`): Show in Chat,
 Show in Finder, Edit (a picture, in the chat's image editor), Select, and Delete (`chatShared:deleteFiles`) for Filo's
-own copies and voice messages' recordings, none for a file shown in place. ⌘-click and Shift-click pick several, each
-then showing a mark and its size; the menu and the Delete key act on all of them, and Esc lets them go. A delete that
+own copies and voice messages' recordings, none for a file shown in place. ⌘-click and Shift-click pick several; while
+picking, each file Filo can delete shows a circle (a tile's at its top right, a row's at its end; `check_mark`), filled
+with a tick once it's picked, and picked files show their size. The menu and the Delete key act on all of them, and Esc
+lets them go. A delete that
 fails says why in a toast. Select starts picking (`selecting`): a plain click then picks or lets go of a file instead
 of opening it, until the last one is let go or Esc. Show in Chat asks how far back the message is (`chatShared:depth`, counted as
 `voiceSessions:detail`'s `limit` counts, the group's by `seq`), and the chat loads back that far before it scrolls to
