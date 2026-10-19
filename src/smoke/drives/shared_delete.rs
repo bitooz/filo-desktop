@@ -6,7 +6,7 @@ use std::time::Duration;
 use gpui::{Context, Window};
 use serde_json::{Value, json};
 
-use super::{PAGE_SCROLLS, click, native_input, on_screen, shot, window_width};
+use super::{PAGE_SCROLLS, native_input, on_screen, shot, window_width};
 use crate::app::AppShell;
 use crate::backend::backend;
 use crate::local_backend::DEFAULT_AGENT_ID;
@@ -128,37 +128,59 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
         this.update_in(cx, |_, window, _| window.refresh()).ok();
         wait(1000).await;
         shot("1-shared");
-        click(&this, cx, "shared-select");
-        wait(800).await;
-        shot("2-select");
         // Newest first: v2, the sketch, v1, three to a row.
-        let Some(row) = on_screen("shared-media-row-0") else {
+        if on_screen("shared-media-row-0").is_none() {
             eprintln!("shared-delete-drive: FAIL the media grid isn't on screen");
             return quit(cx);
-        };
+        }
         let Some(width) = window_width(&this, cx) else { return quit(cx) };
+        // Where the tile is now: the bar over the list moves it down while files are picked.
         let tile = |column: f32| {
+            let row = on_screen("shared-media-row-0").unwrap_or_default();
             let x = f32::from(row.origin.x) + f32::from(row.size.width) * (column + 0.5) / 3.;
             (f64::from(x), f64::from(f32::from(row.center().y)))
         };
+        const COMMAND: u64 = native_input::COMMAND;
+        const ESCAPE: (&str, u16) = ("\u{1b}", 53);
+        let picked_bar = || on_screen("shared-delete").is_some();
+        // v1's menu, for it alone.
+        let (x, y) = tile(2.);
+        native_input::right_click(width, x, y);
+        wait(800).await;
+        shot("2-menu");
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+        wait(600).await;
+        // ⌘-click v2, Shift-click v1: the run of all three is picked; Esc lets them go.
+        let (x0, y0) = tile(0.);
+        native_input::click_with(width, x0, y0, COMMAND);
+        wait(400).await;
+        let (x2, y2) = tile(2.);
+        native_input::click_with(width, x2, y2, native_input::SHIFT);
+        wait(600).await;
+        shot("2b-shift-run");
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+        wait(600).await;
+        // ⌘-click the sketch and v1: both picked; v1's menu now deletes both.
         for column in [1., 2.] {
             let (x, y) = tile(column);
-            native_input::click(width, x, y);
+            native_input::click_with(width, x, y, COMMAND);
             wait(400).await;
         }
-        // v2, the agent's newest, is still its file's copy: picked, then let go.
-        let (x, y) = tile(0.);
-        native_input::click(width, x, y);
-        wait(400).await;
-        native_input::click(width, x, y);
+        let (x, y) = tile(2.);
+        native_input::right_click(width, x, y);
+        wait(800).await;
+        shot("3-picked-menu");
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
         wait(600).await;
-        shot("3-picked");
-        click(&this, cx, "shared-delete");
+        shot("4-picked");
+        let both_picked = picked_bar();
+        // The Delete key, then the dialog's Return.
+        native_input::key(width, "\u{7f}", 51, 0);
         wait(1000).await;
-        shot("4-confirm");
+        shot("5-confirm");
         native_input::key(width, "\r", 36, 0);
         wait(2000).await;
-        shot("5-deleted");
+        shot("5a-deleted");
         let designs = local.join("agents/workspace/designs");
         let kept = [designs.join("logo.png"), designs.join("brief.md")].iter().all(|path| path.is_file());
         let ok = !v1.exists() && !sketch.exists() && kept;
@@ -169,18 +191,37 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
             if kept { "still there" } else { "gone" },
             if ok { "PASS" } else { "FAIL" }
         );
-        // The voice message, from the Voice tab.
+        eprintln!(
+            "shared-delete-drive: ⌘-click picked two, the bar showed {} {}",
+            if both_picked { "with Delete" } else { "nothing" },
+            if both_picked { "PASS" } else { "FAIL" }
+        );
+        // ⌘-click v2 (the agent's latest), then Esc lets it go.
+        let (x, y) = tile(0.);
+        native_input::click_with(width, x, y, COMMAND);
+        wait(600).await;
+        let picked_then = picked_bar();
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+        wait(600).await;
+        let cleared = picked_then && !picked_bar();
+        eprintln!("shared-delete-drive: Esc lets go of the picked {}", if cleared { "PASS" } else { "FAIL" });
+        // The voice message, from the Voice tab: ⌘-click, Delete key, Return.
         if let Some(tabs) = on_screen("shared-tabs") {
             let x = f32::from(tabs.origin.x) + f32::from(tabs.size.width) * 7. / 8.;
             native_input::click(width, f64::from(x), f64::from(f32::from(tabs.center().y)));
         }
         wait(800).await;
-        click(&this, cx, "shared-select");
+        if let Some(voice) = on_screen("shared-voice-0") {
+            let center = voice.center();
+            native_input::right_click(width, f64::from(f32::from(center.x)), f64::from(f32::from(center.y)));
+            wait(800).await;
+            shot("5b-voice-menu");
+            native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+            wait(600).await;
+            native_input::click_with(width, f64::from(f32::from(center.x)), f64::from(f32::from(center.y)), COMMAND);
+        }
         wait(600).await;
-        click(&this, cx, "shared-voice-0");
-        wait(600).await;
-        shot("5b-voice-picked");
-        click(&this, cx, "shared-delete");
+        native_input::key(width, "\u{7f}", 51, 0);
         wait(1000).await;
         native_input::key(width, "\r", 36, 0);
         wait(2000).await;
@@ -213,14 +254,47 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
             })
             .collect();
         eprintln!("shared-delete-drive: the chat's files: {}", labels.join(", "));
+        // v2's menu, from the keyboard: its first item, Show in Chat, opens the chat at its message.
+        if let Some(tabs) = on_screen("shared-tabs") {
+            let x = f32::from(tabs.origin.x) + f32::from(tabs.size.width) / 8.;
+            native_input::click(width, f64::from(x), f64::from(f32::from(tabs.center().y)));
+        }
+        wait(800).await;
+        // Opens v2's menu and runs its `item`th item from the keyboard (↓ that many times, Return).
+        let pick_from_menu = async |item: usize| {
+            let (x, y) = tile(0.);
+            native_input::right_click(width, x, y);
+            wait(800).await;
+            for _ in 0..item {
+                native_input::key(width, "\u{f701}", 125, 0);
+                wait(200).await;
+            }
+            native_input::key(width, "\r", 36, 0);
+            wait(3000).await;
+        };
+        pick_from_menu(1).await;
+        shot("6-chat");
+        let in_chat = this
+            .update(cx, |shell, cx| {
+                shell.agents_screen().is_some_and(|agents| agents.read(cx).current_conversation().is_some())
+            })
+            .unwrap_or(false);
+        eprintln!("shared-delete-drive: Show in Chat opens the chat {}", if in_chat { "PASS" } else { "FAIL" });
+        // Edit (its third item): the chat's image editor, with v2.
         this.update_in(cx, |shell, window, cx| {
             if let Some(agents) = shell.agents_screen() {
-                agents.update(cx, |agents, cx| agents.open_agent(DEFAULT_AGENT_ID.to_string(), window, cx));
+                agents.update(cx, |agents, cx| agents.edit_agent(DEFAULT_AGENT_ID.to_string(), window, cx));
             }
         })
         .ok();
-        wait(3000).await;
-        shot("6-chat");
+        wait(2000).await;
+        to_bottom("agent-profile");
+        this.update_in(cx, |_, window, _| window.refresh()).ok();
+        wait(1000).await;
+        pick_from_menu(3).await;
+        shot("6b-edit");
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+        wait(1000).await;
         this.update_in(cx, |shell, window, cx| {
             if let Some(agents) = shell.agents_screen() {
                 agents.update(cx, |agents, cx| agents.edit_group(window, cx));

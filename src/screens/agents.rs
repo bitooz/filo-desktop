@@ -34,7 +34,7 @@ use crate::format;
 use crate::screens::agent_picture;
 use crate::screens::chat::conversation::{self, Conversation, ConversationEvent, ModelChoice};
 use crate::screens::chat::drafts::{self, Drafts};
-use crate::screens::chat::shared::SharedPanel;
+use crate::screens::chat::shared::{SharedEvent, SharedPanel};
 use crate::screens::chat::{Mention, reply_status, working_panel};
 use crate::screens::routine_display::{Routine, format_routine_schedule};
 use crate::theme::{ActiveTheme as _, HEADER_HEIGHT, TypeVariant, Typography as _, radius, space};
@@ -313,6 +313,8 @@ struct GroupSetup {
     shared: Option<Entity<SharedPanel>>,
     scroll: ScrollHandle,
     _subs: [Subscription; 2],
+    /// Its Show in Chat and Edit (`on_shared`).
+    _shared_sub: Option<Subscription>,
 }
 
 /// `agents:scheduledCount`: the pending reminders and the routines an agent owns.
@@ -852,6 +854,8 @@ struct Form {
     routines: Option<Result<Vec<Routine>, String>>,
     scroll: ScrollHandle,
     _subs: [Subscription; 3],
+    /// The shared list's Show in Chat and Edit (`on_shared`).
+    _shared_sub: Option<Subscription>,
 }
 
 /// The picture sheet while it's open (`open_picker`): the picture its preview shows (the form's changes only on Done),
@@ -2000,6 +2004,39 @@ impl AgentsScreen {
         }
     }
 
+    /// What `shared`'s menu asks of chat `chat` (an agent's id, or `GROUP`), whose Shared list it is (`on_shared`).
+    fn watch_shared(
+        &mut self,
+        shared: &Entity<SharedPanel>,
+        chat: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(shared, window, move |this, _, event: &SharedEvent, window, cx| {
+            this.on_shared(chat.clone(), event, window, cx)
+        })
+    }
+
+    /// A Shared list's Show in Chat (the chat, at that message) and Edit (the chat, with the picture in its image editor,
+    /// which sends the marked-up copy there), leaving the profile or Group settings it's on.
+    fn on_shared(&mut self, chat: String, event: &SharedEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.setup.as_ref().is_some_and(|setup| setup.settings) {
+            self.close_setup(cx);
+        }
+        match event {
+            SharedEvent::ShowInChat(message) => self.open_at(chat, message.clone(), 0, window, cx),
+            SharedEvent::Edit(picture) => {
+                self.open_agent(chat.clone(), window, cx);
+                let view = if chat == GROUP { self.group_chat.clone() } else { self.chat(&chat) };
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| {
+                        view.edit_picture(crate::screens::chat::image_editor::Source::Chat(picture.clone()), window, cx)
+                    });
+                }
+            }
+        }
+    }
+
     /// Group settings: the setup's two steps, with Cancel and Save.
     pub fn edit_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_setup(true, window, cx);
@@ -2036,6 +2073,7 @@ impl AgentsScreen {
         let session = self.group.clone().flatten().map(|group| group.session_id).filter(|_| settings);
         let width = setup_column_width(window, self.list_width());
         let shared = session.map(|session| cx.new(|cx| SharedPanel::new(session, "Members".into(), width, cx)));
+        let _shared_sub = shared.as_ref().map(|shared| self.watch_shared(shared, GROUP.to_string(), window, cx));
         self.setup = Some(GroupSetup {
             settings,
             step: 0,
@@ -2049,6 +2087,7 @@ impl AgentsScreen {
             shared,
             scroll: ScrollHandle::new(),
             _subs: [name_sub, hue_sub],
+            _shared_sub,
         });
         self.form = None;
         self.selected = Some(GROUP.to_string());
@@ -2365,6 +2404,8 @@ impl AgentsScreen {
             let (session_id, name) = (row.session_id.clone()?, row.name.clone());
             Some(cx.new(|cx| SharedPanel::new(session_id, name, width, cx)))
         });
+        let _shared_sub =
+            shared.as_ref().zip(id.clone()).map(|(shared, agent)| self.watch_shared(shared, agent, window, cx));
         let edited = id.clone();
         self.leave_current(None, cx);
         self.form = Some(Form {
@@ -2383,6 +2424,7 @@ impl AgentsScreen {
             routines: None,
             scroll: ScrollHandle::new(),
             _subs,
+            _shared_sub,
         });
         // A one-off read: the profile shows the routines as they were when it opened.
         if let Some(agent) = edited {

@@ -1431,11 +1431,16 @@ pub(crate) mod native_input {
 
     /// A left click at (x, y), window points from the top left.
     pub fn click(width: f64, x: f64, y: f64) -> bool {
+        click_with(width, x, y, 0)
+    }
+
+    /// `click` with keys held (`flags`: `COMMAND`, …): a ⌘-click or a Shift-click.
+    pub fn click_with(width: f64, x: f64, y: f64, flags: u64) -> bool {
         unsafe {
             let Some((_, number, height)) = window(width) else { return false };
             let location = Point { x, y: height - y };
             for kind in [LEFT_DOWN, LEFT_UP] {
-                let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: kind location: location modifierFlags: 0u64 timestamp: uptime() windowNumber: number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f32];
+                let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: kind location: location modifierFlags: flags timestamp: uptime() windowNumber: number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f32];
                 if event.is_null() {
                     return false;
                 }

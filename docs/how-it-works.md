@@ -89,11 +89,15 @@ folder sends nothing and says why. A file named as a picture whose first bytes a
 
 Filo's copies (the user's in `local/attachments/`, agents' pictures and videos in `local/sent/`: attachments.rs
 `own_copy`) are deleted with their chat when an agent is deleted (local_backend/shared.rs `delete_chat_files`, those no
-other chat or the group has too), and from a chat's Shared list (the agent's profile, Group settings): Select, pick
-files, each with its size, Delete (`chatShared:deleteFiles`). Voice messages' recordings are picked the same way on the
-Voice tab (attachments.rs `delete_recording`, which notes each in `local/attachments/deleted-recordings.txt`, so a
-recording just sent and not saved yet isn't taken for one deleted). A file shown in place can't be picked. A message
-whose copy or recording was deleted shows it as "No longer kept". generate_images writes only new files (`O_EXCL`, not over a file or a
+other chat or the group has too), and from a chat's Shared list (the agent's profile, Group settings;
+screens/chat/shared.rs). A right-click on a picture, video, file or recording opens its menu (`item_menu`): Show in Chat,
+Show in Finder, Edit (a picture, in the chat's image editor), Select, and Delete (`chatShared:deleteFiles`) for Filo's
+own copies and voice messages' recordings, none for a file shown in place. ⌘-click and Shift-click pick several, each
+then showing its size; the menu, the bar over the list and the Delete key act on all of them, and Esc lets them go.
+Recordings are deleted with attachments.rs `delete_recording`, which notes each in
+`local/attachments/deleted-recordings.txt`, so a recording just sent and not saved yet isn't taken for one deleted. A
+message whose copy or recording was deleted shows it as "No longer kept". `FILO_OPEN=shared-delete-drive` clicks
+through it in a test window. generate_images writes only new files (`O_EXCL`, not over a file or a
 link at its path).
 While turns run, a watcher notices the files growing and the conversation updates. A turn's state (working, done,
 failed) is read from the file, so it survives restarts. Stop asks the worker to end the CLI. In an agent's conversation

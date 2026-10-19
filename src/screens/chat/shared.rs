@@ -3,17 +3,21 @@
 // files in Quick Look, voice plays in place, and links open in the browser. An agent's profile (the Agents tab's edit
 // page) shows its chat's under the form, Group settings the group's; the page around it scrolls it.
 // The newest page is live; older ones load as the list needs them, one at a time.
-// Select picks files to delete, each with its size: Filo's copies only (`deletable`) and voice messages' recordings, to
-// free the room they take; their messages then show them as no longer kept. A file shown where it is on this Mac (an agent's) can't be picked.
+// A right-click on a picture, video, file or recording opens its menu (`item_menu`): Show in Chat, Show in Finder, Edit
+// (a picture, in the chat's image editor), Select, and Delete for the files Filo keeps (`deletable`: its copies and voice
+// messages' recordings, never a file shown where it is on this Mac). ⌘-click and Shift-click pick several, the Mac way;
+// the menu, the bar over the list and the Delete key then act on all of them, and Esc lets them go. Deleting frees the
+// room they take, and their messages show them as no longer kept.
 
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Task,
-    WeakEntity, Window, div, img, prelude::FluentBuilder as _, px,
+    AnyElement, App, ClickEvent, Context, EventEmitter, FocusHandle, ImageSource, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Task, WeakEntity, Window, div, img, prelude::FluentBuilder as _, px,
 };
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -27,8 +31,24 @@ use crate::{format, media};
 const FILL: usize = 30;
 const GRID_GAP: f32 = 2.;
 const ROW_TILE: f32 = 40.;
-/// A pickable file's mark while picking files to delete.
+/// A picked tile's mark.
 const CHECK: f32 = 20.;
+
+/// What the Shared list asks of the page around it: its menu's Show in Chat (the message's id) and Edit (a picture).
+pub enum SharedEvent {
+    ShowInChat(String),
+    Edit(file_preview::Item),
+}
+
+/// One shared item, as the list knows it (`SharedItem::key`): its message and its address.
+type Key = (String, String);
+
+/// How a click picks: ⌘ adds or takes away one, Shift the run from the last one picked.
+#[derive(Clone, Copy)]
+enum Pick {
+    Toggle,
+    Range,
+}
 
 /// One thing a message shared.
 #[derive(Clone, Debug, Deserialize)]
@@ -55,6 +75,10 @@ struct SharedItem {
 impl SharedItem {
     fn key(&self) -> (String, String) {
         (self.message_id.clone(), self.url.clone())
+    }
+
+    fn is_video(&self) -> bool {
+        self.content_type.as_deref().is_some_and(|kind| kind.starts_with("video/"))
     }
 
     /// This Mac's copy when the item is one (the local backend's are `file://` addresses), not something to download.
@@ -146,11 +170,14 @@ pub struct SharedPanel {
     width: f32,
     /// Which grid rows were near the screen: the rest leave their pictures out (the page around scrolls this).
     on_screen: crate::pictures::OnScreen,
-    /// Itself, for what a click on a file does while picking.
+    /// Itself, for what a click on a file and its menu do.
     weak: WeakEntity<Self>,
-    /// Picking files to delete (Select), and those picked (`SharedItem::key`).
-    selecting: bool,
-    picked: HashSet<(String, String)>,
+    /// The files picked (⌘-click, Shift-click, the menu's Select), and the last one picked, where a Shift-click's run
+    /// starts.
+    picked: HashSet<Key>,
+    anchor: Option<Key>,
+    /// Takes the Delete key while files are picked.
+    focus: FocusHandle,
     /// The picked files are being deleted; why that failed, last time.
     deleting: bool,
     delete_error: Option<String>,
@@ -180,8 +207,9 @@ impl SharedPanel {
             width,
             on_screen: Default::default(),
             weak: cx.entity().downgrade(),
-            selecting: false,
             picked: HashSet::new(),
+            anchor: None,
+            focus: cx.focus_handle(),
             deleting: false,
             delete_error: None,
             _live,
@@ -282,19 +310,44 @@ impl SharedPanel {
         }
     }
 
-    /// Starts or ends picking files to delete; ending it lets go of those picked.
-    fn set_selecting(&mut self, selecting: bool, cx: &mut Context<Self>) {
-        self.selecting = selecting;
-        self.picked.clear();
+    /// Lets go of the files picked (Esc, a plain click).
+    fn clear_picks(&mut self, cx: &mut Context<Self>) {
+        if !self.picked.is_empty() || self.delete_error.is_some() {
+            self.picked.clear();
+            self.anchor = None;
+            self.delete_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Picks `key` (⌘-click: or lets it go), or (Shift-click) every item of its tab from the last one picked to it.
+    fn pick(&mut self, key: Key, how: Pick, cx: &mut Context<Self>) {
+        let run = match (how, &self.anchor) {
+            (Pick::Range, Some(anchor)) => {
+                let tab: Vec<Key> =
+                    self.items.iter().filter(|item| item.kind == self.tab.kind()).map(SharedItem::key).collect();
+                let at = |key: &Key| tab.iter().position(|other| other == key);
+                at(anchor).zip(at(&key)).map(|(from, to)| tab[from.min(to)..=from.max(to)].to_vec())
+            }
+            _ => None,
+        };
+        match run {
+            Some(run) => self.picked.extend(run),
+            None if !self.picked.remove(&key) => _ = self.picked.insert(key.clone()),
+            None => {}
+        }
+        self.anchor = Some(key);
         self.delete_error = None;
         cx.notify();
     }
 
-    fn toggle_pick(&mut self, key: (String, String), cx: &mut Context<Self>) {
-        if !self.picked.remove(&key) {
-            self.picked.insert(key);
+    /// What `key`'s menu acts on: every file picked when it's one of them, else itself.
+    fn targets(&self, key: &Key) -> Vec<SharedItem> {
+        if self.picked.contains(key) {
+            self.items.iter().filter(|item| self.picked.contains(&item.key())).cloned().collect()
+        } else {
+            self.items.iter().filter(|item| item.key() == *key).cloned().collect()
         }
-        cx.notify();
     }
 
     /// Picks no longer listed (deleted, or their message gone) aren't picked.
@@ -310,12 +363,20 @@ impl SharedPanel {
         (items, size)
     }
 
-    /// Asks, then deletes Filo's copies of the picked files; their messages then show them as no longer kept.
-    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (items, size) = self.picked_items();
+    /// The Delete key and the bar's Delete: the picked files Filo keeps.
+    fn delete_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (picked, _) = self.picked_items();
+        let items: Vec<SharedItem> = picked.into_iter().filter(|item| item.deletable).cloned().collect();
+        self.confirm_delete(items, window, cx);
+    }
+
+    /// Asks, then deletes Filo's copies of `items` (each `deletable`); their messages then show them as no longer kept.
+    fn confirm_delete(&mut self, items: Vec<SharedItem>, window: &mut Window, cx: &mut Context<Self>) {
+        let items: Vec<SharedItem> = items.into_iter().filter(|item| item.deletable).collect();
         if items.is_empty() || self.deleting {
             return;
         }
+        let size: f64 = items.iter().filter_map(|item| item.size).sum();
         let files: Vec<serde_json::Value> =
             items.iter().map(|item| json!({ "messageId": item.message_id, "url": item.url })).collect();
         let title = match files.len() {
@@ -334,6 +395,10 @@ impl SharedPanel {
     }
 
     fn delete(&mut self, files: Vec<serde_json::Value>, cx: &mut Context<Self>) {
+        let gone: HashSet<Key> = files
+            .iter()
+            .filter_map(|file| Some((file["messageId"].as_str()?.to_string(), file["url"].as_str()?.to_string())))
+            .collect();
         self.deleting = true;
         self.delete_error = None;
         cx.notify();
@@ -342,14 +407,15 @@ impl SharedPanel {
             cx,
             "chatShared:deleteFiles",
             args,
-            |this: &mut Self, result: Result<serde_json::Value, String>, cx| {
+            move |this: &mut Self, result: Result<serde_json::Value, String>, cx| {
                 this.deleting = false;
                 match result {
                     Ok(_) => {
-                        // Gone from the list now; the live page agrees once it's read again.
-                        let picked = std::mem::take(&mut this.picked);
-                        this.items.retain(|item| !picked.contains(&item.key()));
-                        this.selecting = false;
+                        // Gone from the list now; the live page agrees once it's read again. Any picked that weren't
+                        // Filo's to delete are let go too.
+                        this.items.retain(|item| !gone.contains(&item.key()));
+                        this.picked.clear();
+                        this.anchor = None;
                         this.fill(cx);
                     }
                     Err(error) => {
@@ -411,19 +477,37 @@ fn month_heading(label: String, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// While the user picks files to delete (`SharedPanel::selecting`): those picked, and the panel a click picks them in.
-struct Picking<'a> {
-    picked: &'a HashSet<(String, String)>,
+/// The files picked, and the panel a click picks them in and a right-click opens a file's menu for.
+struct Picks<'a> {
+    picked: &'a HashSet<Key>,
     panel: WeakEntity<SharedPanel>,
 }
 
-impl Picking<'_> {
-    /// What a click on `item` does while picking: picks it or lets it go; nothing for one that can't be deleted.
-    fn on_click(&self, item: &SharedItem) -> OnClick {
-        let (panel, key, deletable) = (self.panel.clone(), item.key(), item.deletable);
-        Box::new(move |_, _, cx| {
-            if deletable {
-                panel.update(cx, |panel, cx| panel.toggle_pick(key.clone(), cx)).ok();
+impl Picks<'_> {
+    /// What a click on `item` does: with ⌘ or Shift, picks it (the panel takes the keyboard, for Delete); a plain one
+    /// lets go of those picked and `opens` it.
+    fn on_click(&self, item: &SharedItem, opens: OnClick) -> OnClick {
+        let (panel, key) = (self.panel.clone(), item.key());
+        Box::new(move |event, window, cx| {
+            let modifiers = event.modifiers();
+            let how = if modifiers.platform {
+                Some(Pick::Toggle)
+            } else if modifiers.shift {
+                Some(Pick::Range)
+            } else {
+                None
+            };
+            panel
+                .update(cx, |panel, cx| match how {
+                    Some(how) => {
+                        window.focus(&panel.focus);
+                        panel.pick(key.clone(), how, cx);
+                    }
+                    None => panel.clear_picks(cx),
+                })
+                .ok();
+            if how.is_none() {
+                opens(event, window, cx);
             }
         })
     }
@@ -431,38 +515,126 @@ impl Picking<'_> {
     fn picked(&self, item: &SharedItem) -> bool {
         self.picked.contains(&item.key())
     }
+
+    /// `element` with `item`'s right-click menu (`item_menu`), under an id of its own: gpui-component names every
+    /// context menu "context-menu", so items side by side would share one.
+    fn with_menu(
+        &self,
+        id: String,
+        item: &SharedItem,
+        element: impl gpui::ParentElement + gpui::Styled + IntoElement + 'static,
+    ) -> AnyElement {
+        let (panel, key) = (self.panel.clone(), item.key());
+        div()
+            .id(SharedString::from(format!("{id}-menu")))
+            .size_full()
+            .child(element.context_menu(move |menu, window, cx| item_menu(menu, &panel, &key, window, cx)))
+            .into_any_element()
+    }
 }
 
-/// The round mark of a file that can be picked, on a picture (`on_media`) or in a row: filled and ticked once it is.
-fn check_mark(picked: bool, on_media: bool, cx: &App) -> gpui::Div {
+/// A file's right-click menu, built as it opens: for it, or for every file picked when it's one of them. Show in Chat
+/// (one file: its message), Show in Finder, Edit (one picture), Select (one not picked yet), and Delete (those Filo
+/// keeps; none for a file shown where it is).
+fn item_menu(
+    menu: PopupMenu,
+    panel: &WeakEntity<SharedPanel>,
+    key: &Key,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(shared) = panel.upgrade() else { return menu };
+    let (targets, picked, focus) = {
+        let shared = shared.read(cx);
+        (shared.targets(key), shared.picked.contains(key), shared.focus.clone())
+    };
+    // Closed, the menu gives the list the keyboard back, as Finder's does, so Delete acts on the files picked.
+    cx.subscribe_in(&cx.entity(), window, move |_, _, _: &gpui::DismissEvent, window, _| window.focus(&focus)).detach();
+    let single = (targets.len() == 1).then(|| targets[0].clone());
+    let mut menu = menu;
+    if let Some(item) = &single {
+        let (panel, message) = (panel.clone(), item.message_id.clone());
+        menu = menu.item(PopupMenuItem::new("Show in Chat").on_click(move |_, _, cx| {
+            panel.update(cx, |_, cx| cx.emit(SharedEvent::ShowInChat(message.clone()))).ok();
+        }));
+    }
+    let files: Vec<std::path::PathBuf> = targets.iter().filter_map(SharedItem::local_file).collect();
+    if !files.is_empty() {
+        menu = menu.item(PopupMenuItem::new("Show in Finder").on_click(move |_, _, _| show_in_finder(&files)));
+    }
+    if let Some(item) = single.filter(|item| item.kind == "media" && !item.is_video()) {
+        let (panel, picture) = (panel.clone(), item.preview_item());
+        menu = menu.item(PopupMenuItem::new("Edit").on_click(move |_, _, cx| {
+            panel.update(cx, |_, cx| cx.emit(SharedEvent::Edit(picture.clone()))).ok();
+        }));
+    }
+    if !picked {
+        let (panel, key) = (panel.clone(), key.clone());
+        menu = menu.item(PopupMenuItem::new("Select").on_click(move |_, window, cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    window.focus(&panel.focus);
+                    panel.pick(key.clone(), Pick::Toggle, cx);
+                })
+                .ok();
+        }));
+    }
+    let deletable: Vec<SharedItem> = targets.into_iter().filter(|item| item.deletable).collect();
+    if !deletable.is_empty() {
+        let label = match deletable.len() {
+            1 => "Delete".to_string(),
+            count => format!("Delete {count} Files"),
+        };
+        let panel = panel.clone();
+        menu = menu.separator().item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.confirm_delete(deletable.clone(), window, cx)).ok();
+        }));
+    }
+    menu
+}
+
+/// Finder, with `files` selected in one window, as its own Show in Finder does.
+fn show_in_finder(files: &[std::path::PathBuf]) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+    let urls: Vec<objc2::rc::Retained<NSURL>> =
+        files.iter().filter_map(|file| Some(NSURL::fileURLWithPath(&NSString::from_str(file.to_str()?)))).collect();
+    let urls = NSArray::from_retained_slice(&urls);
+    // SAFETY: an AppKit message on the main thread (a menu item's click), with an array of file URLs.
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let _: () = msg_send![workspace, activateFileViewerSelectingURLs: &*urls];
+    }
+}
+
+/// A picked tile's round mark, filled and ticked.
+fn check_mark(cx: &App) -> gpui::Div {
     let colors = *cx.colors();
     div()
         .size(px(CHECK))
         .flex_none()
         .rounded(px(radius::FULL))
         .border_2()
-        .map(|this| match (picked, on_media) {
-            (true, _) => this.border_color(colors.accent).bg(colors.accent),
-            (false, true) => this.border_color(colors.on_media).bg(colors.media.opacity(0.25)),
-            (false, false) => this.border_color(colors.border_strong),
-        })
+        .border_color(colors.accent)
+        .bg(colors.accent)
         .flex()
         .items_center()
         .justify_center()
-        .when(picked, |this| this.child(ui::icon_sized("check", 12., colors.on_accent)))
+        .child(ui::icon_sized("check", 12., colors.on_accent))
 }
 
 /// Three square tiles a row across the column; a video shows its frame and length. A tile opens the app's viewer on
 /// `gallery` (the tab's pictures and videos) at its place, so the arrows step through the rest. A row far off screen
-/// leaves its pictures out (`on_screen`). While `picking`, a tile shows its size and a mark, and a click picks it; one
-/// that can't be deleted is dimmed.
+/// leaves its pictures out (`on_screen`). ⌘- or Shift-click picks a tile instead (`picks`): a picked one shows a mark,
+/// its outline and its size. Each has its right-click menu.
 fn media_grid(
     items: &[&SharedItem],
     first: usize,
     gallery: &Rc<Vec<file_preview::Item>>,
     on_screen: &crate::pictures::OnScreen,
     width: f32,
-    picking: Option<&Picking>,
+    picks: &Picks,
     cx: &mut App,
 ) -> AnyElement {
     let colors = *cx.colors();
@@ -495,17 +667,16 @@ fn media_grid(
                         .picture()
                         .or_else(|| poster.map(|poster| gpui::Resource::Path(poster.picture.as_path().into())));
                     let duration = poster.and_then(|poster| poster.duration_ms);
-                    let picked = picking.is_some_and(|picking| picking.picked(item));
-                    let dimmed = picking.is_some() && !item.deletable;
-                    div()
-                        .id(SharedString::from(format!("shared-media-{}", first + row * 3 + column)))
+                    let picked = picks.picked(item);
+                    let at = first + row * 3 + column;
+                    let square = div()
+                        .id(SharedString::from(format!("shared-media-{at}")))
                         .relative()
-                        .flex_1()
-                        .h(px(tile))
+                        .size_full()
                         .overflow_hidden()
                         .bg(colors.surface_strong)
-                        .when(!dimmed, |this| this.cursor_pointer().hover(|style| style.opacity(0.85)))
-                        .when(dimmed, |this| this.opacity(0.4))
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.85))
                         .map(|this| match picture {
                             // Off screen: the tile's colour only.
                             _ if !shows => this,
@@ -538,7 +709,7 @@ fn media_grid(
                                     .when_some(duration, |this, duration| this.child(format::duration_clock(duration))),
                             )
                         })
-                        .when_some(picking.filter(|_| item.deletable), |this, _| {
+                        .when(picked, |this| {
                             this.child(
                                 div()
                                     .absolute()
@@ -548,8 +719,9 @@ fn media_grid(
                                     .flex_col()
                                     .justify_between()
                                     .items_end()
-                                    .when(picked, |this| this.border_2().border_color(colors.accent))
-                                    .child(check_mark(picked, true, cx))
+                                    .border_2()
+                                    .border_color(colors.accent)
+                                    .child(check_mark(cx))
                                     .when_some(item.size, |this, size| {
                                         this.child(
                                             div()
@@ -563,13 +735,17 @@ fn media_grid(
                                     }),
                             )
                         })
-                        .map(|this| match picking {
-                            Some(picking) => this.on_click(picking.on_click(item)),
-                            None => this.on_click({
-                                let (gallery, at) = (gallery.clone(), first + row * 3 + column);
-                                move |_, window, cx| crate::media_viewer::open(gallery.to_vec(), at, None, window, cx)
-                            }),
-                        })
+                        .on_click(picks.on_click(item, {
+                            let gallery = gallery.clone();
+                            Box::new(move |_, window, cx| {
+                                crate::media_viewer::open(gallery.to_vec(), at, None, window, cx)
+                            })
+                        }));
+                    div().flex_1().min_w_0().overflow_hidden().h(px(tile)).child(picks.with_menu(
+                        format!("shared-media-{at}"),
+                        item,
+                        square,
+                    ))
                 }))
                 // The last row keeps its tiles the size of the others.
                 .children((chunk.len()..3).map(|_| div().flex_1()))
@@ -580,8 +756,8 @@ fn media_grid(
         .into_any_element()
 }
 
-/// A list row: a 40 px tile, a title and a line under it, and what goes at the end. While picking (`pick`: whether
-/// it's picked, none for one that can't be), a mark goes first; a row that can't be picked is dimmed.
+/// A list row: a 40 px tile, a title and a line under it, and what goes at the end. A file's (`menu`: the panel's
+/// picks and the item) is drawn picked when it is, and has its right-click menu; a link's has neither.
 #[allow(clippy::too_many_arguments)]
 fn row(
     id: String,
@@ -590,29 +766,34 @@ fn row(
     subtitle: AnyElement,
     trailing: Option<String>,
     on_click: OnClick,
-    pick: Option<Option<bool>>,
+    menu: Option<(&Picks, &SharedItem)>,
     cx: &App,
 ) -> AnyElement {
     let colors = *cx.colors();
-    let dimmed = pick == Some(None);
-    div()
-        .id(SharedString::from(id))
+    let picked = menu.is_some_and(|(picks, item)| picks.picked(item));
+    let row = div()
+        .id(SharedString::from(id.clone()))
         .flex()
         .items_center()
         .gap(px(space::MD))
         .px(px(space::SM))
         .py(px(space::SM))
         .rounded(px(radius::MD))
-        .when(!dimmed, |this| this.cursor_pointer().hover(|style| style.bg(colors.selected_fill.opacity(0.5))))
-        .when(dimmed, |this| this.opacity(0.4))
-        .when_some(pick.flatten(), |this, picked| this.child(check_mark(picked, false, cx)))
+        .cursor_pointer()
+        .map(|this| match picked {
+            true => this.bg(colors.selected_fill),
+            false => this.hover(|style| style.bg(colors.selected_fill.opacity(0.5))),
+        })
         .child(tile)
         .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).child(title).child(subtitle))
         .when_some(trailing, |this, trailing| {
             this.child(div().flex_none().caption().text_color(colors.text_tertiary).child(trailing))
         })
-        .on_click(on_click)
-        .into_any_element()
+        .on_click(on_click);
+    match menu {
+        Some((picks, item)) => picks.with_menu(id, item, row),
+        None => row.into_any_element(),
+    }
 }
 
 fn tile(round: bool, cx: &App) -> gpui::Div {
@@ -630,23 +811,13 @@ fn tile(round: bool, cx: &App) -> gpui::Div {
 }
 
 impl SharedPanel {
-    /// The text width of a row: the column less the row's padding, the tile and the gap (and the mark while picking).
+    /// The text width of a row: the column less the row's padding, the tile and the gap.
     fn text_width(&self) -> f32 {
-        let mark = if self.selecting { CHECK + space::MD } else { 0. };
-        (self.width - 2. * space::SM - ROW_TILE - space::MD - mark).max(0.)
+        (self.width - 2. * space::SM - ROW_TILE - space::MD).max(0.)
     }
 
-    /// While picking files to delete: what a click on `item`'s row does instead of opening it, and its mark
-    /// (`row`'s `pick`).
-    fn picking(&self, item: &SharedItem, opens: OnClick) -> (OnClick, Option<Option<bool>>) {
-        match self.picker() {
-            Some(picking) => (picking.on_click(item), Some(item.deletable.then(|| picking.picked(item)))),
-            None => (opens, None),
-        }
-    }
-
-    fn picker(&self) -> Option<Picking<'_>> {
-        self.selecting.then(|| Picking { picked: &self.picked, panel: self.weak.clone() })
+    fn picks(&self) -> Picks<'_> {
+        Picks { picked: &self.picked, panel: self.weak.clone() }
     }
 
     /// One line, cut with "…" at the row's text width (a flexible width isn't known in time in a scrolling page).
@@ -662,15 +833,15 @@ impl SharedPanel {
             Some(size) => format!("{} · {}", format::file_size(size), format::short_date(item.at)),
             None => format::short_date(item.at),
         };
-        let (on_click, pick) = self.picking(item, preview(item));
+        let picks = self.picks();
         row(
             format!("shared-file-{index}"),
             picture.into_any_element(),
             self.line(name).callout().medium().into_any_element(),
             self.line(details).footnote().text_color(colors.text_secondary).into_any_element(),
             None,
-            on_click,
-            pick,
+            picks.on_click(item, preview(item)),
+            Some((&picks, item)),
             cx,
         )
     }
@@ -708,8 +879,8 @@ impl SharedPanel {
             Some(sender) => sender.clone(),
             None => self.agent_name.clone(),
         };
-        // Its size while picking files to delete.
-        let size = item.size.filter(|_| self.selecting).map(format::file_size);
+        // Its size once it's picked.
+        let size = item.size.filter(|_| self.picked.contains(&item.key())).map(format::file_size);
         let (title, subtitle) = match &item.name {
             Some(name) => (name.clone(), format!("{sender} · {}", size.unwrap_or_else(|| format::short_date(item.at)))),
             None => {
@@ -718,7 +889,8 @@ impl SharedPanel {
         };
         let duration = item.duration_ms.map(format::duration_clock);
         let width = self.text_width() - if duration.is_some() { 40. } else { 0. };
-        let (on_click, pick) = self.picking(item, {
+        let picks = self.picks();
+        let on_click = picks.on_click(item, {
             let url = item.url.clone();
             Box::new(move |_, _, cx| media::toggle(audio_id.clone(), url.clone(), None, cx))
         });
@@ -735,7 +907,7 @@ impl SharedPanel {
                 .into_any_element(),
             duration,
             on_click,
-            pick,
+            Some((&picks, item)),
             cx,
         );
         crate::smoke::tracked_fill(format!("shared-voice-{index}"), row)
@@ -752,15 +924,9 @@ impl SharedPanel {
         for (month, group) in by_month(items) {
             body = body.child(month_heading(month, cx));
             body = match self.tab {
-                Tab::Media => body.child(media_grid(
-                    &group,
-                    index,
-                    &gallery,
-                    &self.on_screen,
-                    self.width,
-                    self.picker().as_ref(),
-                    cx,
-                )),
+                Tab::Media => {
+                    body.child(media_grid(&group, index, &gallery, &self.on_screen, self.width, &self.picks(), cx))
+                }
                 _ => body.child(div().flex().flex_col().children(group.iter().enumerate().map(|(offset, item)| {
                     match self.tab {
                         Tab::Files => self.file_row(index + offset, item, cx),
@@ -800,8 +966,21 @@ impl SharedPanel {
     }
 }
 
+impl EventEmitter<SharedEvent> for SharedPanel {}
+
 impl Render for SharedPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Esc lets go of the files picked, before the page around it takes Esc; over a file's open menu, it closes the
+        // menu, the files stay picked and the list has the keyboard again (for Delete).
+        if !self.picked.is_empty() {
+            crate::escape::layer(window, cx, |this, window, cx| {
+                if gpui_component::one_menu::close_in(window, cx) {
+                    window.focus(&this.focus);
+                } else {
+                    this.clear_picks(cx);
+                }
+            });
+        }
         let tabs = ui::segmented(
             "shared-tabs",
             vec![
@@ -849,48 +1028,45 @@ impl Render for SharedPanel {
                 .children(self.render_footer(cx))
                 .into_any_element()
         };
-        // Select, on a tab with files Filo keeps copies of; Cancel while picking.
-        let can_pick = self.tab != Tab::Links && items.iter().any(|item| item.deletable);
-        let select = (can_pick || self.selecting).then(|| {
-            let selecting = self.selecting;
-            crate::smoke::tracked(
-                "shared-select",
-                Button::ghost("shared-select", if selecting { "Cancel" } else { "Select" })
-                    .small()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_selecting(!selecting, cx))),
-            )
-        });
         // A drive picks a tab by its place on the bar.
-        let tabs_tracked = crate::smoke::tracked_fill("shared-tabs", tabs);
-        let header = div()
-            .flex()
-            .items_center()
-            .gap(px(space::SM))
-            .child(div().flex_1().min_w_0().child(tabs_tracked))
-            .children(select);
+        let tabs = crate::smoke::tracked_fill("shared-tabs", tabs);
         div()
+            .id("shared-panel")
             .w(px(self.width))
             .flex()
             .flex_col()
             .gap(px(space::XS))
-            .child(header)
-            .children(self.selecting.then(|| self.render_pick_bar(&items, cx)))
+            .track_focus(&self.focus)
+            // A click in it gives it the keyboard, for Delete.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseDownEvent, window, _| window.focus(&this.focus)),
+            )
+            // The Delete key (⌫, or ⌦) deletes the files picked, Filo's own.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "backspace" | "delete") && !this.picked.is_empty() {
+                    cx.stop_propagation();
+                    this.delete_picked(window, cx);
+                }
+            }))
+            .child(tabs)
+            .children((!self.picked.is_empty()).then(|| self.render_pick_bar(cx)))
             .child(body)
     }
 }
 
 impl SharedPanel {
-    /// While picking files to delete: how many are picked and their size, Delete, and a word on the files that can't
-    /// be picked when the tab has any.
-    fn render_pick_bar(&self, items: &[&SharedItem], cx: &mut Context<Self>) -> AnyElement {
+    /// While files are picked: how many and their size, Delete (for those Filo keeps), and a word on any picked that are
+    /// shown where they are.
+    fn render_pick_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = *cx.colors();
         let (picked, size) = self.picked_items();
         let summary = match picked.len() {
-            0 => "Pick the files to delete.".to_string(),
-            1 => format!("1 file · {}", format::file_size(size)),
-            count => format!("{count} files · {}", format::file_size(size)),
+            1 => format!("1 file picked · {}", format::file_size(size)),
+            count => format!("{count} files picked · {}", format::file_size(size)),
         };
-        let shown_in_place = items.iter().any(|item| !item.deletable);
+        let deletable = picked.iter().filter(|item| item.deletable).count();
+        let shown_in_place = picked.len() - deletable;
         div()
             .flex()
             .flex_col()
@@ -905,24 +1081,34 @@ impl SharedPanel {
                     .items_center()
                     .gap(px(space::SM))
                     .child(div().flex_1().min_w_0().callout().medium().truncate().child(summary))
-                    .child(crate::smoke::tracked(
-                        "shared-delete",
-                        Button::danger("shared-delete", if self.deleting { "Deleting…" } else { "Delete" })
+                    .when(deletable > 0, |this| {
+                        this.child(crate::smoke::tracked(
+                            "shared-delete",
+                            Button::danger("shared-delete", if self.deleting { "Deleting…" } else { "Delete" })
+                                .small()
+                                .icon("trash-2")
+                                .disabled(self.deleting)
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, window, cx| this.delete_picked(window, cx)),
+                                ),
+                        ))
+                    })
+                    .child(
+                        Button::ghost("shared-clear", "Clear")
                             .small()
-                            .icon("trash-2")
-                            .disabled(picked.is_empty() || self.deleting)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.confirm_delete(window, cx))),
-                    )),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.clear_picks(cx))),
+                    ),
             )
             .when_some(self.delete_error.clone(), |this, error| {
                 this.child(div().footnote().text_color(colors.danger).child(format!("Couldn’t delete: {error}")))
             })
-            .when(shown_in_place, |this| {
+            .when(shown_in_place > 0, |this| {
+                let which = if shown_in_place == 1 { "One is" } else { "Some are" };
                 this.child(
                     div()
                         .footnote()
                         .text_color(colors.text_secondary)
-                        .child("Dimmed files are shown where they are on this Mac: Filo keeps no copy to delete."),
+                        .child(format!("{which} shown where it is on this Mac: Filo keeps no copy to delete.")),
                 )
             })
             .into_any_element()
