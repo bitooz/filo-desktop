@@ -471,8 +471,8 @@ impl Asks {
 }
 
 impl GroupMessage {
-    /// Its text (`text`, cut or not), with the files it came with named after it and where each is saved: how the
-    /// members read it.
+    /// Its text (`text`, cut or not), with the files it came with named after it and where each is (attachments.rs
+    /// `told_at`): how the members read it.
     pub fn with_files(&self, text: &str) -> String {
         if self.attachments.is_empty() {
             return text.to_string();
@@ -480,7 +480,7 @@ impl GroupMessage {
         let files: Vec<String> = self
             .attachments
             .iter()
-            .map(|file| format!("{} ({}), saved at {}", file.name, file.content_type, file.file.display()))
+            .map(|file| format!("{} ({}), at {}", file.name, file.content_type, crate::attachments::told_at(file)))
             .collect();
         [text.trim_end(), &format!("[Attached: {}]", files.join("; "))]
             .into_iter()
@@ -620,13 +620,7 @@ pub fn messages(db: &Db, limit: usize) -> Result<(Vec<GroupMessage>, bool), Stri
 /// (attachments.rs `moved_to`), kept in the message's row for next time.
 pub fn find_moved_files(db: &Db, messages: &mut [GroupMessage]) {
     for message in messages {
-        let mut found = false;
-        for file in &mut message.attachments {
-            if let Some(path) = crate::attachments::moved_to(file) {
-                *file = crate::attachments::moved(file, path);
-                found = true;
-            }
-        }
+        let found = !crate::attachments::find_moved(&mut message.attachments).is_empty();
         if found && let Ok(attachments) = serde_json::to_string(&message.attachments) {
             let _ = db.write(|tx| {
                 tx.execute("UPDATE group_messages SET attachments = ?1 WHERE id = ?2", params![attachments, message.id])
@@ -693,6 +687,26 @@ pub fn voices(db: &Db, ids: &[&str]) -> Result<std::collections::HashMap<String,
             .filter(|(id, _)| ids.contains(&id.as_str()))
             .filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?)))
             .collect())
+    })
+}
+
+/// Every file the group's messages carry (store.rs `Attachment`'s `file`) and the storage ids of its voice messages'
+/// recordings: what a chat that's deleted with its files leaves, when the group has them too.
+pub fn files_kept(db: &Db) -> Result<(std::collections::HashSet<PathBuf>, std::collections::HashSet<String>), String> {
+    db.with(|conn| {
+        let mut statement = conn.prepare("SELECT attachments, voice FROM group_messages")?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))?;
+        let (mut files, mut voices) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for (attachments, voice) in rows.filter_map(Result::ok) {
+            let attachments: Vec<crate::store::Attachment> =
+                attachments.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default();
+            files.extend(attachments.into_iter().map(|file| file.file));
+            if let Some(voice) = voice.and_then(|json| serde_json::from_str::<crate::store::Voice>(&json).ok()) {
+                voices.insert(voice.storage_id);
+            }
+        }
+        Ok((files, voices))
     })
 }
 

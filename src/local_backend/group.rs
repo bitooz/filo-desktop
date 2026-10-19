@@ -1106,7 +1106,9 @@ impl Local {
         }
         let db = self.db()?;
         let now = now_ms();
-        let latest = group::latest(db)?;
+        let mut latest = group::latest(db)?;
+        // Members read where a member's file is now (`transcript`), found again when it was renamed or moved.
+        group::find_moved_files(db, &mut latest);
         let asked = group::call_of(db, turn)?;
         let checking = group::checking(turn, asked.as_ref());
         let work = self.group_work(&turn.speaker, members, now);
@@ -1670,10 +1672,7 @@ mod tests {
         assert!(prompt.contains(&format!("shot.png (image/png, 3 B), saved at {} (the user's own file: /Users/me/shot.png): given to you with this message as an image", saved.display())), "{prompt}");
         let context = &messages[0].group_call.as_ref().unwrap().context;
         assert!(
-            context.ends_with(&format!(
-                "User: @Chef look\n[Attached: shot.png (image/png), saved at {}]",
-                saved.display()
-            )),
+            context.ends_with(&format!("User: @Chef look\n[Attached: shot.png (image/png), at {}]", saved.display())),
             "{context}"
         );
         group::finish(db, &turn.id, "completed", None, 2).unwrap();
@@ -1729,6 +1728,106 @@ mod tests {
             unseen["chats"].as_array().unwrap().iter().filter(|chat| chat["agentGroup"] == json!(true)).count(),
             1
         );
+        std::fs::remove_dir_all(&local.root).ok();
+    }
+
+    #[test]
+    fn filos_copies_go_from_the_shared_list_and_with_their_chat_never_files_shown_in_place() {
+        let local = temp();
+        let chef_chat = add_agent(&local, "chef-id", "Chef");
+        let session = local.call("agents:openGroup", &json!({})).unwrap().as_str().unwrap().to_string();
+        let db = local.db().unwrap();
+        let work = local.root.canonicalize().unwrap().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (photo, menu, plate) = (work.join("pasta.jpg"), work.join("menu.pdf"), work.join("plate.png"));
+        std::fs::write(&photo, b"\xFF\xD8\xFF jpg").unwrap();
+        std::fs::write(&menu, b"pdf").unwrap();
+        std::fs::write(&plate, b"\x89PNG\r\n\x1a\n plate").unwrap();
+        // As send_message's `files` sends them: the photo as Filo's copy, the menu where it is.
+        let sent = |path: &std::path::Path| filo_local::attachments::sent(&local.root, path).unwrap();
+        let mut reply = Message::new(Role::Assistant, "Dinner", None);
+        reply.attachments = vec![sent(&photo), sent(&menu)];
+        local.agent_chats.append(&chef_chat, &reply).unwrap();
+        // The user's picture, the composer's copy.
+        let storage_id = local.save_attachment("image/png", b"\x89PNG\r\n\x1a\n mine").unwrap();
+        let mine = filo_local::store::Attachment {
+            file: filo_local::attachments::file(&local.root, &storage_id).unwrap(),
+            storage_id,
+            name: "mine.png".into(),
+            content_type: "image/png".into(),
+            size: 13,
+            local_path: None,
+            bookmark: None,
+            inode: None,
+        };
+        local.agent_chats.add_user_message_with(&chef_chat, "Look", "t1", vec![mine.clone()]).unwrap();
+        // A post in the group, whose file the chef's chat shows too.
+        let posted_file = sent(&plate);
+        let posted =
+            group::post_files(db, "chef-id", "", vec![posted_file.clone()], group::Asks::default(), None, now_ms())
+                .unwrap();
+        let mut line = Message::new(Role::Assistant, "", None);
+        line.in_group = Some(posted.id.clone());
+        line.attachments = vec![posted_file.clone()];
+        local.agent_chats.append(&chef_chat, &line).unwrap();
+
+        // The Shared list: Filo's copies can be deleted, the menu shown where it is can't; each with its size.
+        let listed = |session: &str| -> Vec<(String, bool, f64, Option<String>)> {
+            let page = local.call("chatShared:list", &json!({ "sessionId": session })).unwrap();
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["kind"] != "link")
+                .map(|item| {
+                    (
+                        item["name"].as_str().unwrap().to_string(),
+                        item["deletable"] == true,
+                        item["size"].as_f64().unwrap(),
+                        item["sender"].as_str().map(str::to_string),
+                    )
+                })
+                .collect()
+        };
+        let row = |name: &str, deletable: bool, size: f64| (name.to_string(), deletable, size, None);
+        assert_eq!(
+            listed(&chef_chat),
+            [
+                row("plate.png", true, 14.),
+                row("mine.png", true, 13.),
+                row("pasta.jpg", true, 7.),
+                row("menu.pdf", false, 3.)
+            ]
+        );
+        // The group's: its post, with who sent it.
+        assert_eq!(listed(&session), [("plate.png".to_string(), true, 14., Some("Chef".to_string()))]);
+        // Deleting the photo and the menu deletes the photo's copy only.
+        let url = |file: &filo_local::store::Attachment| format!("file://{}", file.file.display());
+        let picked = json!([
+            { "messageId": reply.id, "url": url(&reply.attachments[0]) },
+            { "messageId": reply.id, "url": url(&reply.attachments[1]) },
+        ]);
+        let deleted =
+            local.call("chatShared:deleteFiles", &json!({ "sessionId": chef_chat, "files": picked })).unwrap();
+        assert_eq!((deleted["deleted"].as_f64(), deleted["freed"].as_f64()), (Some(1.), Some(7.)));
+        assert!(!reply.attachments[0].file.exists() && photo.is_file() && menu.is_file());
+        assert_eq!(listed(&chef_chat).len(), 3);
+        // Its message shows it as no longer kept: Filo's copy, gone.
+        let detail = local.call("voiceSessions:detail", &json!({ "id": chef_chat })).unwrap();
+        let shown = detail["messages"].as_array().unwrap().iter().find(|message| message["_id"] == reply.id).unwrap();
+        let files = shown["attachments"].as_array().unwrap();
+        assert_eq!((&files[0]["gone"], &files[0]["copy"]), (&json!(true), &json!(true)));
+        assert_eq!((&files[1]["gone"], &files[1]["copy"]), (&json!(false), &json!(false)));
+        // A file shown in place is shown at its size now.
+        std::fs::write(&menu, b"a longer pdf").unwrap();
+        let detail = local.call("voiceSessions:detail", &json!({ "id": chef_chat })).unwrap();
+        let shown = detail["messages"].as_array().unwrap().iter().find(|message| message["_id"] == reply.id).unwrap();
+        assert_eq!(shown["attachments"][1]["size"], 12.);
+
+        // The chef goes: its chat's copies go with it, but not the one the group's post has, nor the menu.
+        local.call("agents:remove", &json!({ "id": "chef-id" })).unwrap();
+        assert!(!mine.file.exists());
+        assert!(posted_file.file.is_file() && menu.is_file());
         std::fs::remove_dir_all(&local.root).ok();
     }
 

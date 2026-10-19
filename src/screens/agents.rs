@@ -308,6 +308,10 @@ struct GroupSetup {
     /// The reasoning levels the routing model takes (`route_levels`): for which model, and when they were asked.
     levels: Option<(String, std::time::Instant, Vec<String>)>,
     saving: bool,
+    /// What the group shared, under Group settings (the setup has none), and the page's scroll, near whose end it loads
+    /// older items.
+    shared: Option<Entity<SharedPanel>>,
+    scroll: ScrollHandle,
     _subs: [Subscription; 2],
 }
 
@@ -2029,6 +2033,9 @@ impl AgentsScreen {
         );
         let members =
             if saved.all { self.rows().iter().map(|row| row.id.clone()).collect() } else { saved.members.clone() };
+        let session = self.group.clone().flatten().map(|group| group.session_id).filter(|_| settings);
+        let width = setup_column_width(window, self.list_width());
+        let shared = session.map(|session| cx.new(|cx| SharedPanel::new(session, "Members".into(), width, cx)));
         self.setup = Some(GroupSetup {
             settings,
             step: 0,
@@ -2039,6 +2046,8 @@ impl AgentsScreen {
             route: saved.route.clone(),
             levels: None,
             saving: false,
+            shared,
+            scroll: ScrollHandle::new(),
             _subs: [name_sub, hue_sub],
         });
         self.form = None;
@@ -3082,6 +3091,12 @@ fn form_column_width(window: &Window, list_width: f32) -> f32 {
     pane.min(FORM_WIDTH) - 2. * space::XXXL
 }
 
+/// The width of Group settings' column: the pane right of the sidebar and the list less the page's padding, capped.
+fn setup_column_width(window: &Window, list_width: f32) -> f32 {
+    let pane = f32::from(window.viewport_size().width) - crate::app::SIDEBAR_WIDTH - list_width;
+    (pane - 2. * space::XXXL).min(SETUP_WIDTH)
+}
+
 /// The custom colour's swatch: a few hues blended on a dot.
 fn rainbow_dot() -> gpui::Div {
     let hue = |degrees: f32, alpha: f32| gpui::hsla(degrees / 360., 0.8, 0.6, alpha);
@@ -3994,6 +4009,8 @@ impl AgentsScreen {
         let colors = *cx.colors();
         let Some(setup) = &self.setup else { return div().flex_1().into_any_element() };
         let (step, settings, saving) = (setup.step, setup.settings, setup.saving);
+        let scroll = setup.scroll.clone();
+        crate::smoke::keep_page_scroll("group-settings", &scroll);
         if setup.look.colors_open() {
             crate::escape::popup(window, cx, |this, _, cx| this.set_colors_open(false, cx));
         }
@@ -4078,22 +4095,31 @@ impl AgentsScreen {
             .bg(colors.background)
             .child(crate::chrome::drag_region(div().id("group-setup-header")).h(px(HEADER_HEIGHT)).flex_none())
             .child(
-                div().id("group-setup-scroll").flex_1().min_h_0().flex().flex_col().overflow_y_scroll().child(
-                    // At least the area's height, so a short step stays centred; a long one (many members) grows past
-                    // it and the area scrolls from the top rather than squeezing it to spill over both edges. Group
-                    // settings starts at the top, as the Edit agent page does.
-                    div()
-                        .w_full()
-                        .flex_none()
-                        .min_h_full()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .when(!settings, |this| this.justify_center())
-                        .px(px(space::XXXL))
-                        .pb(px(space::XXL))
-                        .child(column),
-                ),
+                div()
+                    .id("group-setup-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .on_scroll_wheel(cx.listener(Self::on_setup_scroll))
+                    .child(
+                        // At least the area's height, so a short step stays centred; a long one (many members) grows
+                        // past it and the area scrolls from the top rather than squeezing it to spill over both edges.
+                        // Group settings starts at the top, as the Edit agent page does.
+                        div()
+                            .w_full()
+                            .flex_none()
+                            .min_h_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .when(!settings, |this| this.justify_center())
+                            .px(px(space::XXXL))
+                            .pb(px(space::XXL))
+                            .child(column),
+                    ),
             )
             .child(footer)
             .into_any_element()
@@ -4108,7 +4134,35 @@ impl AgentsScreen {
     /// the name, as an agent's model line is, and who's in it below.
     fn settings_page(&self, levels: Vec<String>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let line = self.route_line(levels, cx);
-        vec![self.setup_header(Some(line), window, cx), self.setup_members_section(cx)]
+        let mut pieces = vec![self.setup_header(Some(line), window, cx), self.setup_members_section(cx)];
+        // What the group shared, as an agent's profile shows its chat's.
+        if let Some(shared) = self.setup.as_ref().and_then(|setup| setup.shared.clone()) {
+            let width = setup_column_width(window, self.list_width());
+            shared.update(cx, |shared, cx| shared.set_width(width, cx));
+            let colors = *cx.colors();
+            pieces.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM))
+                    .child(
+                        div().px(px(space::SM)).footnote().semibold().text_color(colors.text_secondary).child("Shared"),
+                    )
+                    .child(shared)
+                    .into_any_element(),
+            );
+        }
+        pieces
+    }
+
+    /// Near the end of Group settings, the shared list loads older items.
+    fn on_setup_scroll(&mut self, _: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(setup) = &self.setup else { return };
+        let Some(shared) = setup.shared.clone() else { return };
+        let scrolled = -setup.scroll.offset().y;
+        if setup.scroll.max_offset().height - scrolled < px(SHARED_NEAR_END) {
+            shared.update(cx, |shared, cx| shared.load_older(cx));
+        }
     }
 
     /// The group's picture (its ✎ and colour popover) and name, as the Edit agent page has them; `under` goes under the

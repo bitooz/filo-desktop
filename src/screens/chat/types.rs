@@ -263,9 +263,20 @@ pub struct Attachment {
     /// from): drawn and opened from disk.
     #[serde(default)]
     pub local_file: Option<std::path::PathBuf>,
-    /// The file is no longer there (an agent's, shown where it was, deleted since): shown as such, nothing to open.
+    /// The file is no longer there (an agent's, shown where it was, deleted since; Filo's copy, deleted from the Shared
+    /// list): shown as such (`gone_label`), nothing to open.
     #[serde(default)]
     pub gone: bool,
+    /// It's Filo's own copy of the file (the user's, or an agent's picture or video), not a file shown where it is.
+    #[serde(default)]
+    pub copy: bool,
+}
+
+impl Attachment {
+    /// What shows in place of a file that's gone: Filo's copy was deleted, or the file where it was.
+    pub fn gone_label(&self) -> &'static str {
+        if self.copy { "No longer kept" } else { "No longer there" }
+    }
 }
 
 /// An artifact a reply made in this chat (local_backend/artifacts.rs `chat_tasks`): its card, which opens it.

@@ -790,6 +790,8 @@ fn attended(messages: &[Message], turn_id: &str) -> bool {
 /// Filo's folders a turn's CLI reads without asking short of Full access (engine.rs `TurnSpec::readable`): the chats'
 /// files under `store_root` (the history its instructions point to), the files the user sent and the artifacts' pages,
 /// beside the database `db` (without one, the store's own, as the MCP server takes it: mcp.rs `Target::from_args`).
+/// Not the copies of agents' pictures and videos beside them (attachments.rs `SENT_DIR`): an agent could send a file it
+/// can't read to read it there.
 pub(crate) fn readable(store_root: &Path, db: Option<&Path>) -> Vec<PathBuf> {
     let db = db.map_or_else(|| store_root.join(crate::db::FILE), Path::to_path_buf);
     vec![
@@ -1260,6 +1262,7 @@ mod tests {
             file: path.to_path_buf(),
             local_path: None,
             bookmark: None,
+            inode: None,
         };
         let mut earlier = Message::new(Role::User, "see this", Some("t1".into()));
         earlier.attachments = vec![file("old.png", "image/png", &picture)];

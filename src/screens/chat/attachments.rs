@@ -75,6 +75,7 @@ impl PendingAttachment {
             local_path: self.local_path.as_ref().map(|path| path.to_string_lossy().into_owned()),
             local_file: self.preview.clone().filter(|file| decodes_here(file)),
             gone: false,
+            copy: false,
         }
     }
 }
@@ -668,6 +669,7 @@ mod tests {
             local_path: path.map(str::to_string),
             local_file: None,
             gone: false,
+            copy: false,
         };
         let pasted = "/Users/me/.config/filo/local/pasted/pasted-image-2026-10-10-191941.png";
         let files = vec![file(Some(pasted)), file(Some("/Users/me/Desktop/Screen Shot.png"))];
@@ -699,6 +701,7 @@ mod tests {
             local_path: Some(path.into()),
             local_file: None,
             gone: false,
+            copy: false,
         };
         let (one, two) =
             ("/Users/me/.config/filo/pasted/pasted-image-1.png", "/Users/me/.config/filo/pasted/pasted-image-2.png");

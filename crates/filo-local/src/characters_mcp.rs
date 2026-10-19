@@ -51,7 +51,7 @@ pub fn tools() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "prompt": { "type": "string", "description": "What to draw." },
-                                "path": { "type": "string", "description": "Absolute path of the PNG to write (its folder is made if needed)." },
+                                "path": { "type": "string", "description": "Absolute path of the new PNG to write (its folder is made if needed); nothing may be there yet." },
                                 "references": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths of pictures to draw from (PNG, JPEG or WebP)." }
                             },
                             "required": ["prompt", "path"],
@@ -139,6 +139,13 @@ fn requests(arguments: &Value) -> Result<Vec<Request>, String> {
                 .is_none_or(|extension| !extension.eq_ignore_ascii_case("png"))
             {
                 return Err(format!("`path` must end in .png: {}", path.display()));
+            }
+            // Only a new file: never over one that's there, or through a link (`generate_one` makes it new too).
+            if std::fs::symlink_metadata(&path).is_ok() {
+                return Err(format!(
+                    "There's already something at {}: give a new file's path (pictures are only written as new files).",
+                    path.display()
+                ));
             }
             let references = image
                 .get("references")
@@ -247,6 +254,7 @@ fn keep_picture(root: &Path, path: &Path) -> std::io::Result<Attachment> {
         file,
         local_path: None,
         bookmark: None,
+        inode: None,
     })
 }
 
@@ -292,10 +300,18 @@ fn generate_one(codex: &Path, request: &Request) -> Result<String, String> {
     if let Some(folder) = request.path.parent() {
         std::fs::create_dir_all(folder).map_err(|error| format!("couldn't make {}: {error}", folder.display()))?;
     }
-    picture
-        .save_with_format(&request.path, image::ImageFormat::Png)
-        .map_err(|error| format!("couldn't write it: {error}"))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut png, image::ImageFormat::Png).map_err(|error| format!("couldn't make the PNG: {error}"))?;
+    write_new(&request.path, png.get_ref()).map_err(|error| format!("couldn't write it: {error}"))?;
     Ok(format!("made, {}x{}", picture.width(), picture.height()))
+}
+
+/// Writes `bytes` as a new file at `path`: never over a file that's there, nor through a link at the path, so an
+/// agent can't have a picture written over a file of the user's (`O_EXCL`, which doesn't follow a link).
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes).inspect_err(|_| _ = std::fs::remove_file(path))
 }
 
 /// Runs `codex exec --json` with `prompt` and finds the picture its session saved.
@@ -503,6 +519,23 @@ mod tests {
             one(json!({ "prompt": "a cat", "path": "/tmp/idle.png", "references": ["/nowhere/at/all.png"] })).is_err()
         );
         assert!(requests(&json!({ "images": [] })).is_err());
+        // Only new files: not over one that's there, nor through a link, even one to nothing yet.
+        let dir = crate::test_support::temp_dir("generate-new-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (theirs, link, dangling) = (dir.join("theirs.png"), dir.join("link.png"), dir.join("dangling.png"));
+        std::fs::write(&theirs, b"the user's").unwrap();
+        std::os::unix::fs::symlink(&theirs, &link).unwrap();
+        std::os::unix::fs::symlink(dir.join("nothing-yet.txt"), &dangling).unwrap();
+        for path in [&theirs, &link, &dangling] {
+            let refused = one(json!({ "prompt": "a cat", "path": path.display().to_string() }));
+            assert!(refused.is_err_and(|why| why.contains("There's already something at")), "{}", path.display());
+            assert!(write_new(path, b"png").is_err());
+        }
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"the user's");
+        assert!(!dir.join("nothing-yet.txt").exists());
+        write_new(&dir.join("new.png"), b"png").unwrap();
+        assert_eq!(std::fs::read(dir.join("new.png")).unwrap(), b"png");
+        std::fs::remove_dir_all(&dir).ok();
         let five = json!({ "images": vec![json!({ "prompt": "a", "path": "/tmp/a.png" }); 5] });
         assert!(requests(&five).is_err());
         let prompt = codex_prompt(&Request {

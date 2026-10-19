@@ -5016,7 +5016,7 @@ fn render_media(
                 .overflow_hidden()
                 .bg(colors.surface_strong)
                 .when(!gone, |this| this.cursor_pointer())
-                .when(gone, |this| this.child(gone_tile(&media[index].name, colors)))
+                .when(gone, |this| this.child(gone_tile(media[index], colors)))
                 // The picture takes the corners itself: clipping to the tile is rectangular.
                 .when_some(source, |this, picture| {
                     this.child(
@@ -5115,9 +5115,9 @@ fn render_media(
 /// The size of a lone picture's or video's tile once its file is gone (`gone_tile`).
 const GONE_TILE: (f32, f32) = (240., 150.);
 
-/// What a picture's or video's tile shows once its file is no longer there (an agent's, deleted since it was sent):
-/// its name, said to be gone, in place of the picture.
-fn gone_tile(name: &str, colors: crate::theme::Palette) -> gpui::Div {
+/// What a picture's or video's tile shows once its file is no longer there (Filo's copy deleted from the Shared list, an
+/// agent's file shown in place deleted since it was sent): its name, said to be gone, in place of the picture.
+fn gone_tile(file: &Attachment, colors: crate::theme::Palette) -> gpui::Div {
     div()
         .absolute()
         .inset_0()
@@ -5129,8 +5129,8 @@ fn gone_tile(name: &str, colors: crate::theme::Palette) -> gpui::Div {
         .gap(px(space::XS))
         .text_color(colors.text_secondary)
         .child(ui::icon("file-x").size(px(22.)).text_color(colors.text_tertiary))
-        .child(div().footnote().semibold().child("No longer there"))
-        .child(div().caption().max_w_full().truncate().child(name.to_string()))
+        .child(div().footnote().semibold().child(file.gone_label()))
+        .child(div().caption().max_w_full().truncate().child(file.name.clone()))
 }
 
 fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -5167,7 +5167,7 @@ fn render_file(id: &str, index: usize, file: &Attachment, user: bool, window: &m
                 .flex_col()
                 .child(div().footnote().semibold().truncate().child(file.name.clone()))
                 .child(div().caption().opacity(0.7).child(if file.gone {
-                    "No longer there".to_string()
+                    file.gone_label().to_string()
                 } else {
                     format::file_size(file.size)
                 })),

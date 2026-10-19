@@ -3,7 +3,8 @@
 //   <root>/chats/<chat id>/chat.json       title, engine and model, the engine's session (written by the app, replaced whole)
 //   <root>/chats/<chat id>/messages.jsonl  one message per line, only ever appended
 //   <root>/chats/<chat id>/reactions.json  the user's reaction to a message, by its id (the app's, replaced whole)
-//   <root>/chats/<chat id>/moved.json      where an agent's files were found after they moved (the app's, replaced whole)
+//   <root>/chats/<chat id>/moved.json      where an agent's files were found after they moved (replaced whole, by the app
+//                                          or a turn's worker; one losing the other's write only means a lookup again)
 //   <root>/workspace/                      the folder the CLI runs in (its sessions are kept per folder)
 //   <root>/workspace/.claude/skills/<name>/           copies of the user's skill folders (skills.rs) for Claude Code, made
 //                                                     by `write_skills`, with Filo's own (desktop-pet, and artifacts with
@@ -188,7 +189,8 @@ impl Message {
 
 /// A file sent with a message. The user's, as the composer uploaded it: a copy saved under the store's root
 /// (attachments.rs), which the chat shows and the turn hands to the engine. An agent's (mcp.rs `send_message`'s
-/// `files`): the file where it is on this Mac, no copy (`storage_id` empty), with its `bookmark`.
+/// `files`): a picture or video as Filo's frozen copy (attachments.rs `sent`, `local_path` where the agent had it), any
+/// other file where it is on this Mac, no copy (`storage_id` empty), with its `bookmark` and `inode`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
@@ -196,15 +198,19 @@ pub struct Attachment {
     pub name: String,
     pub content_type: String,
     pub size: u64,
-    /// The saved copy; an agent's file itself.
+    /// The saved copy; an agent's file itself when it isn't copied.
     pub file: PathBuf,
-    /// Where the user keeps it: the message's text has this path where the file's chip was.
+    /// Where the user keeps it: the message's text has this path where the file's chip was. For an agent's copy, where
+    /// the agent had the file when it sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
     /// An agent's file's macOS bookmark (bookmark.rs, base64), which finds it when it's renamed or moved
     /// (attachments.rs `moved_to`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bookmark: Option<String>,
+    /// That file's inode when it was sent: a file its bookmark finds counts as it only with the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
 }
 
 /// Where an agent's chat points at the group: it asked members there (`asked`), or a member asked it (`calledBy`),
@@ -648,11 +654,10 @@ impl Store {
                 if let Some(path) = moved.get(&message.id).and_then(|files| files.get(&index)) {
                     *file = crate::attachments::moved(file, path.clone());
                 }
-                if let Some(path) = crate::attachments::moved_to(file) {
-                    *file = crate::attachments::moved(file, path.clone());
-                    moved.entry(message.id.clone()).or_default().insert(index, path);
-                    found = true;
-                }
+            }
+            for index in crate::attachments::find_moved(&mut message.attachments) {
+                moved.entry(message.id.clone()).or_default().insert(index, message.attachments[index].file.clone());
+                found = true;
             }
         }
         if found
@@ -1303,6 +1308,7 @@ pub(crate) mod tests {
             file: store.root().join("attachments/id.png"),
             local_path: Some("/Users/me/shot.png".into()),
             bookmark: None,
+            inode: None,
         };
         store.add_user_message_with(&chat.id, "", "t1", vec![file.clone()]).unwrap();
         let messages = Store::at(store.root()).messages(&chat.id).unwrap();

@@ -73,14 +73,26 @@ again whenever the local data changes.
 A message starts a turn in a worker, a process of its own (`filo --worker turn …`, the app's own binary, in a session of
 its own; `local_backend/workers.rs`) that runs crates/filo-local `turn::run`: the CLI runs with Filo's MCP server
 plugged in (`filo --local-mcp …`) and replies with its `send_message` tool, which appends to the conversation's file.
-Its `files` (up to 5 full paths on this Mac) go with the message where they are, with no copy (attachments.rs
-`in_place`: the canonical path, so a link names its target, and a macOS bookmark), and show as the user's attachments do
-(pictures and videos as tiles, the rest as file chips), in its chat or in the group. The agent is told to send them from
-somewhere lasting, like its workspace. When a file is no longer at its path, its bookmark finds it if it was renamed or
-moved on the same disk (`moved_to`), and the new path is kept: in `chats/<id>/moved.json` beside a chat's messages
-(store.rs `find_moved_files`), in the post's row in the group (group.rs `find_moved_files`). A file neither finds shows
+Its `files` (up to 5 full paths on this Mac) go with the message (attachments.rs `sent`), and show as the user's
+attachments do (pictures and videos as tiles, the rest as file chips), in its chat or in the group. A picture or video
+up to 500 MB is kept as Filo's frozen copy in `local/sent/` (an APFS clone, else a copy, never a link), so the message
+keeps showing it as it was sent while the agent draws v2 over the same file; that folder isn't among those a turn reads
+without asking (turn.rs `readable`), and the agent is told the path it sent from (`told_at`, also in a new session's
+seed and the group's transcript). Any other file, and a bigger video, shows where it is, with no copy (`in_place`: the
+canonical path, so a link names its target, a macOS bookmark and its inode), and the agent is told to keep those
+somewhere lasting, like its workspace. When such a file is no longer at its path, its bookmark finds it if it was
+renamed or moved on the same disk and it's the same file (its inode; not one in a Trash) (`moved_to`), and the new path
+is kept: in `chats/<id>/moved.json` beside a chat's messages (store.rs `find_moved_files`), in the post's row in the
+group (group.rs `find_moved_files`); a file not found is looked up again less and less often. A file neither finds shows
 as "No longer there", a tile or a file row with nothing to open. A path that isn't a full path, isn't there or is a
 folder sends nothing and says why. A file named as a picture whose first bytes aren't one's is sent as a plain file.
+
+Filo's copies (the user's in `local/attachments/`, agents' pictures and videos in `local/sent/`: attachments.rs
+`own_copy`) are deleted with their chat when an agent is deleted (local_backend/shared.rs `delete_chat_files`, those no
+other chat or the group has too), and from a chat's Shared list (the agent's profile, Group settings): Select, pick
+files, each with its size, Delete (`chatShared:deleteFiles`). A file shown in place can't be picked. A message whose
+copy was deleted shows it as "No longer kept". generate_images writes only new files (`O_EXCL`, not over a file or a
+link at its path).
 While turns run, a watcher notices the files growing and the conversation updates. A turn's state (working, done,
 failed) is read from the file, so it survives restarts. Stop asks the worker to end the CLI. In an agent's conversation
 the CLI is told it's that agent, with the agent's instructions.

@@ -3,8 +3,11 @@
 // `Attachment`). A file from the user's Mac, of any size, is kept without reading it (`keep`): an APFS clone, else a
 // link to it. A turn hands the pictures to the engine as images (`engine::Input`), a text file's words in the prompt,
 // and every file's name and where it's saved. An agent's message carries files too (mcp.rs `send_message`'s `files`,
-// `in_place`), shown where they are on this Mac with no copy, each with a bookmark that finds it when it's renamed or
-// moved (`moved_to`); one that's gone the chat shows as no longer there.
+// `sent`): a picture or video as Filo's frozen copy (`<root>/sent/`, a folder turns don't read without asking), so the
+// message keeps showing it as it was sent; any other file where it is on this Mac with no copy, with a bookmark that
+// finds it when it's renamed or moved (`moved_to`). Filo's copies (`own_copy`) go with the chat they're in, or when the
+// user deletes them from a chat's Shared list (`delete_copy`); the chat then shows them as no longer kept. A file shown
+// in place that's gone shows as no longer there.
 
 use std::fs;
 use std::io;
@@ -15,6 +18,11 @@ use base64::Engine as _;
 use crate::store::Attachment;
 
 pub const DIR: &str = "attachments";
+/// Where Filo keeps its frozen copies of the pictures and videos agents send (`sent`): beside `DIR`, but not among the
+/// folders a turn reads without asking (turn.rs `readable`), so sending a file can't make it readable that way.
+pub const SENT_DIR: &str = "sent";
+/// A picture or video an agent sends is kept as a copy up to this size; a larger one shows where it is.
+pub const MAX_COPY_BYTES: u64 = 500 * 1024 * 1024;
 /// Files one message carries at most: the composer's, `filo-local send --file`'s and an agent's `files`.
 pub const MAX_PER_MESSAGE: usize = 5;
 /// A text file's words go in the prompt up to this many characters each, and this many in all.
@@ -44,36 +52,73 @@ pub fn keep(root: &Path, path: &Path, content_type: &str, link: bool) -> io::Res
     }
     let dir = root.join(DIR);
     fs::create_dir_all(&dir)?;
-    // Its own extension, so a video still plays as one (`foo.m4v`); a name's own type else.
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| {
-            !extension.is_empty() && extension.len() <= 8 && extension.chars().all(|c| c.is_ascii_alphanumeric())
-        })
-        .map_or_else(|| extension_for(content_type).to_string(), str::to_lowercase);
-    let id = format!("{}.{extension}", uuid::Uuid::new_v4());
+    let id = format!("{}.{}", uuid::Uuid::new_v4(), own_extension(path, content_type));
     let target = dir.join(&id);
-    if clone(path, &target).is_ok() {
-        return Ok(id);
-    }
-    if link {
+    if !link {
+        clone_or_copy(path, &target)?;
+    } else if clone(path, &target).is_err() {
         std::os::unix::fs::symlink(path.canonicalize()?, &target)?;
-    } else {
-        // Copied aside and moved in, so a copy cut short never passes for the file.
-        let part = dir.join(format!(".{id}.part"));
-        fs::copy(path, &part).inspect_err(|_| _ = fs::remove_file(&part))?;
-        fs::rename(&part, &target)?;
     }
     Ok(id)
 }
 
+/// `from` kept at `to`: an APFS clone, else a copy, never a link. A copy is made aside and moved in, so one cut short
+/// never passes for the file.
+fn clone_or_copy(from: &Path, to: &Path) -> io::Result<()> {
+    if clone(from, to).is_ok() {
+        return Ok(());
+    }
+    let part = to.with_file_name(format!(".{}.part", to.file_name().unwrap_or_default().to_string_lossy()));
+    fs::copy(from, &part).inspect_err(|_| _ = fs::remove_file(&part))?;
+    fs::rename(&part, to)
+}
+
 /// The file at `path` (its canonical path) an agent sends with its message (mcp.rs `send_message`), as the message keeps
-/// it: where it is, nothing copied, with a bookmark to find it by when it moves. Named as the file is (a link's target,
-/// without control characters, so a name can't pass for a line of its own), and typed by that name, but a "picture"
-/// whose first bytes aren't a picture's is a plain file.
+/// it. A picture or a video up to `MAX_COPY_BYTES` is Filo's frozen copy in `root`'s `SENT_DIR` (a clone where the disk
+/// can, which takes no room until the original changes; never a link), so the message shows it as it was sent however
+/// the agent changes its file; `local_path` keeps where the agent had it. Any other file is shown where it is
+/// (`in_place`).
+pub fn sent(root: &Path, path: &Path) -> io::Result<Attachment> {
+    let file = in_place(path)?;
+    let media = file.content_type.starts_with("image/") || file.content_type.starts_with("video/");
+    if !media || file.size > MAX_COPY_BYTES {
+        return Ok(file);
+    }
+    let dir = root.join(SENT_DIR);
+    fs::create_dir_all(&dir)?;
+    let storage_id = format!("{}.{}", uuid::Uuid::new_v4(), own_extension(path, &file.content_type));
+    let copy = dir.join(&storage_id);
+    clone_or_copy(path, &copy)?;
+    Ok(Attachment {
+        storage_id,
+        size: fs::metadata(&copy).map_or(file.size, |meta| meta.len()),
+        local_path: Some(path.display().to_string()),
+        file: copy,
+        bookmark: None,
+        inode: None,
+        ..file
+    })
+}
+
+/// The extension a copy of `path` is named with: the file's own, lowercase, so a video still plays as one (`foo.m4v`);
+/// else its type's.
+fn own_extension(path: &Path, content_type: &str) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty() && extension.len() <= 8 && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .map_or_else(|| extension_for(content_type).to_string(), str::to_lowercase)
+}
+
+/// The file at `path` (its canonical path) an agent sends, as the message keeps one that isn't copied (`sent`): where it
+/// is, with a bookmark to find it by when it moves and its inode, which tells it's still the file that was sent when
+/// the bookmark finds one. Named as the file is (a link's target, without control characters, so a name can't pass for
+/// a line of its own), and typed by that name, but a "picture" whose first bytes aren't a picture's is a plain file.
 pub fn in_place(path: &Path) -> io::Result<Attachment> {
-    let size = fs::metadata(path)?.len();
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::metadata(path)?;
+    let size = meta.len();
     let mut content_type = content_type_for(path);
     if content_type.starts_with("image/") && !starts_as_picture(path) {
         content_type = "application/octet-stream";
@@ -86,6 +131,7 @@ pub fn in_place(path: &Path) -> io::Result<Attachment> {
         file: path.to_path_buf(),
         local_path: None,
         bookmark: crate::bookmark::of(path).map(|bookmark| base64::engine::general_purpose::STANDARD.encode(bookmark)),
+        inode: Some(meta.ino()),
     })
 }
 
@@ -98,8 +144,10 @@ fn file_name(path: &Path) -> String {
     if name.trim().is_empty() { "file".into() } else { name }
 }
 
-/// Whether the file starts as a PNG, JPEG, GIF, WebP, BMP, TIFF or HEIC/HEIF/AVIF does.
+/// Whether the file starts as a PNG, JPEG, GIF, WebP, BMP, TIFF or HEIC/HEIF/AVIF does. For the last, an ISO box of a
+/// picture's brand: MP4, MOV and M4A start with `ftyp` too.
 fn starts_as_picture(path: &Path) -> bool {
+    const PICTURE_BRANDS: [&[u8; 4]; 7] = [b"heic", b"heix", b"hevc", b"heif", b"mif1", b"msf1", b"avif"];
     let mut head = [0u8; 12];
     let Ok(read) = fs::File::open(path).and_then(|mut file| io::Read::read(&mut file, &mut head)) else { return false };
     let head = &head[..read];
@@ -107,47 +155,114 @@ fn starts_as_picture(path: &Path) -> bool {
         || head.starts_with(b"\xFF\xD8\xFF")
         || head.starts_with(b"GIF8")
         || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
-        || head.starts_with(b"BM")
+        // "BM", the file's size, then four bytes that are kept at zero.
+        || (head.starts_with(b"BM") && head.get(6..10) == Some(&[0; 4]))
         || head.starts_with(b"II*\0")
         || head.starts_with(b"MM\0*")
-        || head.get(4..8) == Some(b"ftyp")
+        || (head.get(4..8) == Some(b"ftyp")
+            && head.get(8..12).is_some_and(|brand| PICTURE_BRANDS.iter().any(|picture| brand == &picture[..])))
 }
 
-/// How long a bookmark that found nothing isn't asked again: the chat's queries run many times a second.
+/// How long a bookmark that found nothing isn't asked again at first (the chat's queries run many times a second), and
+/// at most: each time it finds nothing again, the wait doubles.
 const GONE_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+const GONE_RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Where an agent's file is now when it's no longer at its path: what its bookmark finds (renamed, or moved on the same
-/// disk). None while it's still there, or when it's gone (a bookmark that found nothing is asked again only after
-/// `GONE_RECHECK`).
+/// Where an agent's file shown in place (`in_place`) is now when it's no longer at its path: what its bookmark finds
+/// (renamed, or moved on the same disk), when that's the file that was sent (its inode; a bookmark looks a file up by
+/// its old path first, which can be a newer file of that name) and not in the Trash. None while it's still there, or
+/// when it's gone (a bookmark that found nothing is asked again after `GONE_RECHECK`, then less and less often).
 pub fn moved_to(file: &Attachment) -> Option<PathBuf> {
     use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt as _;
     use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-    static GONE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    use std::time::{Duration, Instant};
+    /// Each gone file's path: when it was last looked up, and how long until the next time.
+    static GONE: OnceLock<Mutex<HashMap<PathBuf, (Instant, Duration)>>> = OnceLock::new();
     let bookmark = file.bookmark.as_deref()?;
     if file.file.is_file() {
         return None;
     }
     let gone = GONE.get_or_init(Mutex::default);
-    if gone.lock().unwrap().get(&file.file).is_some_and(|at| at.elapsed() < GONE_RECHECK) {
+    let waited = gone.lock().unwrap().get(&file.file).copied();
+    if waited.is_some_and(|(at, wait)| at.elapsed() < wait) {
         return None;
     }
     let found = base64::engine::general_purpose::STANDARD
         .decode(bookmark)
         .ok()
         .and_then(|bookmark| crate::bookmark::resolve(&bookmark))
-        .filter(|path| path.is_file() && *path != file.file);
+        .filter(|path| *path != file.file && !in_trash(path))
+        .filter(|path| {
+            fs::metadata(path).is_ok_and(|meta| meta.is_file() && file.inode.is_none_or(|inode| meta.ino() == inode))
+        });
     let mut gone = gone.lock().unwrap();
     match &found {
         Some(_) => gone.remove(&file.file),
-        None => gone.insert(file.file.clone(), Instant::now()),
+        None => {
+            let wait = waited.map_or(GONE_RECHECK, |(_, wait)| (wait * 2).min(GONE_RECHECK_MAX));
+            gone.insert(file.file.clone(), (Instant::now(), wait))
+        }
     };
     found
+}
+
+/// Whether `path` is in a Trash (the home folder's, or a disk's): a file moved there was thrown away.
+fn in_trash(path: &Path) -> bool {
+    path.components().any(|part| matches!(part.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
 }
 
 /// `file` as it is at `path`, where its bookmark found it (`moved_to`): its name the file's own there.
 pub fn moved(file: &Attachment, path: PathBuf) -> Attachment {
     Attachment { name: file_name(&path), file: path, ..file.clone() }
+}
+
+/// `files` each where it is now: one that's no longer at its path where its bookmark finds it (`moved_to`). The places
+/// in `files` of those found (a chat keeps them beside its messages, store.rs `find_moved_files`; the group in the
+/// message's row, group.rs).
+pub fn find_moved(files: &mut [Attachment]) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (index, file) in files.iter_mut().enumerate() {
+        if let Some(path) = moved_to(file) {
+            *file = moved(file, path);
+            found.push(index);
+        }
+    }
+    found
+}
+
+/// Whether `file` is a copy Filo keeps (the user's in `DIR`, an agent's picture or video in `SENT_DIR`), named as its
+/// storage id: what goes with its chat or from the Shared list (`delete_copy`). Never a file shown where it is.
+pub fn own_copy(file: &Attachment) -> bool {
+    let folder = file.file.parent().and_then(Path::file_name).and_then(|name| name.to_str());
+    valid_id(&file.storage_id)
+        && file.file.file_name().and_then(|name| name.to_str()) == Some(file.storage_id.as_str())
+        && matches!(folder, Some(DIR | SENT_DIR))
+}
+
+/// Deletes Filo's copy of `file` (`own_copy`; a link the composer kept to a file on another disk goes, not the file).
+/// Whether there was one to delete.
+pub fn delete_copy(file: &Attachment) -> io::Result<bool> {
+    if !own_copy(file) {
+        return Ok(false);
+    }
+    match fs::remove_file(&file.file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Where an agent is told a message's file is: for an agent's frozen copy (`sent`), which turns don't read without
+/// asking, where the agent had it when it sent it; else the file itself (one shown in place, the user's copy). Without
+/// control characters, so a folder's name can't start a line of its own.
+pub fn told_at(file: &Attachment) -> String {
+    let in_sent = file.file.parent().and_then(Path::file_name).is_some_and(|folder| folder == SENT_DIR);
+    let at = match &file.local_path {
+        Some(original) if in_sent => original.clone(),
+        _ => file.file.display().to_string(),
+    };
+    at.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// A file's content type by its extension, as the composer, the CLI's `send --file` and an agent's `files` tell it.
@@ -326,16 +441,16 @@ pub fn prompt_note(files: &[Attachment], pictures: bool) -> String {
 }
 
 /// "[attached: image1.png, notes.pdf]" for a message in the chat so far; with `paths`, each one's path after its name
-/// ("chart.png at /Users/me/work/chart.png"), as an agent's own files are named to it.
+/// ("chart.png at /Users/me/work/chart.png; notes.md at …", `told_at`), as an agent's own files are named to it.
 pub fn names(files: &[Attachment], paths: bool) -> String {
     if files.is_empty() {
         return String::new();
     }
     let named: Vec<String> = files
         .iter()
-        .map(|file| if paths { format!("{} at {}", file.name, file.file.display()) } else { file.name.clone() })
+        .map(|file| if paths { format!("{} at {}", file.name, told_at(file)) } else { file.name.clone() })
         .collect();
-    format!("[attached: {}]", named.join(", "))
+    format!("[attached: {}]", named.join(if paths { "; " } else { ", " }))
 }
 
 #[cfg(test)]
@@ -413,6 +528,88 @@ mod tests {
     }
 
     #[test]
+    fn a_bookmark_finds_only_the_file_that_was_sent_and_not_in_the_trash() {
+        let root = crate::test_support::temp_dir("attachments-same-file");
+        let root = root.canonicalize().unwrap();
+        // Sent, renamed (the chat keeps the new path), a new file made under the old name, the renamed one deleted.
+        let (chart, old) = (root.join("chart.pdf"), root.join("chart-old.pdf"));
+        fs::write(&chart, b"v1").unwrap();
+        let sent = in_place(&chart).unwrap();
+        fs::rename(&chart, &old).unwrap();
+        assert_eq!(moved_to(&sent).as_ref(), Some(&old));
+        let found = moved(&sent, old.clone());
+        fs::write(&chart, b"a newer file").unwrap();
+        fs::remove_file(&old).unwrap();
+        // The bookmark looks it up by its first path first, which is the newer file now: not the one sent.
+        assert_eq!(moved_to(&found), None);
+        // Thrown away: a Trash isn't where it is.
+        let notes = root.join("notes.txt");
+        fs::write(&notes, b"notes").unwrap();
+        let sent = in_place(&notes).unwrap();
+        fs::create_dir_all(root.join(".Trash")).unwrap();
+        fs::rename(&notes, root.join(".Trash/notes.txt")).unwrap();
+        assert_eq!(moved_to(&sent), None);
+    }
+
+    #[test]
+    fn an_agents_picture_or_video_is_kept_as_sent_and_the_rest_where_it_is() {
+        let root = crate::test_support::temp_dir("attachments-sent");
+        let root = root.canonicalize().unwrap();
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let (logo, clip, notes) = (work.join("Logo.PNG"), work.join("clip.mov"), work.join("notes.md"));
+        fs::write(&logo, b"\x89PNG\r\n\x1a\n v1").unwrap();
+        fs::write(&clip, b"mov").unwrap();
+        fs::write(&notes, b"# notes").unwrap();
+        let picture = sent(&root, &logo).unwrap();
+        assert_eq!(picture.file, root.join(SENT_DIR).join(&picture.storage_id));
+        assert!(picture.storage_id.ends_with(".png") && own_copy(&picture));
+        assert_eq!(
+            (picture.name.as_str(), picture.content_type.as_str(), picture.size, picture.local_path.as_deref()),
+            ("Logo.PNG", "image/png", 11, logo.to_str())
+        );
+        assert_eq!(told_at(&picture), logo.display().to_string());
+        // Frozen: the agent's next version doesn't change it.
+        fs::write(&logo, b"\x89PNG\r\n\x1a\n v2").unwrap();
+        assert_eq!(fs::read(&picture.file).unwrap(), b"\x89PNG\r\n\x1a\n v1");
+        assert!(own_copy(&sent(&root, &clip).unwrap()));
+        // Other files, a "picture" that isn't one, and a video too big to copy: where they are.
+        let text = sent(&root, &notes).unwrap();
+        assert!(!own_copy(&text) && text.file == notes && told_at(&text) == notes.display().to_string());
+        let fake = work.join("fake.png");
+        fs::write(&fake, b"words").unwrap();
+        assert_eq!(sent(&root, &fake).unwrap().file, fake);
+        let big = work.join("big.mp4");
+        fs::File::create(&big).unwrap().set_len(MAX_COPY_BYTES + 1).unwrap();
+        assert_eq!(sent(&root, &big).unwrap().file, big);
+        assert_eq!(fs::read_dir(root.join(SENT_DIR)).unwrap().count(), 2);
+        // Only Filo's copies are deleted, never a file shown where it is, nor one dressed up as a copy.
+        assert!(!delete_copy(&text).unwrap() && notes.is_file());
+        let posing = Attachment { storage_id: "notes.md".into(), ..text.clone() };
+        assert!(!delete_copy(&posing).unwrap() && notes.is_file());
+        assert!(delete_copy(&picture).unwrap() && !picture.file.exists() && logo.is_file());
+        assert!(!delete_copy(&picture).unwrap());
+    }
+
+    #[test]
+    fn a_picture_is_told_by_its_first_bytes() {
+        let root = crate::test_support::temp_dir("attachments-first-bytes");
+        let check = |bytes: &[u8]| {
+            let path = root.join("x.png");
+            fs::write(&path, bytes).unwrap();
+            starts_as_picture(&path)
+        };
+        assert!(check(b"\0\0\0\x18ftypheic\0\0\0\0"));
+        assert!(check(b"\0\0\0\x1cftypavif\0\0\0\0"));
+        assert!(check(b"BM\x36\x10\x0e\0\0\0\0\0\x36\0"));
+        // A video or a sound starts with `ftyp` too; a text can start with "BM".
+        assert!(!check(b"\0\0\0\x18ftypqt  \0\0\0\0"));
+        assert!(!check(b"\0\0\0\x20ftypisom\0\0\x02\0"));
+        assert!(!check(b"\0\0\0\x1cftypM4A \0\0\0\0"));
+        assert!(!check(b"BMW owners' notes"));
+    }
+
+    #[test]
     fn a_sent_files_name_and_type_are_its_own() {
         let root = crate::test_support::temp_dir("attachments-named");
         fs::create_dir_all(&root).unwrap();
@@ -442,6 +639,7 @@ mod tests {
             file: "/x/a".into(),
             local_path: None,
             bookmark: None,
+            inode: None,
         };
         assert!(handed_over(&file("image/png", 4 * 1024 * 1024)));
         assert!(!handed_over(&file("image/png", 40 * 1024 * 1024)));
@@ -475,6 +673,7 @@ mod tests {
                 file: "/x/a.png".into(),
                 local_path: None,
                 bookmark: None,
+                inode: None,
             },
             Attachment {
                 storage_id: "b.txt".into(),
@@ -484,6 +683,7 @@ mod tests {
                 file: text,
                 local_path: None,
                 bookmark: None,
+                inode: None,
             },
         ];
         let note = prompt_note(&files, true);

@@ -4,8 +4,9 @@
 // chat and turn it serves, so everything it does lands in that chat. Its tools:
 //
 // - `send_message { text, files }`: a message to the user in the chat. The only way a reply reaches the chat. `files`
-//   are paths on this Mac sent with it, shown where they are with no copy (attachments.rs `in_place`) as the user's own
-//   attachments are (pictures and videos as tiles, the rest as file chips). In a turn of the
+//   are paths on this Mac sent with it (attachments.rs `sent`): a picture or video as Filo's frozen copy, the rest where
+//   they are with no copy, shown as the user's own attachments are (pictures and videos as tiles, the rest as file
+//   chips). In a turn of the
 //   agents' group chat (`--group-speaker <filo or an agent's id>`), it posts in the group in that member's name
 //   (group.rs) instead, with an optional `ask` list of the members (or everyone) who answer next: only they do, never
 //   one its text @-names; the other tools still belong to the member's own conversation (`--chat`). A group turn run in
@@ -578,7 +579,7 @@ fn artifact_origin(target: &Target) -> crate::artifacts::Origin {
 }
 
 /// The local data folder: the database's. generate_images' pictures are kept in its attachments/, with the user's
-/// files.
+/// files; send_message's copies of pictures and videos in its sent/.
 pub(crate) fn data_dir(target: &Target) -> PathBuf {
     target.db.parent().map(PathBuf::from).unwrap_or_default()
 }
@@ -679,13 +680,14 @@ fn files_property() -> Value {
         "type": "array",
         "items": { "type": "string" },
         "maxItems": MAX_FILES,
-        "description": format!("Files on this Mac to send with the message, by their full paths (like \"/Users/me/Desktop/chart.png\"), up to {MAX_FILES}. Pictures and videos show in the chat as tiles the user opens to look at or play, other files as file chips they open. The chat shows each file where it is, without a copy: save what you send somewhere it stays, like your workspace (the folder you work in), not a temp folder, and don't delete it afterwards. A file that's renamed or moved on the same disk is still found; one that's deleted shows as no longer there. `text` can be empty when you send files.")
+        "description": format!("Files on this Mac to send with the message, by their full paths (like \"/Users/me/Desktop/chart.png\"), up to {MAX_FILES}. Pictures and videos show in the chat as tiles the user opens to look at or play, other files as file chips they open. Filo keeps a copy of each picture and video (up to 500 MB) as it is when you send it, so the message keeps showing that version: to show a change, send the file again and the user can compare the two. Other files (and bigger videos) show where they are, without a copy: save those somewhere they stay, like your workspace (the folder you work in), not a temp folder, and don't delete them afterwards. One that's renamed or moved on the same disk is still found; one that's deleted shows as no longer there. `text` can be empty when you send files.")
     })
 }
 
-/// The files sent with send_message (`files`), each where it is (its canonical path). Every path is checked first, so a
-/// bad one sends nothing.
-fn sent_files(arguments: &Value) -> Result<Vec<store::Attachment>, String> {
+/// The files sent with send_message (`files`), as attachments.rs `sent` keeps them: a picture or video as Filo's frozen
+/// copy, in the data folder's `sent/` (`data_dir`), anything else where it is (its canonical path). Every path is
+/// checked first, so a bad one sends nothing, and copies made for a message that isn't sent are removed (`forget`).
+fn sent_files(target: &Target, arguments: &Value) -> Result<Vec<store::Attachment>, String> {
     let paths: Vec<&str> = match arguments.get("files") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::String(path)) => vec![path.as_str()],
@@ -702,13 +704,25 @@ fn sent_files(arguments: &Value) -> Result<Vec<store::Attachment>, String> {
         ));
     }
     let paths = paths.into_iter().map(checked_file).collect::<Result<Vec<_>, _>>()?;
-    paths
-        .iter()
-        .map(|path| {
-            crate::attachments::in_place(path)
-                .map_err(|error| format!("Couldn't open {} (from `files`): {error}. Nothing was sent.", path.display()))
-        })
-        .collect()
+    let root = data_dir(target);
+    let mut files: Vec<store::Attachment> = Vec::new();
+    for path in paths {
+        match crate::attachments::sent(&root, &path) {
+            Ok(file) => files.push(file),
+            Err(error) => {
+                forget(&files);
+                return Err(format!("Couldn't send {} (from `files`): {error}. Nothing was sent.", path.display()));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Removes the copies made for a message that wasn't sent.
+fn forget(files: &[store::Attachment]) {
+    for file in files {
+        let _ = crate::attachments::delete_copy(file);
+    }
 }
 
 /// A path in `files`, as a file that's there: a full path (`~/` is the home folder) to a file, not a folder. Its
@@ -776,17 +790,18 @@ fn send_message(target: &Target, arguments: &Value) -> Result<String, String> {
         let members = crate::group::members(&db);
         let asks = crate::group::asks(&ask_list(arguments), speaker, &members)?;
         let asked = crate::group::asked_names(&asks, speaker, &members);
-        let files = sent_files(arguments)?;
+        let files = sent_files(target, arguments)?;
         let shown = shown_files(&files);
         let posted = crate::group::post_files(
             &db,
             speaker,
             text,
-            files,
+            files.clone(),
             asks,
             target.turn_id.as_deref(),
             crate::now_ms() as i64,
-        )?;
+        )
+        .inspect_err(|_| forget(&files))?;
         if let Some(report) =
             arguments.get("report").and_then(Value::as_str).map(str::trim).filter(|report| !report.is_empty())
         {
@@ -809,23 +824,37 @@ fn send_message(target: &Target, arguments: &Value) -> Result<String, String> {
         };
         return Ok(format!("{posted}{shown}"));
     }
-    let files = sent_files(arguments)?;
+    let files = sent_files(target, arguments)?;
     let shown = shown_files(&files);
     let mut message = target.store.agent_message(&target.chat_id, text, target.turn_id.clone());
     message.attachments = files;
-    target.store.append(&target.chat_id, &message).map_err(|error| format!("Couldn't save the message: {error}"))?;
+    target.store.append(&target.chat_id, &message).map_err(|error| {
+        forget(&message.attachments);
+        format!("Couldn't save the message: {error}")
+    })?;
     Ok(format!("Sent. The user sees it in the chat.{shown}"))
 }
 
-/// What send_message's result says of the files it sent: which, from where (so the agent can find and change them
-/// later), and to leave them there. Empty without files.
+/// What send_message's result says of the files it sent, by where the agent has them (so it can find and change them
+/// later): those kept as copies, which its changes don't touch, and those shown where they are, to leave there. Paths
+/// are set apart with "; ", which a path rarely has. Empty without files.
 fn shown_files(files: &[store::Attachment]) -> String {
-    let at: Vec<String> = files.iter().map(|file| file.file.display().to_string()).collect();
-    match at.as_slice() {
-        [] => String::new(),
-        [one] => format!(" Its file shows from where it is, {one}: leave it there."),
-        all => format!(" Its {} files show from where they are, {}: leave them there.", all.len(), all.join(", ")),
+    let (copied, in_place): (Vec<_>, Vec<_>) = files.iter().partition(|file| crate::attachments::own_copy(file));
+    let list = |files: &[&store::Attachment]| {
+        files.iter().map(|file| crate::attachments::told_at(file)).collect::<Vec<_>>().join("; ")
+    };
+    let mut said = String::new();
+    match copied.len() {
+        0 => {}
+        1 => said.push_str(&format!(" Kept as sent, a copy your changes don't touch: {}.", list(&copied))),
+        _ => said.push_str(&format!(" Kept as sent, copies your changes don't touch: {}.", list(&copied))),
     }
+    match in_place.len() {
+        0 => {}
+        1 => said.push_str(&format!(" Shown from where it is (leave it there): {}.", list(&in_place))),
+        _ => said.push_str(&format!(" Shown from where they are (leave them there): {}.", list(&in_place))),
+    }
+    said
 }
 
 fn memory_tool(target: &Target, name: &str, arguments: &Value) -> Result<String, String> {
@@ -1469,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn send_message_shows_files_where_they_are_and_refuses_bad_paths() {
+    fn send_message_keeps_pictures_as_sent_shows_other_files_where_they_are_and_refuses_bad_paths() {
         // As in the app: the data folder (`data`, with filo.db) and the agents' chats in agents/ below it.
         let data = temp_store("mcp-files");
         let store = Store::at(data.root().join("agents"));
@@ -1489,13 +1518,15 @@ mod tests {
             (schema["properties"]["files"]["type"].as_str(), schema["required"].clone()),
             (Some("array"), json!(["text"]))
         );
-        // Told to keep what it sends somewhere lasting.
-        assert!(schema["properties"]["files"]["description"].as_str().unwrap().contains("like your workspace"));
+        // Told pictures are kept as sent, and to keep the rest somewhere lasting.
+        let described = schema["properties"]["files"]["description"].as_str().unwrap();
+        assert!(described.contains("as it is when you send it") && described.contains("like your workspace"));
         // The agent's files, in its workspace.
         let work = store.root().canonicalize().unwrap().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let (picture, video, report) = (work.join("Chart.PNG"), work.join("clip.mov"), work.join("report.pdf"));
-        for (path, bytes) in [(&picture, &b"\x89PNG\r\n\x1a\n"[..]), (&video, b"mov bytes"), (&report, b"pdf bytes")] {
+        for (path, bytes) in [(&picture, &b"\x89PNG\r\n\x1a\n v1"[..]), (&video, b"mov bytes"), (&report, b"pdf bytes")]
+        {
             std::fs::write(path, bytes).unwrap();
         }
         let paths = [&picture, &video, &report].map(|path| path.display().to_string());
@@ -1504,28 +1535,56 @@ mod tests {
         assert_eq!(
             sent["content"][0]["text"],
             format!(
-                "Sent. The user sees it in the chat. Its 3 files show from where they are, {}: leave them there.",
-                paths.join(", ")
+                "Sent. The user sees it in the chat. Kept as sent, copies your changes don't touch: {}; {}. Shown from where it is (leave it there): {}.",
+                paths[0], paths[1], paths[2]
             )
         );
         let message = store.messages(&chat.id).unwrap().pop().unwrap();
         assert_eq!((message.role, message.text.as_str()), (Role::Assistant, "Here it is."));
-        let shown: Vec<(&str, &str, u64, &Path)> = message
+        let shown: Vec<(&str, &str, u64, Option<&str>)> = message
             .attachments
             .iter()
-            .map(|file| (file.name.as_str(), file.content_type.as_str(), file.size, file.file.as_path()))
+            .map(|file| (file.name.as_str(), file.content_type.as_str(), file.size, file.local_path.as_deref()))
             .collect();
         assert_eq!(
             shown,
             [
-                ("Chart.PNG", "image/png", 8, picture.as_path()),
-                ("clip.mov", "video/quicktime", 9, video.as_path()),
-                ("report.pdf", "application/pdf", 9, report.as_path())
+                ("Chart.PNG", "image/png", 11, Some(paths[0].as_str())),
+                ("clip.mov", "video/quicktime", 9, Some(paths[1].as_str())),
+                ("report.pdf", "application/pdf", 9, None)
             ]
         );
-        // Nothing copied: no storage id, nothing in the data folder's attachments/, and a bookmark to find each by.
-        assert!(message.attachments.iter().all(|file| file.storage_id.is_empty() && file.bookmark.is_some()));
+        // The picture and the video: Filo's copies in the data folder's sent/ (clones, never links), which turns don't
+        // read without asking; the PDF where it is, with a bookmark and its inode.
+        let sent_dir = data.root().join(crate::attachments::SENT_DIR);
+        for file in &message.attachments[..2] {
+            assert_eq!(file.file, sent_dir.join(&file.storage_id));
+            assert!(!std::fs::symlink_metadata(&file.file).unwrap().file_type().is_symlink());
+            assert!(crate::attachments::own_copy(file) && file.bookmark.is_none());
+        }
+        assert!(message.attachments[1].storage_id.ends_with(".mov"));
+        let pdf = &message.attachments[2];
+        assert!(pdf.storage_id.is_empty() && pdf.file == report && pdf.bookmark.is_some() && pdf.inode.is_some());
         assert!(!data.root().join(crate::attachments::DIR).exists());
+        assert!(
+            !crate::turn::readable(store.root(), Some(&target.db)).iter().any(|folder| sent_dir.starts_with(folder))
+        );
+        // The agent draws v2 over its file and sends it again: the first message still shows v1.
+        std::fs::write(&picture, b"\x89PNG\r\n\x1a\n v2").unwrap();
+        assert_eq!(send(&target, json!({ "text": "v2", "files": [paths[0]] }))["isError"], false);
+        let messages = store.messages(&chat.id).unwrap();
+        let [first, second] = [&messages[messages.len() - 2], &messages[messages.len() - 1]];
+        assert_eq!(std::fs::read(&first.attachments[0].file).unwrap(), b"\x89PNG\r\n\x1a\n v1");
+        assert_eq!(std::fs::read(&second.attachments[0].file).unwrap(), b"\x89PNG\r\n\x1a\n v2");
+        // A new session's seed names the agent's files where it has them.
+        assert_eq!(
+            crate::attachments::names(&first.attachments[..1], true),
+            format!("[attached: Chart.PNG at {}]", paths[0])
+        );
+        // Deleting its file doesn't touch what the chat shows.
+        std::fs::remove_file(&video).unwrap();
+        assert_eq!(std::fs::read(&first.attachments[1].file).unwrap(), b"mov bytes");
+        std::fs::write(&video, b"mov bytes").unwrap();
 
         // Files alone; `~/` the home folder; a link or `..` is sent as the file it names.
         let link = work.join("latest.png");
@@ -1538,8 +1597,8 @@ mod tests {
         assert_eq!(alone["isError"], false, "{alone}");
         let files = store.messages(&chat.id).unwrap().pop().unwrap().attachments;
         assert_eq!(
-            files.iter().map(|file| (file.name.as_str(), file.file.as_path())).collect::<Vec<_>>(),
-            [("Chart.PNG", picture.as_path()), ("report.pdf", report.as_path())]
+            files.iter().map(|file| (file.name.as_str(), crate::attachments::told_at(file))).collect::<Vec<_>>(),
+            [("Chart.PNG", paths[0].clone()), ("report.pdf", paths[2].clone())]
         );
         assert!(checked_file("~/").is_err_and(|error| error.contains("folder")));
 
@@ -1560,6 +1619,9 @@ mod tests {
         refused(json!({ "text": "x", "files": { "path": ok } }), "list of paths");
         refused(json!({ "text": " ", "files": [] }), "needs non-empty `text` (or `files` to send)");
         assert_eq!(store.messages(&chat.id).unwrap().len(), before);
+        // No copy is left behind by a message that wasn't sent.
+        let copies = std::fs::read_dir(&sent_dir).unwrap().count();
+        assert_eq!(copies, 4);
         std::fs::remove_dir_all(data.root()).ok();
     }
 
@@ -1583,17 +1645,18 @@ mod tests {
             sent["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .ends_with(&format!("Its file shows from where it is, {}: leave it there.", photo.display()))
+                .ends_with(&format!("Kept as sent, a copy your changes don't touch: {}.", photo.display()))
         );
         let (messages, _) = crate::group::messages(&db, 10).unwrap();
         let posted = messages.last().unwrap();
         assert_eq!((posted.speaker.as_deref(), posted.text.as_str()), (Some("chef"), ""));
+        // Filo's copy, beside the database.
         assert_eq!(
-            posted.attachments.iter().map(|file| (file.content_type.as_str(), file.file.as_path())).collect::<Vec<_>>(),
-            [("image/jpeg", photo.as_path())]
+            posted.attachments.iter().map(|file| (file.content_type.as_str(), file.file.parent())).collect::<Vec<_>>(),
+            [("image/jpeg", Some(store.root().join(crate::attachments::SENT_DIR).as_path()))]
         );
-        // Members read where it is; a preview names it.
-        assert!(posted.with_files("").contains(&format!("pasta.jpg (image/jpeg), saved at {}", photo.display())));
+        // Members read where the agent has it; a preview names it.
+        assert!(posted.with_files("").contains(&format!("pasta.jpg (image/jpeg), at {}", photo.display())));
         assert_eq!(posted.summary(), "pasta.jpg");
         let line = store.messages(&chat.id).unwrap().pop().unwrap();
         assert_eq!((line.in_group.as_deref(), &line.attachments), (Some(posted.id.as_str()), &posted.attachments));

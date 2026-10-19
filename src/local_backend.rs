@@ -172,6 +172,7 @@ pub const MOVED: &[&str] = &[
     "voiceRecordings:createUpload",
     "voiceRecordings:send",
     "chatShared:list",
+    "chatShared:deleteFiles",
     // A conversation's coding tasks, their questions and the chats they work for are in local_backend/coding.rs
     // (`CODING`).
     "notes:mine",
@@ -359,22 +360,26 @@ fn routine_run(message: &Message) -> Option<filo_local::store::RoutineRun> {
     Some(filo_local::store::RoutineRun { title: title.to_string(), when: when.to_string() })
 }
 
-/// A message's files as the chat shows them (`Attachment`): drawn and opened from the copy saved here, or an agent's
-/// file where it is. One that's no longer there is `gone`, with no file to draw or open.
+/// A message's files as the chat shows them (`Attachment`): drawn and opened from Filo's copy (`copy`), or an agent's
+/// file where it is, at the size it is now. One that's no longer there is `gone`, with no file to draw or open: a copy
+/// deleted from the Shared list (no longer kept), or a file deleted where it was.
 fn attachments_json(files: &[filo_local::store::Attachment]) -> Value {
     Value::Array(
         files
             .iter()
             .map(|file| {
-                let gone = !file.file.is_file();
+                let copy = filo_local::attachments::own_copy(file);
+                let meta = std::fs::metadata(&file.file).ok().filter(|meta| meta.is_file());
+                let size = meta.as_ref().filter(|_| !copy).map_or(file.size, |meta| meta.len());
                 json!({
                     "storageId": file.storage_id,
                     "name": file.name,
                     "contentType": file.content_type,
-                    "size": file.size as f64,
+                    "size": size as f64,
                     "localPath": file.local_path,
-                    "localFile": (!gone).then_some(&file.file),
-                    "gone": gone,
+                    "localFile": meta.is_some().then_some(&file.file),
+                    "gone": meta.is_none(),
+                    "copy": copy,
                 })
             })
             .collect(),
@@ -808,6 +813,7 @@ impl Local {
             "voiceSessions:unseen" => Ok(self.unseen()),
             "voiceSessions:working" => Ok(self.working(args)),
             "chatShared:list" => Ok(self.shared(args)),
+            "chatShared:deleteFiles" => self.delete_shared_files(args),
             "notes:mine" => Ok(json!(notes::list(self.db()?)?)),
             "notes:getMine" => Ok(json!(notes::get(self.db()?, required(args, "id")?)?)),
             "notes:search" => {
@@ -1137,6 +1143,8 @@ impl Local {
         let removed = app_data::remove_agent(self.db()?, &id)?.ok_or("This agent no longer exists.")?;
         if let Some(session) = removed.session_id {
             self.stop_session(&session);
+            // Filo's copies of the chat's files go with it.
+            self.delete_chat_files(&session);
             let _ = self.agent_chats.delete_chat(&session);
         }
         self.group_agent_removed(&id);
@@ -1410,6 +1418,7 @@ impl Local {
                     file: saved,
                     local_path: arg(file, "localPath").map(str::to_string),
                     bookmark: None,
+                    inode: None,
                 })
             })
             .collect()

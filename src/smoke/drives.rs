@@ -17,6 +17,8 @@ use super::{DRIVE_BOUNDS, NOTE_SHARE_ITEMS, PAGE_SCROLLS};
 
 // `FILO_OPEN=list-reorder-timing` (smoke/drives/list_reorder.rs).
 mod list_reorder;
+// `FILO_OPEN=shared-delete-drive` (smoke/drives/shared_delete.rs).
+mod shared_delete;
 
 async fn first_id(
     future: impl std::future::Future<Output = Result<Value, String>>,
@@ -1178,7 +1180,8 @@ type Drive = fn(Option<String>, &mut Window, &mut Context<AppShell>);
 
 /// The drives `open_from_env` starts by name. They click and type through the window like a person (in-app AppKit
 /// events, `native_input`), so while one runs the elements it looks for record where they are (`driving`).
-const DRIVES: [(&str, Drive); 37] = [
+const DRIVES: [(&str, Drive); 38] = [
+    ("shared-delete-drive", |_, window, cx| shared_delete::run(window, cx)),
     ("list-reorder-timing", |_, window, cx| list_reorder::run(window, cx)),
     ("feed-drive", |_, window, cx| run_feed_drive(window, cx)),
     ("chat-timing", |_, window, cx| run_chat_timing(window, cx)),

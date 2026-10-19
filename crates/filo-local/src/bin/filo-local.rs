@@ -101,6 +101,7 @@ fn send(args: &[String]) -> i32 {
             file,
             local_path: Some(path.display().to_string()),
             bookmark: None,
+            inode: None,
         });
     }
     let chat = match chat_id {
