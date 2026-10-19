@@ -364,6 +364,12 @@ impl FocusHandle {
         self.id.contains(other.id, window)
     }
 
+    /// Filo: whether the element with this handle was drawn in the most recently rendered frame. A handle outlives its
+    /// element, and the window keeps the keyboard on it after its element is no longer drawn.
+    pub fn is_drawn(&self, window: &Window) -> bool {
+        window.rendered_frame.dispatch_tree.focusable_node_id(self.id).is_some()
+    }
+
     /// Dispatch an action on the element that rendered this focus handle
     pub fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
         if let Some(node_id) = window

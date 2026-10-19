@@ -4398,6 +4398,8 @@ impl Render for Conversation {
         }
         self.hold_pin();
         self.note_glance_clip();
+        // A letter typed on a sound's row comes back to this box while it's drawn (audio_row.rs).
+        crate::audio_row::message_box(&gpui::Focusable::focus_handle(self.input.read(cx), cx), window, cx);
         let body: AnyElement = match (&self.session_id, &self.detail) {
             (None, _) if self.pending.is_none() && !self.fixture() => div()
                 .flex_1()

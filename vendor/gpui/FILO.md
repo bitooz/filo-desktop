@@ -28,6 +28,9 @@ Changes, all marked `Filo:` in the source:
   back on a click (no `acceptsFirstResponder`), so nothing did. Now a mouse down this view hears makes it the first
   responder, and a frame drawn while the window itself (or its content view) is the first responder hands it back on
   the next pass of the run loop. `FILO_OPEN=page-keys-drive` checks both in the app.
+- `src/window.rs` (`FocusHandle::is_drawn`): whether a focus handle's element is in the last frame. A sound's row in
+  Filo hands letters typed on it back to the message box only while that box is drawn (audio_row.rs); a box on a page
+  that's no longer shown keeps its handle, and the window would focus it and lose the keys.
 - `src/window.rs` (`scene_index`, `painted_over`, `PaintedOver`): what GPUI painted over a native view. A native view
   over the window's view (a web view, a glance's page, a video) is over everything GPUI draws, so a menu, tooltip,
   notification or dialog GPUI draws over one was hidden behind it. A native view's element takes `scene_index` as it

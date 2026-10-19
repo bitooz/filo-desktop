@@ -115,6 +115,11 @@ pub fn is_audio(content_type: &str, name: &str) -> bool {
 /// A name for what's made from `file` and kept (a video's poster, a sound's waveform), from its path, size and time,
 /// so a changed file gets a new one; None when the file isn't there.
 pub fn file_key(file: &Path) -> Option<String> {
+    file_facts(file).map(|(key, _)| key)
+}
+
+/// `file_key`, and the file's size, from one look at it.
+pub fn file_facts(file: &Path) -> Option<(String, u64)> {
     use sha2::Digest as _;
     let meta = std::fs::metadata(file).ok()?;
     let modified = meta
@@ -123,7 +128,7 @@ pub fn file_key(file: &Path) -> Option<String> {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |time| time.as_millis());
     let id = sha2::Sha256::digest(format!("{}\n{}\n{modified}", file.display(), meta.len()).as_bytes());
-    Some(id[..10].iter().map(|byte| format!("{byte:02x}")).collect())
+    Some((id[..10].iter().map(|byte| format!("{byte:02x}")).collect(), meta.len()))
 }
 
 /// The temporary folder what's made from files of one `kind` ("posters", "waves") is kept in, by `file_key`.
