@@ -43,6 +43,8 @@ mod recorder;
 mod report;
 mod screens;
 mod screenshot;
+// Rows sliding to a new order (the Agents list).
+mod sliding_rows;
 // Telling the user when the Mac slept while tasks kept it awake.
 mod slept;
 mod smoke;

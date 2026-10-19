@@ -15,6 +15,9 @@ use crate::screens::note::NoteScreen;
 
 use super::{DRIVE_BOUNDS, NOTE_SHARE_ITEMS, PAGE_SCROLLS};
 
+// `FILO_OPEN=list-reorder-timing` (smoke/drives/list_reorder.rs).
+mod list_reorder;
+
 async fn first_id(
     future: impl std::future::Future<Output = Result<Value, String>>,
     pick: impl Fn(&Value) -> Option<String>,
@@ -1175,7 +1178,8 @@ type Drive = fn(Option<String>, &mut Window, &mut Context<AppShell>);
 
 /// The drives `open_from_env` starts by name. They click and type through the window like a person (in-app AppKit
 /// events, `native_input`), so while one runs the elements it looks for record where they are (`driving`).
-const DRIVES: [(&str, Drive); 36] = [
+const DRIVES: [(&str, Drive); 37] = [
+    ("list-reorder-timing", |_, window, cx| list_reorder::run(window, cx)),
     ("feed-drive", |_, window, cx| run_feed_drive(window, cx)),
     ("chat-timing", |_, window, cx| run_chat_timing(window, cx)),
     ("feed-glance-drive", |_, window, cx| run_feed_glance_drive(window, cx)),

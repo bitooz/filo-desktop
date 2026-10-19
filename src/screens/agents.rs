@@ -54,8 +54,6 @@ const PANE_MIN: f32 = 440.;
 /// The ⋯ at the end of a chat's header (a small icon button), with a little to spare.
 const AGENT_MENU_WIDTH: f32 = 28.;
 const ROW_PICTURE: f32 = 40.;
-/// A row's height until it's drawn, for its slide.
-const ROW_HEIGHT: f32 = 56.;
 pub const NAME_MAX: usize = 32;
 pub const INSTRUCTIONS_MAX: usize = 8_000;
 /// The form's column, padding included.
@@ -943,15 +941,13 @@ pub struct AgentsScreen {
     /// click points at, or one ⌘P's search found, with how far back it is (0: loaded already, or not known).
     reveal: Option<(String, String, usize)>,
     /// The list's rows in the order shown, and the order they take once the pointer leaves the list (`arrange`): while
-    /// it's over the list (`pointer`) rows don't move under it. Each row's height as last drawn, and the slide to a new
-    /// order under way. The rows left with a draft at the last placing: one that gains or loses its draft (the user
-    /// leaving its chat, or sending or clearing it) moves even under the pointer.
+    /// it's over the list (`pointer`) rows don't move under it (they slide to a new order: sliding_rows.rs). The rows
+    /// left with a draft at the last placing: one that gains or loses its draft (the user leaving its chat, or sending
+    /// or clearing it) moves even under the pointer.
     shown: Vec<String>,
     target: Vec<String>,
     placed_drafts: Vec<String>,
     pointer: ListPointer,
-    row_heights: Rc<std::cell::RefCell<HashMap<String, f32>>>,
-    slide: Option<Slide>,
     _subs: Vec<Task<()>>,
 }
 
@@ -1067,53 +1063,6 @@ fn held(shown: &[String], target: &[String], moved: &[String]) -> Vec<String> {
 
 /// How long the tool marks take to fade in or out.
 const MARKS_FADE: std::time::Duration = std::time::Duration::from_millis(180);
-
-/// How long rows take to slide to a new order.
-const SLIDE: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// Rows sliding from where they were to a new order: how far each started from its new place, and when.
-struct Slide {
-    started: std::time::Instant,
-    from: HashMap<String, f32>,
-}
-
-impl Slide {
-    fn progress(&self) -> f32 {
-        (self.started.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).min(1.)
-    }
-
-    /// How far `key` is from its place now, easing out to nothing.
-    fn offset(&self, key: &str) -> f32 {
-        self.from.get(key).map_or(0., |from| from * (1. - gpui::ease_out_quint()(self.progress())))
-    }
-}
-
-/// How far each row moves going from `old` to `new` (rows `height` tall, starting `offset` from their place in `old`):
-/// the distance from where it shows now to its place in `new`.
-fn slide_from(
-    old: &[String],
-    new: &[String],
-    height: impl Fn(&str) -> f32,
-    offset: impl Fn(&str) -> f32,
-) -> HashMap<String, f32> {
-    let tops = |order: &[String]| -> HashMap<String, f32> {
-        let mut top = 0.;
-        order
-            .iter()
-            .map(|key| {
-                let at = top;
-                top += height(key);
-                (key.clone(), at)
-            })
-            .collect()
-    };
-    let (before, after) = (tops(old), tops(new));
-    after
-        .iter()
-        .filter_map(|(key, to)| Some((key.clone(), before.get(key)? + offset(key) - to)))
-        .filter(|(_, from)| from.abs() >= 0.5)
-        .collect()
-}
 
 impl AgentsScreen {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1239,8 +1188,6 @@ impl AgentsScreen {
             target: Vec::new(),
             placed_drafts: Vec::new(),
             pointer: ListPointer::default(),
-            row_heights: Rc::default(),
-            slide: None,
             _subs,
         }
     }
@@ -1582,6 +1529,26 @@ impl AgentsScreen {
     #[cfg(feature = "dev")]
     pub fn list_order(&self) -> Vec<String> {
         self.target.clone()
+    }
+
+    /// Puts `rows` in the list in place of the agents (`FILO_OPEN=list-reorder-timing`).
+    #[cfg(feature = "dev")]
+    pub fn show_rows_for_check(&mut self, rows: Vec<AgentRow>, cx: &mut Context<Self>) {
+        self.agents = Some(Ok(rows));
+        cx.notify();
+    }
+
+    /// Gives row `id` a last message saying `preview`, from `at` (none: when its last one was), as `agents:list` does
+    /// when its chat moves on.
+    #[cfg(feature = "dev")]
+    pub fn set_last_for_check(&mut self, id: &str, at: Option<f64>, preview: &str, cx: &mut Context<Self>) {
+        if let Some(Ok(rows)) = &mut self.agents
+            && let Some(row) = rows.iter_mut().find(|row| row.id == id)
+        {
+            let at = at.or(row.last.as_ref().map(|last| last.at)).unwrap_or_default();
+            row.last = Some(LastMessage { from_user: false, preview: preview.to_string(), at });
+            cx.notify();
+        }
     }
 
     /// The agents' chats left with a draft, with their draft's line (`FILO_OPEN=drafts-drive`).
@@ -3622,20 +3589,12 @@ impl AgentsScreen {
             .collect();
         let mut items: HashMap<String, AnyElement> =
             group_row.map(|row| (GROUP.to_string(), row)).into_iter().chain(rows).collect();
-        let list = self.place_rows(lasts, window).into_iter().map(|(key, offset)| {
-            // Each row slides from where it showed to its new place.
-            let row = items.remove(&key);
-            div().relative().top(px(offset)).children(row).into_any_element()
+        // Each row slides from where it showed to its new place.
+        let rows = self.place_rows(lasts, window).into_iter().filter_map(|key| {
+            let row = items.remove(&key)?;
+            Some((SharedString::from(key), row))
         });
-        let heights = self.row_heights.clone();
-        let keys = self.shown.clone();
-        let list = div()
-            .on_children_prepainted(move |bounds, _, _| {
-                let mut heights = heights.borrow_mut();
-                heights.clear();
-                heights.extend(keys.iter().cloned().zip(bounds.iter().map(|bounds| f32::from(bounds.size.height))));
-            })
-            .children(list);
+        let list = crate::sliding_rows::sliding_rows("agents-rows", colors.background, rows);
         self.list_newest = working_panel::newest_time(working_since);
         div()
             .relative()
@@ -3723,9 +3682,8 @@ impl AgentsScreen {
     }
 
     /// Puts the rows in their order (`arrange`), or holds the one shown while the pointer is over the list (all but the
-    /// rows whose draft came or went: the user's doing), and starts them sliding when it changes: each row's key and
-    /// how far it is from its place now.
-    fn place_rows(&mut self, lasts: Vec<(String, bool, f64)>, window: &mut Window) -> Vec<(String, f32)> {
+    /// rows whose draft came or went: the user's doing): the rows' keys in the order they show.
+    fn place_rows(&mut self, lasts: Vec<(String, bool, f64)>, window: &mut Window) -> Vec<String> {
         let main = self.main_row().map(|row| row.id.clone());
         let drafted: Vec<&str> = self.drafts.keys().collect();
         let moved: Vec<String> = drafted
@@ -3755,23 +3713,8 @@ impl AgentsScreen {
         self.pointer.held.set(hold);
         let shown = if hold { held(&self.shown, &self.target, &moved) } else { self.target.clone() };
         self.placed_drafts = self.drafts.keys().map(str::to_string).collect();
-        if shown != self.shown && !self.shown.is_empty() {
-            let heights = self.row_heights.borrow();
-            let height = |key: &str| heights.get(key).copied().unwrap_or(ROW_HEIGHT);
-            let from = slide_from(&self.shown, &shown, height, |key| {
-                self.slide.as_ref().map_or(0., |slide| slide.offset(key))
-            });
-            drop(heights);
-            self.slide = Some(Slide { started: std::time::Instant::now(), from });
-        }
         self.shown = shown;
-        if self.slide.as_ref().is_some_and(|slide| slide.progress() >= 1.) {
-            self.slide = None;
-        }
-        if self.slide.is_some() {
-            window.request_animation_frame();
-        }
-        self.shown.iter().map(|key| (key.clone(), self.slide.as_ref().map_or(0., |slide| slide.offset(key)))).collect()
+        self.shown.clone()
     }
 
     /// Follows the pointer for the list (`ListPointer`): leaving it, or the window, while the list holds its order
@@ -5259,19 +5202,6 @@ mod tests {
         assert_eq!(held(&shown, &keys(&[GROUP, "c", "b", "a"]), &keys(&["c"])), keys(&[GROUP, "c", "a", "b"]));
         // "a"'s draft sent or cleared: back down among the rest.
         assert_eq!(held(&shown, &keys(&[GROUP, "b", "c", "a"]), &keys(&["a"])), keys(&[GROUP, "b", "c", "a"]));
-    }
-
-    #[test]
-    fn rows_slide_from_where_they_showed() {
-        let keys = |list: &[&str]| list.iter().map(|key| key.to_string()).collect::<Vec<_>>();
-        let height = |key: &str| if key == "tall" { 80. } else { 50. };
-        let from = slide_from(&keys(&["a", "tall", "b"]), &keys(&["b", "a", "tall"]), height, |_| 0.);
-        // "b" moves up past both, the others down by its height.
-        assert_eq!((from["b"], from["a"], from["tall"]), (130., -50., -50.));
-        // Mid-slide, a row starts from where it shows, and one that doesn't move isn't in it.
-        let from = slide_from(&keys(&["a", "b"]), &keys(&["b", "a"]), height, |key| if key == "a" { 20. } else { 0. });
-        assert_eq!((from["a"], from["b"]), (-30., 50.));
-        assert!(slide_from(&keys(&["a", "b"]), &keys(&["a", "b"]), height, |_| 0.).is_empty());
     }
 
     #[test]
