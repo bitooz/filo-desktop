@@ -30,7 +30,11 @@ pub fn register(id: &str, from: Vec<PathBuf>) {
 }
 
 /// What a file is, by its extension (filo-local's one table): only pictures, videos, sounds and captions are answered.
+/// AVIF too, which WebKit draws but the app can't (so the table leaves it out, and a chat sends it as a plain file).
 fn content_type(path: &Path) -> Option<&'static str> {
+    if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("avif")) {
+        return Some("image/avif");
+    }
     let kind = filo_local::attachments::content_type_for(path);
     (["image/", "video/", "audio/"].iter().any(|media| kind.starts_with(media)) || kind == "text/vtt").then_some(kind)
 }
@@ -168,6 +172,15 @@ mod tests {
         let script =
             r#"<script>const a = '<img class="av" src="' + src + '" alt="">', b = `<img src="${it.img}">`;</script>"#;
         assert_eq!(link_files(script, "abc"), script);
+    }
+
+    #[test]
+    fn an_avif_is_a_picture_here_and_a_plain_file_in_a_chat() {
+        assert_eq!(content_type(Path::new("cover.AVIF")), Some("image/avif"));
+        assert_eq!(content_type(Path::new("talk.flac")), Some("audio/flac"));
+        assert_eq!(content_type(Path::new("notes.txt")), None);
+        // The app can't draw one, so a chat sends it as a file.
+        assert_eq!(filo_local::attachments::content_type_for(Path::new("cover.avif")), "application/octet-stream");
     }
 
     #[test]

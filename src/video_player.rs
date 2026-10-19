@@ -490,7 +490,11 @@ mod native {
             })
         }
 
+        /// Also takes back a sound's end: it's somewhere else now.
         pub fn seek(&self, seconds: f64, exact: bool) {
+            if let Some((ended, _)) = &self.end {
+                ended.store(false, Ordering::Relaxed);
+            }
             let tolerance = if exact { CMTime::seconds(0.) } else { CMTime::seconds(0.25) };
             // SAFETY: as in `new`.
             unsafe {

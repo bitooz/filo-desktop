@@ -6,8 +6,8 @@
 //   characters' folder.
 // - `Audio`: one sound at a time across the app (voice previews, voice messages, audio files), played from its file on
 //   this Mac by the video player's AVPlayer (video_player.rs `open_audio`), with seeking and a speed for every sound.
-//   A video playing in the viewer stops it and a sound starting pauses the video; nothing plays while the microphone
-//   records. Which files are sounds is `is_audio`, by filo-local's one table of types.
+//   A video playing in the viewer pauses it (where it is) and a sound starting pauses the video; nothing plays while
+//   the microphone records. Which files are sounds is `is_audio`, by filo-local's one table of types.
 // - `file_key` and `kept_folder`: where what's made from a file (a video's poster, a sound's waveform) is kept.
 
 use std::path::{Path, PathBuf};
@@ -236,12 +236,16 @@ pub fn stop(cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// The viewer's video plays (media_viewer.rs): a sound playing stops, and the video pauses when one starts.
+/// The viewer's video plays (media_viewer.rs): a sound playing pauses where it is, and the video pauses when a sound
+/// starts.
 pub fn video_plays(video: &Rc<Player>, cx: &mut App) {
-    if cx.try_global::<Audio>().is_some_and(|audio| audio.current.is_some()) {
-        stop(cx);
+    let audio = cx.default_global::<Audio>();
+    audio.video = Some(Rc::downgrade(video));
+    if let Some(sound) = audio.current.as_mut().filter(|sound| sound.wanted) {
+        sound.player.pause();
+        sound.wanted = false;
+        cx.refresh_windows();
     }
-    cx.default_global::<Audio>().video = Some(Rc::downgrade(video));
 }
 
 /// A sound is about to play: the viewer's video pauses. False while the microphone records, when nothing may play
@@ -276,6 +280,10 @@ pub fn toggle(id: impl Into<SharedString>, url: String, length: Option<f64>, cx:
             sound.wanted = false;
         } else if allowed {
             if sound.pending.is_none() {
+                // Paused just as it ended: from the start.
+                if sound.player.ended() {
+                    sound.player.seek(0., true);
+                }
                 sound.player.play_at(speed);
             }
             sound.wanted = true;
@@ -349,13 +357,17 @@ fn start(id: SharedString, url: &str, length: Option<f64>, from: Option<f64>, cx
                     return false;
                 }
                 let end = sound.end();
+                let mut stopped_short = false;
                 if sound.pending.is_none() && sound.wanted && !player.playing() {
                     if player.ended() || end.is_none_or(|end| player.time() >= end - 0.25) {
                         stop(cx);
                         return false;
                     }
-                    // Stopped short of its end (not by Filo): kept where it is, paused.
+                    // Stopped short of its end (not by Filo): kept where it is, paused. Rare, so every window draws
+                    // again: voice messages' and Shared's buttons show it too, and they don't say they do
+                    // (`shown_in`).
                     sound.wanted = false;
+                    stopped_short = true;
                 }
                 let time = sound.pending.unwrap_or_else(|| player.time());
                 let now = (
@@ -368,6 +380,9 @@ fn start(id: SharedString, url: &str, length: Option<f64>, from: Option<f64>, cx
                     for view in std::mem::take(&mut sound.views) {
                         cx.notify(view);
                     }
+                }
+                if stopped_short {
+                    cx.refresh_windows();
                 }
                 true
             });

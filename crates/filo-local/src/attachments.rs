@@ -157,7 +157,6 @@ pub fn content_type_for(path: &Path) -> &'static str {
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "avif" => "image/avif",
         "heic" => "image/heic",
         "heif" => "image/heif",
         "bmp" => "image/bmp",

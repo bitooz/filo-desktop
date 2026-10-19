@@ -6,13 +6,14 @@
 // plays or pauses it then; a letter typed there goes back to where the keyboard was before (the message box), with
 // the letter, so typing never goes nowhere (`Keyboard`).
 //
-// The waveform is made once per file (`wave`), one file at a time on a thread of its own: macOS's `afconvert` turns the
+// The waveform is made once per file (`wave`), on two threads of their own (`maker`): macOS's `afconvert` turns the
 // sound into 4,000 8-bit samples a second, mono, in a temporary file of its own, and the loudest of each stretch is a
-// bar (read in pieces, so a long sound takes little memory). A conversion that runs past `CONVERT_TIMEOUT` (a file on a
-// stalled network volume) is stopped. The waveform is kept in a temporary folder by the file's path, size and time
-// (media.rs `file_key`, as video_player.rs keeps a video's poster), and in memory by the same key, so a file that
-// changes is made again. Until then, or for a file it can't read (tried again after `RETRY`), the bars are all one
-// height.
+// bar (read in pieces, so a long sound takes little memory). A conversion that runs past its time (`convert_timeout`,
+// by the file's size: a file on a stalled network volume) is stopped, and one whose row is no longer drawn by its turn
+// is skipped. The waveform is kept in a temporary folder by the file's path, size and time (media.rs `file_key`, as
+// video_player.rs keeps a video's poster), and in memory by the same key, which is looked up off the main thread and
+// again every `RECHECK` (a stalled drive never holds up drawing), so a file that changes is made again. Until then, or
+// for a file it can't read (not tried again until it changes), the bars are all one height.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -36,10 +37,10 @@ use crate::ui;
 const PEAKS: usize = 240;
 /// Samples a second the waveform is made from.
 const RATE: usize = 4000;
-/// The longest a waveform's conversion may take (an hour of mp3 takes about five seconds).
-const CONVERT_TIMEOUT: Duration = Duration::from_secs(180);
-/// How long a file whose waveform couldn't be made waits before it's tried again.
-const RETRY: Duration = Duration::from_secs(60);
+/// How often a sound's file is looked at again (its size and time, for its `file_key`).
+const RECHECK: Duration = Duration::from_secs(10);
+/// A waveform asked for longer ago than this is no longer drawn: its conversion is skipped.
+const UNSEEN: Duration = Duration::from_secs(10);
 
 /// A sound's waveform: how loud each of its `PEAKS` stretches is, from 0 to 1, and how long it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,39 +52,100 @@ pub struct Wave {
 enum Made {
     Making,
     Done(Wave),
-    Failed(Instant),
+    /// Not tried again: the key changes when the file does.
+    Failed,
 }
 
-/// Waveforms by file (`media::file_key`).
+/// What came of a waveform's turn.
+enum Outcome {
+    Made(Wave),
+    Failed,
+    /// Its row wasn't drawn any more: asked again when it is.
+    Skipped,
+}
+
+/// A sound file's key (`media::file_key`), looked up off the main thread.
 #[derive(Default)]
-struct Waves(HashMap<String, Made>);
+struct Known {
+    key: Option<String>,
+    checked: Option<Instant>,
+    checking: bool,
+}
+
+/// Sound files' keys, and waveforms by key.
+#[derive(Default)]
+struct Waves {
+    keys: HashMap<PathBuf, Known>,
+    made: HashMap<String, Made>,
+}
 
 impl Global for Waves {}
 
+/// When each waveform was last asked for (drawn), read by the threads making them.
+fn asked() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static ASKED: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    ASKED.get_or_init(Default::default)
+}
+
+/// `file`'s key as last looked up; the first ask, and one every `RECHECK`, looks again in the background, and the
+/// windows draw again when it changed.
+fn key_of(file: &Path, cx: &mut App) -> Option<String> {
+    let known = cx.default_global::<Waves>().keys.entry(file.to_path_buf()).or_default();
+    let key = known.key.clone();
+    if !known.checking && known.checked.is_none_or(|checked| checked.elapsed() >= RECHECK) {
+        known.checking = true;
+        let file = file.to_path_buf();
+        cx.spawn(async move |cx| {
+            let key = {
+                let file = file.clone();
+                cx.background_executor().spawn(async move { crate::media::file_key(&file) }).await
+            };
+            cx.update(|cx| {
+                let known = cx.default_global::<Waves>().keys.entry(file).or_default();
+                let changed = known.key != key;
+                (known.key, known.checked, known.checking) = (key, Some(Instant::now()), false);
+                if changed {
+                    cx.refresh_windows();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+    key
+}
+
 /// `file`'s waveform once it's made; the first ask starts making it, and the windows draw again when it's there.
 pub fn wave(file: &Path, cx: &mut App) -> Option<Wave> {
-    let key = crate::media::file_key(file)?;
+    let key = key_of(file, cx)?;
+    asked().lock().unwrap().insert(key.clone(), Instant::now());
     let waves = cx.default_global::<Waves>();
-    match waves.0.get(&key) {
+    match waves.made.get(&key) {
         Some(Made::Done(wave)) => return Some(wave.clone()),
-        Some(Made::Making) => return None,
-        Some(Made::Failed(at)) if at.elapsed() < RETRY => return None,
-        _ => {}
+        Some(Made::Making | Made::Failed) => return None,
+        None => {}
     }
-    waves.0.insert(key.clone(), Made::Making);
-    let (reply, made) = futures::channel::oneshot::channel();
+    waves.made.insert(key.clone(), Made::Making);
+    let (reply, outcome) = futures::channel::oneshot::channel();
     if maker().send((file.to_path_buf(), key.clone(), reply)).is_err() {
-        waves.0.insert(key, Made::Failed(Instant::now()));
+        waves.made.insert(key, Made::Failed);
         return None;
     }
     cx.spawn(async move |cx| {
-        let made = made.await.ok().flatten();
+        let outcome = outcome.await.unwrap_or(Outcome::Failed);
         cx.update(|cx| {
-            let done = made.is_some();
-            let made = made.map_or_else(|| Made::Failed(Instant::now()), Made::Done);
-            cx.default_global::<Waves>().0.insert(key, made);
-            if done {
-                cx.refresh_windows();
+            let made = &mut cx.default_global::<Waves>().made;
+            match outcome {
+                Outcome::Made(wave) => {
+                    made.insert(key, Made::Done(wave));
+                    cx.refresh_windows();
+                }
+                Outcome::Failed => {
+                    made.insert(key, Made::Failed);
+                }
+                Outcome::Skipped => {
+                    made.remove(&key);
+                }
             }
         })
         .ok();
@@ -92,21 +154,32 @@ pub fn wave(file: &Path, cx: &mut App) -> Option<Wave> {
     None
 }
 
-type Job = (PathBuf, String, futures::channel::oneshot::Sender<Option<Wave>>);
+type Job = (PathBuf, String, futures::channel::oneshot::Sender<Outcome>);
 
-/// The thread that makes waveforms, one at a time, in the order they're asked for.
+/// The two threads that make waveforms, in the order they're asked for, skipping those no longer drawn.
 fn maker() -> &'static mpsc::Sender<Job> {
     static MAKER: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
     MAKER.get_or_init(|| {
         let (jobs, queue) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("waveforms".into())
-            .spawn(move || {
-                for (file, key, reply) in queue {
-                    let _ = reply.send(make_wave(&file, &key));
-                }
-            })
-            .expect("waveform thread");
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(queue));
+        for _ in 0..2 {
+            let queue = queue.clone();
+            std::thread::Builder::new()
+                .name("waveforms".into())
+                .spawn(move || {
+                    loop {
+                        let Ok((file, key, reply)) = queue.lock().unwrap().recv() else { return };
+                        let seen = asked().lock().unwrap().get(&key).is_some_and(|at| at.elapsed() < UNSEEN);
+                        let outcome = match seen.then(|| make_wave(&file, &key)) {
+                            None => Outcome::Skipped,
+                            Some(Some(wave)) => Outcome::Made(wave),
+                            Some(None) => Outcome::Failed,
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                })
+                .expect("waveform thread");
+        }
         jobs
     })
 }
@@ -128,7 +201,8 @@ fn make_wave(file: &Path, key: &str) -> Option<Wave> {
     static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let samples = folder.join(format!("{key}-{}-{made}.wav", std::process::id()));
-    let converted = convert(file, &samples);
+    let size = std::fs::metadata(file).map_or(0, |meta| meta.len());
+    let converted = convert(file, &samples, convert_timeout(size));
     let wave = converted.then(|| std::fs::File::open(&samples).ok().and_then(wave_from)).flatten();
     let _ = std::fs::remove_file(&samples);
     let wave = wave?;
@@ -141,9 +215,15 @@ fn make_wave(file: &Path, key: &str) -> Option<Wave> {
     Some(wave)
 }
 
+/// The longest a waveform's conversion of a file `size` bytes long may take: half a minute, and a second more for each
+/// 2 MB, at most three minutes (an hour of mp3, 57 MB, takes about five seconds).
+fn convert_timeout(size: u64) -> Duration {
+    Duration::from_secs((30 + size / (2 << 20)).min(180))
+}
+
 /// `afconvert` from `file` to 8-bit mono samples at `RATE` in the WAVE file `samples`; false when it failed or ran past
-/// `CONVERT_TIMEOUT` (it's stopped then).
-fn convert(file: &Path, samples: &Path) -> bool {
+/// `timeout` (it's stopped then).
+fn convert(file: &Path, samples: &Path, timeout: Duration) -> bool {
     let Ok(mut child) = std::process::Command::new("/usr/bin/afconvert")
         .args(["-f", "WAVE", "-d", &format!("UI8@{RATE}"), "-c", "1"])
         .arg(file)
@@ -159,7 +239,7 @@ fn convert(file: &Path, samples: &Path) -> bool {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
-            Ok(None) if started.elapsed() < CONVERT_TIMEOUT => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -232,74 +312,117 @@ impl gpui::Render for Scrub {
     }
 }
 
-/// The rows' keyboard focus, and where the keyboard last was outside every row (the message box, mostly): a letter
-/// typed on a row goes back there.
+/// The rows' keyboard focus, and in each window, where the keyboard last was outside every row (the message box,
+/// mostly) and the keys on their way back there (`on_row_key`).
 #[derive(Default)]
 struct Keyboard {
     rows: Vec<WeakFocusHandle>,
-    elsewhere: Option<WeakFocusHandle>,
-    /// Keys typed on a row, on their way back there (`on_row_key`).
-    typed: Vec<gpui::Keystroke>,
+    windows: HashMap<gpui::WindowId, HandBack>,
+    /// `intercept` is listening.
+    listening: bool,
 }
 
 impl Global for Keyboard {}
 
-/// A row's focus, made the first time it's drawn; and where the keyboard is now, when that's outside every row.
+#[derive(Default)]
+struct HandBack {
+    elsewhere: Option<WeakFocusHandle>,
+    /// Keys typed since the first one on a row, and when that was.
+    typed: Vec<gpui::Keystroke>,
+    since: Option<Instant>,
+}
+
+/// Keys gathered this long ago and not typed back (the window closed, or drew no frame) are dropped.
+const HAND_BACK_WITHIN: Duration = Duration::from_secs(1);
+
+impl HandBack {
+    /// Keys are on their way back; stale ones are dropped first.
+    fn going(&mut self) -> bool {
+        if self.since.is_some_and(|since| since.elapsed() > HAND_BACK_WITHIN) {
+            self.typed.clear();
+            self.since = None;
+        }
+        !self.typed.is_empty()
+    }
+}
+
+/// A key a row hands back: one typed, not a shortcut (⌘, ⌃ or fn).
+fn typed(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    !(modifiers.platform || modifiers.control || modifiers.function)
+        && keystroke.key_char.as_ref().is_some_and(|typed| !typed.is_empty() && !typed.chars().any(char::is_control))
+}
+
+/// A row's focus, made the first time it's drawn; and where the keyboard is now in this window, when that's outside
+/// every row.
 fn row_focus(sound: &SharedString, window: &mut Window, cx: &mut App) -> FocusHandle {
     let focus = window.use_keyed_state(SharedString::from(format!("{sound}-focus")), cx, |_, cx| {
         let focus = cx.focus_handle().tab_stop(true);
         let keyboard = cx.default_global::<Keyboard>();
         keyboard.rows.retain(|row| row.upgrade().is_some());
         keyboard.rows.push(focus.downgrade());
+        if !std::mem::replace(&mut keyboard.listening, true) {
+            cx.intercept_keystrokes(intercept).detach();
+        }
         focus
     });
     let focus = focus.read(cx).clone();
     if let Some(now) = window.focused(cx) {
         let keyboard = cx.default_global::<Keyboard>();
         if !keyboard.rows.iter().any(|row| *row == now) {
-            keyboard.elsewhere = Some(now.downgrade());
+            keyboard.windows.entry(window.window_handle().window_id()).or_default().elsewhere = Some(now.downgrade());
         }
     }
     focus
 }
 
-/// A key on a focused row: Space plays or pauses it; a letter (no ⌘ or ⌃) goes back to where the keyboard was before
-/// the row had it. The row keeps the keyboard until the next frame, gathering what's typed meanwhile (a space too); then
-/// the keyboard goes back, and once the window has drawn with it there (its text input is set up as it draws), the keys
-/// are typed there in order.
-fn on_row_key(event: &KeyDownEvent, toggle: &dyn Fn(&mut App), window: &mut Window, cx: &mut App) {
-    let keystroke = &event.keystroke;
-    let modifiers = keystroke.modifiers;
+/// Every key, before anything else has it: while keys are on their way back in this window, the next ones join them
+/// (whatever has the keyboard meanwhile), so they're typed back in the order they came. A shortcut goes on as usual.
+fn intercept(event: &gpui::KeystrokeEvent, window: &mut Window, cx: &mut App) {
+    let modifiers = event.keystroke.modifiers;
     if modifiers.platform || modifiers.control || modifiers.function {
         return;
     }
-    let handing_back = cx.try_global::<Keyboard>().is_some_and(|keyboard| !keyboard.typed.is_empty());
-    if keystroke.key == "space" && !handing_back {
-        if !modifiers.modified() {
-            cx.stop_propagation();
-            toggle(cx);
-        }
+    let id = window.window_handle().window_id();
+    let Some(hand) = cx.default_global::<Keyboard>().windows.get_mut(&id) else { return };
+    if !hand.going() {
         return;
     }
-    let typed =
-        keystroke.key_char.as_ref().is_some_and(|typed| !typed.is_empty() && !typed.chars().any(char::is_control));
-    let elsewhere = cx.try_global::<Keyboard>().and_then(|keyboard| keyboard.elsewhere.as_ref()?.upgrade());
-    if !typed || elsewhere.is_none() {
-        return;
-    }
+    hand.typed.push(event.keystroke.clone());
     cx.stop_propagation();
-    cx.default_global::<Keyboard>().typed.push(keystroke.clone());
-    if handing_back {
+}
+
+/// A key on a focused row: Space plays or pauses it; a letter goes back to where the keyboard was in this window before
+/// the row had it. The row keeps the keyboard until the next frame (`intercept` gathers what's typed meanwhile, a space
+/// too); then the keyboard goes back, and once the window has drawn with it there (its text input is set up as it
+/// draws), the keys are typed there in order.
+fn on_row_key(event: &KeyDownEvent, toggle: &dyn Fn(&mut App), window: &mut Window, cx: &mut App) {
+    let keystroke = &event.keystroke;
+    if keystroke.key == "space" && !keystroke.modifiers.modified() {
+        cx.stop_propagation();
+        toggle(cx);
         return;
     }
-    window.on_next_frame(|window, cx| {
-        let back = cx.try_global::<Keyboard>().and_then(|keyboard| keyboard.elsewhere.as_ref()?.upgrade());
-        match back {
-            Some(back) => window.focus(&back),
-            None => return cx.default_global::<Keyboard>().typed.clear(),
-        }
-        window.on_next_frame(|window, cx| {
-            for keystroke in std::mem::take(&mut cx.default_global::<Keyboard>().typed) {
+    let id = window.window_handle().window_id();
+    let hand = cx.default_global::<Keyboard>().windows.entry(id).or_default();
+    if !typed(keystroke) || hand.elsewhere.as_ref().and_then(WeakFocusHandle::upgrade).is_none() {
+        return;
+    }
+    hand.typed.push(keystroke.clone());
+    hand.since = Some(Instant::now());
+    cx.stop_propagation();
+    window.on_next_frame(move |window, cx| {
+        let hand = cx.default_global::<Keyboard>().windows.entry(id).or_default();
+        let Some(back) = hand.elsewhere.as_ref().and_then(WeakFocusHandle::upgrade).filter(|_| hand.going()) else {
+            hand.typed.clear();
+            return;
+        };
+        window.focus(&back);
+        window.on_next_frame(move |window, cx| {
+            let hand = cx.default_global::<Keyboard>().windows.entry(id).or_default();
+            let keys = std::mem::take(&mut hand.typed);
+            hand.since = None;
+            for keystroke in keys {
                 window.dispatch_keystroke(keystroke, cx);
             }
         })
@@ -545,6 +668,30 @@ mod tests {
         }
         assert!(crate::media::is_audio("audio/mp4", "recording"));
         assert!(!crate::media::is_audio("video/mp4", "clip.mp4") && !crate::media::is_audio("text/plain", "mp3"));
+    }
+
+    #[test]
+    fn a_conversion_gets_longer_for_a_bigger_file_up_to_three_minutes() {
+        assert_eq!(convert_timeout(0), Duration::from_secs(30));
+        assert_eq!(convert_timeout(57 << 20), Duration::from_secs(58));
+        assert_eq!(convert_timeout(10 << 30), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn keys_not_typed_back_in_time_are_dropped() {
+        let key = |key: &str, typed: Option<&str>, platform: bool| gpui::Keystroke {
+            modifiers: gpui::Modifiers { platform, ..Default::default() },
+            key: key.into(),
+            key_char: typed.map(Into::into),
+        };
+        let mut hand =
+            HandBack { elsewhere: None, typed: vec![key("a", Some("a"), false)], since: Some(Instant::now()) };
+        assert!(hand.going());
+        hand.since = Some(Instant::now() - HAND_BACK_WITHIN - Duration::from_millis(1));
+        assert!(!hand.going() && hand.typed.is_empty() && hand.since.is_none());
+        // A letter goes back; a shortcut or a key that types nothing doesn't.
+        assert!(typed(&key("a", Some("a"), false)) && typed(&key("space", Some(" "), false)));
+        assert!(!typed(&key("a", Some("a"), true)) && !typed(&key("left", None, false)));
     }
 
     #[test]
