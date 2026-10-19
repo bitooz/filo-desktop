@@ -1,10 +1,10 @@
-// An audio file where it was shared (a chat's or the Group's message, a coding result's page), played in place: a
-// round play button, the sound's waveform (the part played in the accent colour; a press or a drag along it goes
-// there), the time played and its length, and a speed button (1×, 1.5×, 2×, for every sound), with the file's name under
-// them. It plays from its file on this Mac through media.rs (one sound at a time, AVFoundation's player), so a file
-// attached without a copy plays from where it is. A click anywhere on the row (or Tab) gives it the keyboard, and Space
-// plays or pauses it then; a letter typed there goes back to the window's message box while one is drawn, with the
-// letter, so typing never goes nowhere (`Keyboard`).
+// An audio file where it was shared (a chat's or the Group's message, a coding result's page), played in place: a round
+// play button, the sound's waveform (the part played in the accent colour; a press or a drag along it goes there), the
+// time played and its length, and a speed button (1×, 1.5×, 2×, for every sound), with the file's name under them. It
+// plays from its file on this Mac through media.rs (one sound at a time, AVFoundation's player), so a file attached
+// without a copy plays from where it is. A click anywhere on the row (or Tab) gives it the keyboard, and Space plays or
+// pauses it then (a ring shows it has the keyboard only after Tab, not after a click); a letter typed there goes back
+// to the window's message box while one is drawn, with the letter, so typing never goes nowhere (`Keyboard`).
 //
 // The waveform is made once per file (`wave`), on two threads of their own (`maker`): macOS's `afconvert` turns the
 // sound into 4,000 8-bit samples a second, mono, in a temporary file of its own, and the loudest of each stretch is a
@@ -465,6 +465,8 @@ fn on_row_key(event: &KeyDownEvent, toggle: &dyn Fn(&mut App), window: &mut Wind
 struct Track {
     bounds: Cell<Option<Bounds<Pixels>>>,
     scrubbing: Cell<Option<f64>>,
+    /// The row has the keyboard from a click: it takes it for Space, but shows no ring, which is for Tab.
+    clicked: Cell<bool>,
 }
 
 const BUTTON: f32 = 36.;
@@ -503,6 +505,10 @@ pub fn row(
     let fraction = duration.map_or(0., |duration| (time / duration.max(0.001)).clamp(0., 1.)) as f32;
     let focus = row_focus(&sound, window, cx);
     let focused = focus.is_focused(window);
+    if !focused {
+        track.clicked.set(false);
+    }
+    let ring = focused && !track.clicked.get();
 
     let wave_width = (width - BUTTON - TIME_WIDTH - SPEED_WIDTH - space::SM * 3.).max(60.);
     let count = ((wave_width + BAR_GAP) / (BAR + BAR_GAP)).floor().max(8.) as usize;
@@ -647,6 +653,11 @@ pub fn row(
         .id(SharedString::from(format!("{sound}-row")))
         .track_focus(&focus)
         .on_key_down(move |event: &KeyDownEvent, window, cx| on_row_key(event, &toggle, window, cx))
+        // Before any part of the row has the press (the waveform keeps it to itself).
+        .capture_any_mouse_down({
+            let track = track.clone();
+            move |_, _, _| track.clicked.set(true)
+        })
         .w(px(width))
         .max_w_full()
         .flex()
@@ -656,7 +667,7 @@ pub fn row(
         .m(px(-space::XXS))
         .rounded(px(radius::MD))
         .border_1()
-        .border_color(if focused { colors.accent } else { gpui::transparent_black() })
+        .border_color(if ring { colors.accent } else { gpui::transparent_black() })
         .text_color(fg)
         .child(crate::smoke::tracked(format!("audio-play-{name}"), button))
         .child(

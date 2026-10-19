@@ -341,11 +341,12 @@ An audio file (mp3, m4a, wav, aac, ogg, flac and the like) in a chat's or the gr
 round, plays where it is, in one row shared by both (`src/audio_row.rs`): a round play button, its waveform (the part
 played in the accent colour; a click or a drag along it goes there), the time played and its length, and a speed button
 (1×, 1.5×, 2×, for every sound), with the file's name under them. A click anywhere on the row (or Tab) gives it the
-keyboard, and Space then plays or pauses it; a letter typed while it has the keyboard goes back to the window's message
-box while one is drawn (it says so as it draws), letter and all, and keys typed meanwhile follow in order. It plays from
-its file on this Mac, so a big file attached without a copy plays from where it is. Which files are sounds is one check,
-`media::is_audio` (the content type, or the name by crates/filo-local `attachments::content_type_for`, the one table of
-types), used by the chat, the result page, Shared and artifact pages' files.
+keyboard, and Space then plays or pauses it (an accent ring shows it after Tab, never after a click); a letter typed
+while it has the keyboard goes back to the window's message box while one is drawn (it says so as it draws), letter and
+all, and keys typed meanwhile follow in order. It plays from its file on this Mac, so a big file attached without a copy
+plays from where it is. Which files are sounds is one check, `media::is_audio` (the content type, or the name by
+crates/filo-local `attachments::content_type_for`, the one table of types), used by the chat, the result page, Shared
+and artifact pages' files.
 
 Sounds play through the video player's AVFoundation player, with no picture (`video_player.rs` `open_audio`), and one at
 a time across the app (`media.rs` `Audio`): starting one stops the last and pauses a video playing in the viewer, a
