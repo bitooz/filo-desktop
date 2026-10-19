@@ -94,6 +94,12 @@ screens/chat/shared.rs). A right-click on a picture, video, file or recording op
 Show in Finder, Edit (a picture, in the chat's image editor), Select, and Delete (`chatShared:deleteFiles`) for Filo's
 own copies and voice messages' recordings, none for a file shown in place. ⌘-click and Shift-click pick several, each
 then showing its size; the menu, the bar over the list and the Delete key act on all of them, and Esc lets them go.
+Select starts picking (`selecting`): a plain click then picks or lets go of a file instead of opening it, until the
+last one is let go, Esc or Clear. Show in Chat asks how far back the message is (`chatShared:depth`, counted as
+`voiceSessions:detail`'s `limit` counts, the group's by `seq`), and the chat loads back that far before it scrolls to
+the message and flashes it (conversation.rs `reveal_message_at`, past `MAX_LOADED` when it's older; a page further
+when newer messages came meanwhile). `FILO_OPEN=shared-show-drive` with `FILO_SHOW_CHATS=<session id>,…,group` checks
+it on a copy of the user's data: each chat's newest, middle and oldest file.
 Recordings are deleted with attachments.rs `delete_recording`, which notes each in
 `local/attachments/deleted-recordings.txt`, so a recording just sent and not saved yet isn't taken for one deleted. A
 message whose copy or recording was deleted shows it as "No longer kept". `FILO_OPEN=shared-delete-drive` clicks

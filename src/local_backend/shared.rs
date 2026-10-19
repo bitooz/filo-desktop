@@ -9,6 +9,9 @@
 // then show them as no longer kept. A file shown where it
 // is on this Mac (an agent's, attachments.rs `in_place`) isn't Filo's to delete. A chat's copies also go with the chat
 // (`delete_chat_files`).
+//
+// Show in Chat asks how far back an item's message is (`chatShared:depth`), counted as the chat loads its pages, so the
+// chat loads back that far before it scrolls to it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,6 +39,28 @@ impl Local {
         let Some(id) = arg(args, "sessionId") else { return done(Vec::new()) };
         let (messages, senders) = self.shared_messages_of(id);
         page(&self.root, messages, &senders, arg(args, "cursor"))
+    }
+
+    /// `chatShared:depth { sessionId, messageId }`: how many messages from the newest that one is (1: the newest), as
+    /// `voiceSessions:detail`'s `limit` counts them (the group's: as its detail does), or null when the chat doesn't
+    /// show it.
+    pub(super) fn shared_depth(&self, args: &Value) -> Result<Value, String> {
+        let (Some(id), Some(message)) = (arg(args, "sessionId"), arg(args, "messageId")) else {
+            return Ok(Value::Null);
+        };
+        if self.group_session().as_deref() == Some(id) {
+            let depth: Vec<i64> = self.db()?.with(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT (SELECT COUNT(*) FROM group_messages WHERE seq >= m.seq) FROM group_messages m WHERE m.id = ?1",
+                )?;
+                statement.query_map([message], |row| row.get(0))?.collect()
+            })?;
+            return Ok(json!(depth.first()));
+        }
+        let Some(store) = self.store_of(id) else { return Ok(Value::Null) };
+        let all = store.shared_messages(id).unwrap_or_default();
+        let shown = filo_local::store::shown_of(&all);
+        Ok(json!(shown.iter().rposition(|shown| shown.id == message).map(|index| shown.len() - index)))
     }
 
     /// The messages of conversation `id` whose files the Shared list shows: an agent's chat's, with its files where

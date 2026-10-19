@@ -80,8 +80,9 @@ fn seed(local: &Path, chat: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((v1.file, sketch.file))
 }
 
-/// Seeds the main agent's chat (`seed`), opens its profile, scrolls to Shared, clicks Select, picks v1 and the sketch,
-/// Delete and the dialog's Return, then checks only those copies went (the logo and brief where the agent has them
+/// Seeds the main agent's chat (`seed`), opens its profile and scrolls to Shared. The menu's Select, then plain clicks
+/// pick and let go until none is picked, after which one opens a file; Esc and Clear end picking too. ⌘-click picks v1
+/// and the sketch, the Delete key and the dialog's Return, then checks only those copies went (the logo and brief where the agent has them
 /// stay); then the same on the Voice tab for the voice message. It shows the chat (v1, the sketch and the voice message
 /// no longer kept, v2 and the brief there) and Group settings' Shared.
 /// Pictures with `FILO_DRIVE_SHOTS=<folder>`. Run it with a `FILO_CONFIG_DIR` of its own.
@@ -150,6 +151,92 @@ pub(super) fn run(window: &mut Window, cx: &mut Context<AppShell>) {
         shot("2-menu");
         native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
         wait(600).await;
+        // The menu's Select: plain clicks pick and let go, until the last one goes, Esc or Clear; then one opens a file.
+        // How many the bar says are picked, in the latest frame: drawn with the tabs just over it (`on_screen` would
+        // still see a bar gone in the frame before).
+        let picks = || {
+            let bounds = super::DRIVE_BOUNDS.lock().unwrap();
+            let Some((_, tabs)) = bounds.get("shared-tabs") else { return 0 };
+            (1..4)
+                .find(|count| {
+                    bounds
+                        .get(&format!("shared-picks-{count}"))
+                        .is_some_and(|(_, at)| at.max(tabs).duration_since(*at.min(tabs)) < Duration::from_millis(3))
+                })
+                .unwrap_or(0)
+        };
+        let viewer = |this: &gpui::WeakEntity<AppShell>, cx: &mut gpui::AsyncWindowContext| {
+            this.update_in(cx, |_, window, cx| crate::media_viewer::smoke_state(window, cx) != "closed")
+                .unwrap_or(false)
+        };
+        let select = async |column: f32| {
+            let (x, y) = tile(column);
+            native_input::right_click(width, x, y);
+            wait(800).await;
+            // Show in Chat, Show in Finder, Edit, Select.
+            for _ in 0..4 {
+                native_input::key(width, "\u{f701}", 125, 0);
+                wait(150).await;
+            }
+            native_input::key(width, "\r", 36, 0);
+            wait(600).await;
+        };
+        let plain = async |column: f32| {
+            let (x, y) = tile(column);
+            native_input::click(width, x, y);
+            wait(500).await;
+        };
+        select(0.).await;
+        let mut counts = vec![picks()];
+        for column in [1., 2.] {
+            plain(column).await;
+            counts.push(picks());
+        }
+        shot("2a-select-mode");
+        let opened_while_picking = viewer(&this, cx);
+        for column in [1., 0., 2.] {
+            plain(column).await;
+            counts.push(picks());
+        }
+        plain(1.).await;
+        let opens_after_last = viewer(&this, cx);
+        shot("2a-opens-again");
+        native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+        wait(800).await;
+        let ok = counts == [1, 2, 3, 2, 1, 0] && !opened_while_picking && opens_after_last;
+        eprintln!(
+            "shared-delete-drive: Select, then plain clicks picked {counts:?}, {} while picking, {} once none was {}",
+            if opened_while_picking { "opened a file" } else { "opened nothing" },
+            if opens_after_last { "opened the file" } else { "didn't open the file" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+        // Esc and Clear end it too.
+        for how in ["Esc", "Clear"] {
+            select(2.).await;
+            plain(1.).await;
+            let picked = picks();
+            if how == "Esc" {
+                native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+            } else if let Some(clear) = on_screen("shared-clear") {
+                native_input::click(
+                    width,
+                    f64::from(f32::from(clear.center().x)),
+                    f64::from(f32::from(clear.center().y)),
+                );
+            }
+            wait(600).await;
+            let after = picks();
+            plain(0.).await;
+            let opens = viewer(&this, cx);
+            native_input::key(width, ESCAPE.0, ESCAPE.1, 0);
+            wait(800).await;
+            let ok = picked == 2 && after == 0 && opens;
+            eprintln!(
+                "shared-delete-drive: {how} ends picking ({picked} picked, then {after}), a plain click then {} {}",
+                if opens { "opens a file" } else { "doesn't open the file" },
+                if ok { "PASS" } else { "FAIL" }
+            );
+        }
         // ⌘-click v2, Shift-click v1: the run of all three is picked; Esc lets them go.
         let (x0, y0) = tile(0.);
         native_input::click_with(width, x0, y0, COMMAND);

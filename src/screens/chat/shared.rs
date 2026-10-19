@@ -6,8 +6,9 @@
 // A right-click on a picture, video, file or recording opens its menu (`item_menu`): Show in Chat, Show in Finder, Edit
 // (a picture, in the chat's image editor), Select, and Delete for the files Filo keeps (`deletable`: its copies and voice
 // messages' recordings, never a file shown where it is on this Mac). ⌘-click and Shift-click pick several, the Mac way;
-// the menu, the bar over the list and the Delete key then act on all of them, and Esc lets them go. Deleting frees the
-// room they take, and their messages show them as no longer kept.
+// the menu's Select starts picking (`selecting`): a plain click then picks or lets go of a file too, instead of opening
+// it, until the last one is let go, Esc or Clear. The menu, the bar over the list and the Delete key act on all picked,
+// and Esc lets them go. Deleting frees the room they take, and their messages show them as no longer kept.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -34,9 +35,10 @@ const ROW_TILE: f32 = 40.;
 /// A picked tile's mark.
 const CHECK: f32 = 20.;
 
-/// What the Shared list asks of the page around it: its menu's Show in Chat (the message's id) and Edit (a picture).
+/// What the Shared list asks of the page around it: its menu's Show in Chat (the message's id, and how many messages
+/// from the newest it is: 0 when that isn't known) and Edit (a picture).
 pub enum SharedEvent {
-    ShowInChat(String),
+    ShowInChat(String, usize),
     Edit(file_preview::Item),
 }
 
@@ -176,6 +178,8 @@ pub struct SharedPanel {
     /// starts.
     picked: HashSet<Key>,
     anchor: Option<Key>,
+    /// Picking since the menu's Select: a plain click picks or lets go of a file, until none is picked.
+    selecting: bool,
     /// Takes the Delete key while files are picked.
     focus: FocusHandle,
     /// The picked files are being deleted; why that failed, last time.
@@ -209,6 +213,7 @@ impl SharedPanel {
             weak: cx.entity().downgrade(),
             picked: HashSet::new(),
             anchor: None,
+            selecting: false,
             focus: cx.focus_handle(),
             deleting: false,
             delete_error: None,
@@ -310,11 +315,12 @@ impl SharedPanel {
         }
     }
 
-    /// Lets go of the files picked (Esc, a plain click).
+    /// Lets go of the files picked (Esc, Clear, a plain click), and ends picking with plain clicks.
     fn clear_picks(&mut self, cx: &mut Context<Self>) {
-        if !self.picked.is_empty() || self.delete_error.is_some() {
+        if !self.picked.is_empty() || self.selecting || self.delete_error.is_some() {
             self.picked.clear();
             self.anchor = None;
+            self.selecting = false;
             self.delete_error = None;
             cx.notify();
         }
@@ -337,8 +343,37 @@ impl SharedPanel {
             None => {}
         }
         self.anchor = Some(key);
+        // The last one let go ends picking: a plain click opens a file again.
+        self.selecting &= !self.picked.is_empty();
         self.delete_error = None;
         cx.notify();
+    }
+
+    /// The menu's Select: picks `key`, and plain clicks pick too from now on (`selecting`).
+    fn start_selecting(&mut self, key: Key, cx: &mut Context<Self>) {
+        self.selecting = true;
+        if !self.picked.contains(&key) {
+            self.pick(key, Pick::Toggle, cx);
+        }
+    }
+
+    /// The menu's Show in Chat for `message` (`FILO_OPEN=shared-show-drive`).
+    #[cfg(feature = "dev")]
+    pub fn drive_show_in_chat(&mut self, message: String, cx: &mut Context<Self>) {
+        self.show_in_chat(message, cx);
+    }
+
+    /// The menu's Show in Chat: how far back `message` is (`chatShared:depth`), so its chat loads back to it, then the
+    /// page around shows it there.
+    fn show_in_chat(&mut self, message: String, cx: &mut Context<Self>) {
+        let args = json!({ "sessionId": self.session_id, "messageId": message });
+        backend::call(cx, "chatShared:depth", args, move |_: &mut Self, result: Result<Option<usize>, String>, cx| {
+            let depth = result.unwrap_or_else(|error| {
+                eprintln!("chatShared:depth failed: {error}");
+                None
+            });
+            cx.emit(SharedEvent::ShowInChat(message.clone(), depth.unwrap_or(0)));
+        });
     }
 
     /// What `key`'s menu acts on: every file picked when it's one of them, else itself.
@@ -354,6 +389,7 @@ impl SharedPanel {
     fn forget_gone_picks(&mut self) {
         let listed: HashSet<(String, String)> = self.items.iter().map(SharedItem::key).collect();
         self.picked.retain(|key| listed.contains(key));
+        self.selecting &= !self.picked.is_empty();
     }
 
     /// The picked files, newest first, and their size together.
@@ -416,6 +452,7 @@ impl SharedPanel {
                         this.items.retain(|item| !gone.contains(&item.key()));
                         this.picked.clear();
                         this.anchor = None;
+                        this.selecting = false;
                         this.fill(cx);
                     }
                     Err(error) => {
@@ -484,29 +521,32 @@ struct Picks<'a> {
 }
 
 impl Picks<'_> {
-    /// What a click on `item` does: with ⌘ or Shift, picks it (the panel takes the keyboard, for Delete); a plain one
-    /// lets go of those picked and `opens` it.
+    /// What a click on `item` does: with ⌘ or Shift, picks it (the panel takes the keyboard, for Delete), as a plain
+    /// one does while picking since the menu's Select; else a plain one lets go of those picked and `opens` it.
     fn on_click(&self, item: &SharedItem, opens: OnClick) -> OnClick {
         let (panel, key) = (self.panel.clone(), item.key());
         Box::new(move |event, window, cx| {
             let modifiers = event.modifiers();
-            let how = if modifiers.platform {
-                Some(Pick::Toggle)
-            } else if modifiers.shift {
-                Some(Pick::Range)
-            } else {
-                None
-            };
-            panel
-                .update(cx, |panel, cx| match how {
-                    Some(how) => {
-                        window.focus(&panel.focus);
-                        panel.pick(key.clone(), how, cx);
+            let picks = panel
+                .update(cx, |panel, cx| {
+                    let how = if modifiers.platform || (panel.selecting && !modifiers.shift) {
+                        Some(Pick::Toggle)
+                    } else if modifiers.shift {
+                        Some(Pick::Range)
+                    } else {
+                        None
+                    };
+                    match how {
+                        Some(how) => {
+                            window.focus(&panel.focus);
+                            panel.pick(key.clone(), how, cx);
+                        }
+                        None => panel.clear_picks(cx),
                     }
-                    None => panel.clear_picks(cx),
+                    how.is_some()
                 })
-                .ok();
-            if how.is_none() {
+                .unwrap_or(false);
+            if !picks {
                 opens(event, window, cx);
             }
         })
@@ -534,8 +574,8 @@ impl Picks<'_> {
 }
 
 /// A file's right-click menu, built as it opens: for it, or for every file picked when it's one of them. Show in Chat
-/// (one file: its message), Show in Finder, Edit (one picture), Select (one not picked yet), and Delete (those Filo
-/// keeps; none for a file shown where it is).
+/// (one file: its message), Show in Finder, Edit (one picture), Select (one not picked yet: from then a plain click
+/// picks too), and Delete (those Filo keeps; none for a file shown where it is).
 fn item_menu(
     menu: PopupMenu,
     panel: &WeakEntity<SharedPanel>,
@@ -555,7 +595,7 @@ fn item_menu(
     if let Some(item) = &single {
         let (panel, message) = (panel.clone(), item.message_id.clone());
         menu = menu.item(PopupMenuItem::new("Show in Chat").on_click(move |_, _, cx| {
-            panel.update(cx, |_, cx| cx.emit(SharedEvent::ShowInChat(message.clone()))).ok();
+            panel.update(cx, |panel, cx| panel.show_in_chat(message.clone(), cx)).ok();
         }));
     }
     let files: Vec<std::path::PathBuf> = targets.iter().filter_map(SharedItem::local_file).collect();
@@ -574,7 +614,7 @@ fn item_menu(
             panel
                 .update(cx, |panel, cx| {
                     window.focus(&panel.focus);
-                    panel.pick(key.clone(), Pick::Toggle, cx);
+                    panel.start_selecting(key.clone(), cx);
                 })
                 .ok();
         }));
@@ -1050,7 +1090,10 @@ impl Render for SharedPanel {
                 }
             }))
             .child(tabs)
-            .children((!self.picked.is_empty()).then(|| self.render_pick_bar(cx)))
+            // A drive reads how many are picked from the bar's id.
+            .children((!self.picked.is_empty()).then(|| {
+                crate::smoke::tracked_fill(format!("shared-picks-{}", self.picked.len()), self.render_pick_bar(cx))
+            }))
             .child(body)
     }
 }
@@ -1093,14 +1136,23 @@ impl SharedPanel {
                                 ),
                         ))
                     })
-                    .child(
+                    .child(crate::smoke::tracked(
+                        "shared-clear",
                         Button::ghost("shared-clear", "Clear")
                             .small()
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.clear_picks(cx))),
-                    ),
+                    )),
             )
             .when_some(self.delete_error.clone(), |this, error| {
                 this.child(div().footnote().text_color(colors.danger).child(format!("Couldn’t delete: {error}")))
+            })
+            .when(self.selecting, |this| {
+                this.child(
+                    div()
+                        .footnote()
+                        .text_color(colors.text_secondary)
+                        .child("Click files to pick them or let them go."),
+                )
             })
             .when(shown_in_place > 0, |this| {
                 let which = if shown_in_place == 1 { "One is" } else { "Some are" };

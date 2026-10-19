@@ -1066,10 +1066,10 @@ impl Conversation {
         }
     }
 
-    /// `reveal_message` for a message `depth` messages from the newest (1: the newest), as ⌘P's search finds one: the
-    /// chat loads back that far first (up to `MAX_LOADED`).
+    /// `reveal_message` for a message `depth` messages from the newest (1: the newest), as ⌘P's search and the Shared
+    /// list's Show in Chat find one: the chat loads back that far first, past `MAX_LOADED` when it's older than that.
     pub fn reveal_message_at(&mut self, id: &str, depth: usize, cx: &mut Context<Self>) {
-        let needed = ((depth as f64 / PAGE).ceil() * PAGE).min(MAX_LOADED);
+        let needed = (depth as f64 / PAGE).ceil() * PAGE;
         if needed > self.limit
             && self.session_id.is_some()
             && !self.rows.iter().any(|row| row_message_id(row) == Some(id))
@@ -2007,6 +2007,11 @@ impl Conversation {
             {
                 // A longer page is on its way (`reveal_message_at`).
                 self.reveal_pending = Some((id, tries));
+            } else if tries > 0 && self.session_id.is_some() && self.detail().is_some_and(|detail| detail.has_more) {
+                // Not on the pages loaded (newer messages came since its depth was counted): a page further back.
+                self.limit += PAGE;
+                self.subscribe_detail(cx);
+                self.reveal_pending = Some((id, tries - 1));
             }
         }
     }
@@ -3731,6 +3736,8 @@ impl Conversation {
         let index = self.rows.iter().position(|row| row_message_id(row) == Some(target));
         let Some(index) = index else { return };
         self.list_state.scroll_to_reveal_item(index);
+        // Not held where the reader was as the older page that brought it came in (`hold_pin`).
+        self.held = None;
         self.held_at_end = false;
         self.highlighted = Some(target.to_string());
         let target = target.to_string();

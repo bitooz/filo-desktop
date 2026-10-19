@@ -173,6 +173,7 @@ pub const MOVED: &[&str] = &[
     "voiceRecordings:send",
     "chatShared:list",
     "chatShared:deleteFiles",
+    "chatShared:depth",
     // A conversation's coding tasks, their questions and the chats they work for are in local_backend/coding.rs
     // (`CODING`).
     "notes:mine",
@@ -814,6 +815,7 @@ impl Local {
             "voiceSessions:working" => Ok(self.working(args)),
             "chatShared:list" => Ok(self.shared(args)),
             "chatShared:deleteFiles" => self.delete_shared_files(args),
+            "chatShared:depth" => self.shared_depth(args),
             "notes:mine" => Ok(json!(notes::list(self.db()?)?)),
             "notes:getMine" => Ok(json!(notes::get(self.db()?, required(args, "id")?)?)),
             "notes:search" => {

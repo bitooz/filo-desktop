@@ -2032,6 +2032,12 @@ impl AgentsScreen {
         }
     }
 
+    /// The Shared list on screen: the agent profile's or Group settings' (`FILO_OPEN=shared-show-drive`).
+    #[cfg(feature = "dev")]
+    pub fn drive_shared(&self) -> Option<Entity<SharedPanel>> {
+        self.form.as_ref().and_then(|form| form.shared.clone()).or_else(|| self.setup.as_ref()?.shared.clone())
+    }
+
     /// What `shared`'s menu asks of chat `chat` (an agent's id, or `GROUP`), whose Shared list it is (`on_shared`).
     fn watch_shared(
         &mut self,
@@ -2052,7 +2058,7 @@ impl AgentsScreen {
             self.close_setup(cx);
         }
         match event {
-            SharedEvent::ShowInChat(message) => self.open_at(chat, message.clone(), 0, window, cx),
+            SharedEvent::ShowInChat(message, depth) => self.open_at(chat, message.clone(), *depth, window, cx),
             SharedEvent::Edit(picture) => {
                 self.open_agent(chat.clone(), window, cx);
                 let view = if chat == GROUP { self.group_chat.clone() } else { self.chat(&chat) };

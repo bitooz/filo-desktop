@@ -1832,6 +1832,37 @@ mod tests {
     }
 
     #[test]
+    fn show_in_chat_knows_how_far_back_a_message_is_as_the_chat_loads_its_pages() {
+        let local = temp();
+        let chef_chat = add_agent(&local, "chef-id", "Chef");
+        let session = local.call("agents:openGroup", &json!({})).unwrap().as_str().unwrap().to_string();
+        let db = local.db().unwrap();
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let mut message = Message::new(Role::User, format!("Message {n}"), None);
+            message.at += n;
+            local.agent_chats.append(&chef_chat, &message).unwrap();
+            ids.push((chef_chat.clone(), message.id));
+            let (posted, _) =
+                group::add_user_message(db, &format!("thread-{n}"), &format!("Post {n}"), now_ms()).unwrap();
+            ids.push((session.clone(), posted.id));
+        }
+        // Its depth is the smallest page of the chat (`voiceSessions:detail`'s limit) that holds it.
+        for (session, id) in &ids {
+            let depth = local.call("chatShared:depth", &json!({ "sessionId": session, "messageId": id })).unwrap();
+            let depth = depth.as_u64().unwrap_or_else(|| panic!("no depth for {id}"));
+            let holds = |limit: u64| {
+                let detail = local.call("voiceSessions:detail", &json!({ "id": session, "limit": limit })).unwrap();
+                detail["messages"].as_array().unwrap().iter().any(|message| message["_id"] == *id)
+            };
+            // (A limit under 1 is 1.)
+            assert!(holds(depth) && (depth == 1 || !holds(depth - 1)), "{id} at {depth}");
+        }
+        let unknown = local.call("chatShared:depth", &json!({ "sessionId": chef_chat, "messageId": "nope" })).unwrap();
+        assert_eq!(unknown, Value::Null);
+    }
+
+    #[test]
     fn voice_recordings_go_from_the_shared_list_in_a_chat_and_the_group() {
         let local = temp();
         let chef_chat = add_agent(&local, "chef-id", "Chef");
