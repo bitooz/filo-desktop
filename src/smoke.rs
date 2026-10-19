@@ -21,16 +21,25 @@ pub fn overlay(window: &mut gpui::Window, cx: &mut gpui::App) -> Option<gpui::An
     }
 }
 
-/// `FILO_OPEN=chat-timing` (smoke/drives.rs `run_chat_timing`) runs on a copy of the user's chats: their routines,
-/// coding tasks and group turns don't run in it. Never in a build without the drives.
+/// `FILO_OPEN=chat-timing` and `chat-scroll-timing` (smoke/drives.rs `run_chat_timing`, `run_chat_scroll_timing`) run
+/// on a copy of the user's chats: their routines, coding tasks and group turns don't run in it. Never in a build
+/// without the drives.
 pub fn quiet_backend() -> bool {
-    cfg!(feature = "dev") && std::env::var("FILO_OPEN").is_ok_and(|open| open == "chat-timing")
+    cfg!(feature = "dev")
+        && std::env::var("FILO_OPEN").is_ok_and(|open| open == "chat-timing" || open == "chat-scroll-timing")
 }
 
 /// A build without the drives never runs one.
 #[cfg(not(feature = "dev"))]
 fn driving() -> bool {
     false
+}
+
+/// Whether a view can be kept as drawn (`AnyView::cached`): not while a drive clicks through the window, as a kept
+/// view's elements don't record where they are (`tracked`). The run timing a chat's scrolling keeps them, as the app
+/// does.
+pub fn cache_views() -> bool {
+    !driving() || std::env::var("FILO_OPEN").is_ok_and(|open| open == "chat-scroll-timing")
 }
 
 /// Where the elements a drive clicks were last laid out (window coordinates), while one runs (`driving`); `tracked` is a

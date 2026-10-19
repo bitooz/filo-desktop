@@ -943,6 +943,11 @@ pub struct AgentsScreen {
     /// each open conversation watched for its draft being sent or cleared.
     drafts: Drafts,
     draft_subs: HashMap<gpui::EntityId, Subscription>,
+    /// Each open conversation's reply under way as its row last showed it (`reply_status::reply_since`): the list,
+    /// kept as drawn, is drawn again when one changes (`watch_draft`).
+    replies: HashMap<gpui::EntityId, Option<Option<f64>>>,
+    /// The list as a view of its own (`AgentList`), made when first shown.
+    list_view: Option<Entity<AgentList>>,
     /// Each agent's chat watched for clicks on its lines pointing at the group.
     link_subs: HashMap<gpui::EntityId, Subscription>,
     /// The message to show once its chat's conversation shows (an agent's id, or `GROUP`): the group's one such a
@@ -1190,6 +1195,8 @@ impl AgentsScreen {
             _tray_sub: None,
             drafts: Drafts::default(),
             draft_subs: HashMap::new(),
+            replies: HashMap::new(),
+            list_view: None,
             link_subs: HashMap::new(),
             reveal: None,
             shown: Vec::new(),
@@ -1591,7 +1598,10 @@ impl AgentsScreen {
 
     /// Whether the user is looking at the Agents tab: the conversation on screen marks replies seen.
     pub fn set_attending(&mut self, attending: bool, cx: &mut Context<Self>) {
-        self.attending = attending;
+        // The list's unseen dots go by it.
+        if std::mem::replace(&mut self.attending, attending) != attending {
+            cx.notify();
+        }
         let current = self.current_conversation();
         for view in self.chats.iter().map(|(_, view)| view.clone()).chain(self.group_chat.clone()).collect::<Vec<_>>() {
             let looking = attending && current.as_ref() == Some(&view);
@@ -1790,14 +1800,31 @@ impl AgentsScreen {
         })
     }
 
-    /// Redraws the list when `view`'s draft is sent or cleared, or typed on while its row shows it; nothing else it does.
+    /// Redraws the list when `view`'s draft is sent or cleared, or typed on while its row shows it, or its reply starts
+    /// or ends; nothing else it does (scrolling it notifies it every frame).
     fn watch_draft(&mut self, view: &Entity<Conversation>, cx: &mut Context<Self>) {
-        let sub = cx.observe(view, |this, _, cx| {
-            if this.sync_drafts(cx) {
+        let sub = cx.observe(view, |this, view, cx| {
+            let reply = reply_status::reply_since(view.read(cx));
+            let replied = this.replies.insert(view.entity_id(), reply) != Some(reply);
+            if this.sync_drafts(cx) || replied {
                 cx.notify();
             }
         });
         self.draft_subs.insert(view.entity_id(), sub);
+    }
+
+    /// The list, kept as drawn while only the chat beside it changes (`AgentList`); drawn afresh each frame while a
+    /// drive clicks through it, so its rows record where they are (`smoke::tracked`).
+    fn render_list_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let screen = cx.entity();
+        let view = self.list_view.get_or_insert_with(|| cx.new(|cx| AgentList::new(screen, cx))).clone();
+        let view = gpui::AnyView::from(view);
+        if !crate::smoke::cache_views() {
+            return view.into_any_element();
+        }
+        let mut style = gpui::StyleRefinement::default();
+        style = style.w(px(self.list_width())).flex_none().h_full();
+        view.cached(style).into_any_element()
     }
 
     pub fn open_agent(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1923,6 +1950,7 @@ impl AgentsScreen {
             } else {
                 let (_, view) = self.chats.remove(index);
                 self.draft_subs.remove(&view.entity_id());
+                self.replies.remove(&view.entity_id());
                 self.link_subs.remove(&view.entity_id());
             }
         }
@@ -5061,6 +5089,44 @@ impl AgentsScreen {
     }
 }
 
+/// The Agents list (`AgentsScreen::render_list`) as a view of its own, so the window draws it again only when the screen
+/// changes (it's notified then) and not on every frame of the chat beside it: scrolling a long chat redrew every row
+/// of the list each frame, about half of the frame's work, as did each step of a spinner in the chat. Its rows' times
+/// ("2m") move on with a redraw every half minute; its spinners step it alone (`ui::ticker`).
+pub struct AgentList {
+    screen: WeakEntity<AgentsScreen>,
+    _screen_sub: Subscription,
+    _clock: Task<()>,
+}
+
+impl AgentList {
+    fn new(screen: Entity<AgentsScreen>, cx: &mut Context<Self>) -> Self {
+        // Not for a step of a spinner the screen draws (the chat's header): that draws the screen again, not the list.
+        let _screen_sub = cx.observe(&screen, |_, _, cx| {
+            if !ui::ticker::ticking() {
+                cx.notify();
+            }
+        });
+        let _clock = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(30)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        AgentList { screen: screen.downgrade(), _screen_sub, _clock }
+    }
+}
+
+impl Render for AgentList {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.screen
+            .update(cx, |screen, cx| screen.render_list(window, cx).into_any_element())
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 impl Render for AgentsScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = *cx.colors();
@@ -5100,7 +5166,7 @@ impl Render for AgentsScreen {
                     .size_full()
                     .flex()
                     .on_drag_move(cx.listener(Self::on_edge_drag))
-                    .when(has_rows, |this| this.child(self.render_list(window, cx)))
+                    .when(has_rows, |this| this.child(self.render_list_view(cx)))
                     .child(right)
                     .into_any_element()
             }

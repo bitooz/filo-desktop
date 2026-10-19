@@ -53,26 +53,34 @@ fn turning(glyph: Svg, turns_per_second: f32) -> AnyElement {
 
 /// The clock spinners, working rings and the pet's bob move by: a dozen steps a second, shared. GPUI's
 /// `with_animation(...repeat())` asks for a frame every frame, and with no cached views that re-rendered the whole
-/// window at display rate for as long as one showed (a coding task's ring, for an hour). Each one drawn asks for its
-/// window to be drawn again at the next step; a step with none drawn stops the clock.
+/// window at display rate for as long as one showed (a coding task's ring, for an hour). Each one drawn asks for the
+/// view it's in to be drawn again at the next step (only it and the views around it, not a view kept as drawn beside
+/// it: `AnyView::cached`); a step with none drawn stops the clock.
 pub mod ticker {
     use std::cell::RefCell;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
-    use gpui::{AnyWindowHandle, App, Window};
+    use gpui::{AnyWindowHandle, App, EntityId, Window};
 
     const STEP: Duration = Duration::from_millis(83);
 
     #[derive(Default)]
     struct Ticker {
-        windows: HashSet<AnyWindowHandle>,
+        views: HashMap<AnyWindowHandle, HashSet<EntityId>>,
         running: bool,
     }
 
     thread_local! {
         static TICKER: RefCell<Ticker> = RefCell::new(Ticker::default());
+        static TICKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether this is a step's notifying the views it draws again (an observer of one can leave alone what only
+    /// moves its spinners: agents.rs `AgentList`).
+    pub fn ticking() -> bool {
+        TICKING.with(|ticking| ticking.get())
     }
 
     /// Seconds on the shared clock, whole steps only, so everything moving moves together.
@@ -82,11 +90,12 @@ pub mod ticker {
         (elapsed.as_millis() / STEP.as_millis()) as f32 * STEP.as_secs_f32()
     }
 
-    /// Draws `window` again at the next step (call it from an element's prepaint while something moves).
+    /// Draws the view being drawn again at the next step (call it from an element's prepaint while something moves).
     pub fn keep(window: &Window, cx: &mut App) {
+        let view = window.current_view();
         let start = TICKER.with(|ticker| {
             let mut ticker = ticker.borrow_mut();
-            ticker.windows.insert(window.window_handle());
+            ticker.views.entry(window.window_handle()).or_default().insert(view);
             !std::mem::replace(&mut ticker.running, true)
         });
         if !start {
@@ -95,13 +104,22 @@ pub mod ticker {
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(STEP).await;
-                let windows = TICKER.with(|ticker| std::mem::take(&mut ticker.borrow_mut().windows));
-                if windows.is_empty() {
+                let views = TICKER.with(|ticker| std::mem::take(&mut ticker.borrow_mut().views));
+                if views.is_empty() {
                     TICKER.with(|ticker| ticker.borrow_mut().running = false);
                     break;
                 }
-                for window in windows {
-                    window.update(cx, |_, window, _| window.refresh()).ok();
+                for (window, views) in views {
+                    // The observers run as the update ends, still in the step.
+                    TICKING.with(|ticking| ticking.set(true));
+                    window
+                        .update(cx, |_, _, cx| {
+                            for view in views {
+                                cx.notify(view);
+                            }
+                        })
+                        .ok();
+                    TICKING.with(|ticking| ticking.set(false));
                 }
             }
         })

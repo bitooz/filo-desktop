@@ -49,9 +49,13 @@ impl Future for Shot {
 }
 
 /// In a test run, before any window opens: Metal layers keep their frames readable and remember the last one, and
-/// quitting waits for pictures still being made. The real app draws as GPUI does.
+/// quitting waits for pictures still being made. The real app draws as GPUI does, and so does the run timing a chat's
+/// frames (`FILO_OPEN=chat-scroll-timing`) unless it's recorded (`FILO_DRIVE_VIDEO`, `Recording`): a kept frame is one
+/// fewer for GPUI to draw into.
 pub fn init() {
-    if !crate::test_run::active() {
+    let timing = std::env::var("FILO_OPEN").is_ok_and(|open| open == "chat-scroll-timing")
+        && std::env::var_os("FILO_DRIVE_VIDEO").is_none();
+    if !crate::test_run::active() || timing {
         return;
     }
     let Some(class) = AnyClass::get(c"CAMetalLayer") else { return };
@@ -330,6 +334,114 @@ unsafe fn read_frame(layer: *mut AnyObject) -> Result<Picture, String> {
     let bgra = unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, width * 4 * height) };
     let rgba = bgra.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]]).collect();
     Ok(Picture { width, height, rgba })
+}
+
+/// A video of a test window as it draws (`Recording::start`), made from its own frames like the screenshots, so it asks
+/// for no permission: each frame read back as it's replaced, written at 30 a second for as long as it showed (a frame
+/// that took long to come shows that long), through `ffmpeg`. Reading the frames back slows the window a little.
+pub struct Recording {
+    layer: usize,
+    frames: Option<std::sync::mpsc::Sender<(Instant, Vec<u8>)>>,
+    writer: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl Recording {
+    /// Starts recording the window numbered `number` into `path` (an .mp4). None when there's no such window, it has
+    /// drawn nothing yet, or `ffmpeg` can't be started.
+    pub fn start(number: isize, path: &Path) -> Option<Recording> {
+        // SAFETY: AppKit messages on the main thread, on a window AppKit has open.
+        let (layer, (width, height)) = unsafe {
+            let window: *mut AnyObject = msg_send![&*app(), windowWithWindowNumber: number];
+            if window.is_null() {
+                return None;
+            }
+            let (_, layer) = metal_view(window)?;
+            (layer as usize, frame_bgra(layer).ok()?.0)
+        };
+        let mut ffmpeg = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgra", "-s"])
+            .arg(format!("{width}x{height}"))
+            .args(["-r", "30", "-i", "-", "-vf", "scale=trunc(iw/4)*2:-2", "-c:v", "libx264", "-preset", "veryfast"])
+            .args(["-pix_fmt", "yuv420p", "-crf", "24"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdin = ffmpeg.stdin.take()?;
+        let (frames, received) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            const STEP: Duration = Duration::from_nanos(1_000_000_000 / 30);
+            let mut shown: Option<(Instant, Vec<u8>)> = None;
+            let mut next: Option<Instant> = None;
+            let mut ok = true;
+            for (at, frame) in received {
+                // The frame showing until this one came, once for each 30th of a second it showed.
+                if let Some((_, previous)) = &shown {
+                    let mut out = next.unwrap_or(at);
+                    while out < at && ok {
+                        ok = stdin.write_all(previous).is_ok();
+                        out += STEP;
+                    }
+                    next = Some(out);
+                } else {
+                    next = Some(at);
+                }
+                shown = Some((at, frame));
+            }
+            if let Some((_, last)) = &shown {
+                ok &= stdin.write_all(last).is_ok();
+            }
+            drop(stdin);
+            ffmpeg.wait().is_ok_and(|status| status.success()) && ok
+        });
+        Some(Recording { layer, frames: Some(frames), writer: Some(writer) })
+    }
+
+    /// Takes the frame drawn last: call it as the next one starts (`Window::on_next_frame`), when it's done drawing.
+    pub fn frame(&self) {
+        // SAFETY: the layer belongs to a window that's still open while the drive records it, on the main thread.
+        if let Ok((_, bgra)) = unsafe { frame_bgra(self.layer as *mut AnyObject) }
+            && let Some(frames) = &self.frames
+        {
+            let _ = frames.send((Instant::now(), bgra));
+        }
+    }
+
+    /// Ends the video and waits for it to be written; whether it was.
+    pub fn finish(mut self) -> bool {
+        drop(self.frames.take());
+        self.writer.take().is_some_and(|writer| writer.join().unwrap_or(false))
+    }
+}
+
+/// The last frame drawn in `layer`, as it is (BGRA, rows from the top), with its size: `read_frame` without waiting
+/// for it to be fresh, for a frame already replaced on screen.
+unsafe fn frame_bgra(layer: *mut AnyObject) -> Result<((usize, usize), Vec<u8>), String> {
+    let kept = LAST.lock().unwrap().get(&(layer as usize)).copied();
+    let Some((drawable, _)) = kept else { return Err("nothing drawn yet".into()) };
+    // SAFETY: `LAST` holds the drawable (retained) until the layer hands out the next one, on this thread.
+    let texture = unsafe { &*(drawable as *const metal::MetalDrawableRef) }.texture();
+    if texture.framebuffer_only() || texture.pixel_format() != metal::MTLPixelFormat::BGRA8Unorm {
+        return Err("the frame can't be read back".into());
+    }
+    let (width, height) = (texture.width(), texture.height());
+    let row = width * 4;
+    let device = texture.device();
+    let buffer = device.new_buffer(row * height, metal::MTLResourceOptions::StorageModeShared);
+    let queue = device.new_command_queue();
+    let commands = queue.new_command_buffer();
+    let blit = commands.new_blit_command_encoder();
+    let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
+    let size = metal::MTLSize { width, height, depth: 1 };
+    blit.copy_from_texture_to_buffer(texture, 0, 0, origin, size, &buffer, 0, row, row * height, metal::MTLBlitOption::empty());
+    blit.end_encoding();
+    commands.commit();
+    commands.wait_until_completed();
+    let (width, height) = (width as usize, height as usize);
+    // SAFETY: the blit above filled the shared buffer, `row * height` bytes, and it's done.
+    let bgra = unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, width * 4 * height) }.to_vec();
+    Ok(((width, height), bgra))
 }
 
 /// Every web view showing under `view`.

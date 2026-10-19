@@ -79,6 +79,8 @@ pub fn sync_list_anchored(
 }
 
 /// The first row after `top` that's on screen and `stays`, with how far into it the view's top is (negative: under it).
+/// Rows the list hasn't measured yet (the view was just moved there, as a drag along the timeline to the oldest does)
+/// have no place on screen: then the first of them that stays, at the top.
 fn below_top(
     list: &ListState,
     old: &[RowSig],
@@ -87,7 +89,9 @@ fn below_top(
 ) -> Option<(String, Pixels)> {
     let viewport = list.viewport_bounds();
     for (index, row) in old.iter().enumerate().skip(top + 1) {
-        let bounds = list.bounds_for_item(index)?;
+        let Some(bounds) = list.bounds_for_item(index) else {
+            return old[index..].iter().find(|row| stays(row)).map(|row| (row.key.clone(), px(0.)));
+        };
         if bounds.top() >= viewport.bottom() {
             return None;
         }
@@ -124,18 +128,36 @@ pub fn hold(pin: &Pin, viewport_height: Pixels) -> impl gpui::IntoElement + use<
 }
 
 /// The splices, in order, that turn `old` into `new`: (old rows replaced, how many new rows replace them). Rows kept
-/// (the longest common run of keys) aren't touched unless their `sig` changed.
+/// (the longest common run of keys) aren't touched unless their `sig` changed. Keys are unique, so the rows the two
+/// share at the start and at the end are kept as they are, and the common run is looked for only between them: a
+/// page of older history coming in above a long chat's 700 rows took 46 ms over them all, in a debug build.
 pub fn splices(old: &[RowSig], new: &[RowSig]) -> Vec<(std::ops::Range<usize>, usize)> {
     let (n, m) = (old.len(), new.len());
-    // Longest common subsequence of keys (lists are a few dozen rows).
-    let mut lcs = vec![vec![0u16; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if old[i].key == new[j].key { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
+    let head = old.iter().zip(new).take_while(|(a, b)| a.key == b.key).count();
+    let tail = old[head..].iter().rev().zip(new[head..].iter().rev()).take_while(|(a, b)| a.key == b.key).count();
+    let mut out: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    let changed = |out: &mut Vec<_>, i: usize, j: usize| {
+        if old[i].sig != new[j].sig {
+            out.push((i..i + 1, 1));
+        }
+    };
+    for i in 0..head {
+        changed(&mut out, i, i);
+    }
+    // Longest common subsequence of keys between the two (`lcs[i][j]`: from old row `head + i` and new `head + j`).
+    let (old_end, new_end) = (n - tail, m - tail);
+    let (rows, cols) = (old_end - head, new_end - head);
+    let mut lcs = vec![vec![0u16; cols + 1]; rows + 1];
+    for i in (0..rows).rev() {
+        for j in (0..cols).rev() {
+            lcs[i][j] = if old[head + i].key == new[head + j].key {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
         }
     }
-    let mut out: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
-    let (mut i, mut j) = (0, 0);
+    let (mut i, mut j) = (head, head);
     let (mut gap_old, mut gap_new) = (0, 0);
     let flush = |out: &mut Vec<_>, i: usize, gap_old: &mut usize, gap_new: &mut usize| {
         if *gap_old > 0 || *gap_new > 0 {
@@ -144,15 +166,13 @@ pub fn splices(old: &[RowSig], new: &[RowSig]) -> Vec<(std::ops::Range<usize>, u
         *gap_old = 0;
         *gap_new = 0;
     };
-    while i < n || j < m {
-        if i < n && j < m && old[i].key == new[j].key {
+    while i < old_end || j < new_end {
+        if i < old_end && j < new_end && old[i].key == new[j].key {
             flush(&mut out, i, &mut gap_old, &mut gap_new);
-            if old[i].sig != new[j].sig {
-                out.push((i..i + 1, 1));
-            }
+            changed(&mut out, i, j);
             i += 1;
             j += 1;
-        } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
+        } else if j < new_end && (i == old_end || lcs[i - head][j + 1 - head] >= lcs[i + 1 - head][j - head]) {
             gap_new += 1;
             j += 1;
         } else {
@@ -161,6 +181,9 @@ pub fn splices(old: &[RowSig], new: &[RowSig]) -> Vec<(std::ops::Range<usize>, u
         }
     }
     flush(&mut out, i, &mut gap_old, &mut gap_new);
+    for k in 0..tail {
+        changed(&mut out, old_end + k, new_end + k);
+    }
     out
 }
 
@@ -179,6 +202,82 @@ mod tests {
             len = len - range.len() + count;
         }
         len
+    }
+
+    /// `splices` as it was, over every row: what the faster one must still answer.
+    fn splices_over_all(old: &[RowSig], new: &[RowSig]) -> Vec<(std::ops::Range<usize>, usize)> {
+        let (n, m) = (old.len(), new.len());
+        let mut lcs = vec![vec![0u16; m + 1]; n + 1];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                lcs[i][j] =
+                    if old[i].key == new[j].key { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
+            }
+        }
+        let mut out = Vec::new();
+        let (mut i, mut j, mut gap_old, mut gap_new) = (0, 0, 0, 0);
+        while i < n || j < m {
+            if i < n && j < m && old[i].key == new[j].key {
+                if gap_old > 0 || gap_new > 0 {
+                    out.push((i - gap_old..i, gap_new));
+                }
+                (gap_old, gap_new) = (0, 0);
+                if old[i].sig != new[j].sig {
+                    out.push((i..i + 1, 1));
+                }
+                (i, j) = (i + 1, j + 1);
+            } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
+                (gap_new, j) = (gap_new + 1, j + 1);
+            } else {
+                (gap_old, i) = (gap_old + 1, i + 1);
+            }
+        }
+        if gap_old > 0 || gap_new > 0 {
+            out.push((i - gap_old..i, gap_new));
+        }
+        out
+    }
+
+    #[test]
+    fn older_history_coming_in_above_is_one_splice_at_the_top() {
+        let old: Vec<RowSig> = (500..1200).map(|n| RowSig { key: format!("m{n}"), sig: n }).collect();
+        let mut new: Vec<RowSig> = (450..1200).map(|n| RowSig { key: format!("m{n}"), sig: n }).collect();
+        // The spacer at the end grew with the composer.
+        new.last_mut().unwrap().sig = 1;
+        assert_eq!(splices(&old, &new), vec![(0..0, 50), (699..700, 1)]);
+        assert_eq!(splices(&old, &new), splices_over_all(&old, &new));
+    }
+
+    #[test]
+    fn splices_match_the_common_run_over_all_rows() {
+        // Lists made up from a little generator: rows dropped, added, moved and changed at the ends and in between.
+        let mut seed = 7u64;
+        let mut next = move |below: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % below
+        };
+        for _ in 0..400 {
+            let old: Vec<RowSig> =
+                (0..next(14)).map(|k| RowSig { key: format!("k{k}"), sig: next(3) }).collect();
+            let mut new: Vec<RowSig> = old.iter().filter(|_| next(5) > 0).cloned().collect();
+            for _ in 0..next(4) {
+                let at = next(new.len() as u64 + 1) as usize;
+                new.insert(at, RowSig { key: format!("n{}", next(1000)), sig: 0 });
+            }
+            if new.len() > 2 && next(3) == 0 {
+                let row = new.remove(next(new.len() as u64) as usize);
+                new.insert(next(new.len() as u64 + 1) as usize, row);
+            }
+            for row in &mut new {
+                if next(6) == 0 {
+                    row.sig += 1;
+                }
+            }
+            let mut keys = std::collections::HashSet::new();
+            new.retain(|row| keys.insert(row.key.clone()));
+            assert_eq!(splices(&old, &new), splices_over_all(&old, &new), "{old:?} → {new:?}");
+            assert_eq!(apply(old.len(), &old, &new), new.len());
+        }
     }
 
     #[test]

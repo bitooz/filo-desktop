@@ -10,6 +10,12 @@
 // GPUI's list only knows the heights of rows it has laid out, and none while it follows the bottom, so the place is
 // read in rows, not pixels: the fractional row at the top of the view, between the sent messages around it, pulled
 // toward the last one over the final screen so the newest message can be current.
+//
+// Dragging up near the oldest messages loaded loads the page before them, which the list takes in above the message
+// on screen without moving it (feed_rows::sync_list_anchored). The dashes then stand for more messages, so the one
+// under the pointer is an older one: the drag goes on from where the chat is (`Scrub::from_here`, `from_here`), the
+// strip above the pointer now holding the older messages and below it the newer ones, rather than to the dash's new
+// message, which was a jump into the page just loaded and on to load the next.
 
 use gpui::{
     Bounds, DispatchPhase, Hitbox, HitboxBehavior, Hsla, ListOffset, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -34,19 +40,30 @@ const DASH_HOVERED: f32 = 16.;
 const TAPER: f32 = 2.5;
 /// A press that moves less than this is a click.
 const CLICK_SLOP: f32 = 3.;
+/// Dragged within this many sent messages of the oldest loaded, the page before them is asked for.
+const LOAD_AHEAD: f32 = 6.;
 /// Bubbles keep this far from the chat's right edge while the strip can show: the strip, and a gap.
 pub(super) const CLEAR: f32 = RAIL_WIDTH + space::SM;
 
 /// A press on the strip, until it comes up.
 pub(super) struct Scrub {
-    /// Where the chat was, for Esc: the list's top and the follow flags.
+    /// Where the chat was, for Esc: the list's top (and the row there, as rows come in above it) and the follow flags.
     from: ListOffset,
+    from_row: Option<String>,
     from_flags: (bool, bool, bool),
     start_y: Pixels,
     /// Past the click slop: the chat follows the pointer.
     moved: bool,
     /// Where the pointer has put the chat, in sent messages; shown instead of the place read off the list.
     pos: Option<f32>,
+    /// The pointer's last height in the window while pressed.
+    last_y: Option<Pixels>,
+    /// The rows the sent messages were counted in (how many, and the first), to tell when a page came in.
+    rows_seen: (usize, Option<String>),
+    /// Since a page came in under the drag: the dash and the place it started again from (`from_here`).
+    from_here: Option<(f32, f32)>,
+    /// A page came in since the last move: the next one starts from where the chat is.
+    rows_changed: bool,
     /// Esc, heard before anything focused does.
     _escape: Subscription,
 }
@@ -139,6 +156,21 @@ fn row_for(sent: &[usize], pos: f32) -> f32 {
     sent[k] as f32 + (pos - k as f32) * (sent[k + 1] - sent[k]) as f32
 }
 
+/// The place for dash `dash` in a drag that a page came in under, the pointer then at dash `from` and the chat at place
+/// `place` (both since the page): up the strip to the oldest at the first dash, down it to the newest (`newest`) at
+/// the last (`last`). Past the first dash (the pointer was over or above it), the older messages go on up from there
+/// at `per` sent messages a dash.
+fn from_here(dash: f32, (from, place): (f32, f32), last: f32, newest: f32, per: f32) -> f32 {
+    let pos = if dash >= from {
+        if last > from { place + (newest - place) * ((dash - from) / (last - from)).min(1.) } else { place }
+    } else if from > 0. {
+        place * (dash.max(0.) / from)
+    } else {
+        place + (dash - from) * per
+    };
+    pos.clamp(0., newest)
+}
+
 /// How far a dash `distance` from the place lengthens and brightens: 1 on it, 0 from `TAPER` away.
 fn nearness(distance: f32) -> f32 {
     (1. - distance.abs() / TAPER).max(0.)
@@ -171,6 +203,11 @@ impl Conversation {
             .collect()
     }
 
+    /// How many sent messages there are and the first one's row: what a drag's dashes were counted from.
+    fn sent_rows_seen(&self, sent: &[usize]) -> (usize, Option<String>) {
+        (sent.len(), sent.first().and_then(|&index| self.row_sigs.get(index)).map(|row| row.key.clone()))
+    }
+
     /// Where the reader is, among the sent messages, as the list was last laid out.
     fn timeline_place(&self, sent: &[usize]) -> f32 {
         let list = &self.list_state;
@@ -190,12 +227,19 @@ impl Conversation {
                 cx.stop_propagation();
             }
         });
+        let from = self.list_state.logical_scroll_top();
+        let rows_seen = self.sent_rows_seen(&self.sent_rows());
         self.timeline.scrub = Some(Scrub {
-            from: self.list_state.logical_scroll_top(),
+            from,
+            from_row: self.row_sigs.get(from.item_ix).map(|row| row.key.clone()),
             from_flags: (self.at_bottom, self.at_end, self.held_at_end),
             start_y: y,
             moved: false,
             pos: None,
+            last_y: Some(y),
+            rows_seen,
+            from_here: None,
+            rows_changed: false,
             _escape: escape,
         });
         cx.notify();
@@ -212,6 +256,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         let y = f32::from(event.position.y - strip.top());
+        let rows_now = self.timeline.scrub.as_ref().map(|_| self.sent_rows_seen(&self.sent_rows()));
         if let Some(scrub) = &mut self.timeline.scrub {
             // A move with no button is a release that never arrived.
             let released = event.pressed_button != Some(MouseButton::Left);
@@ -221,9 +266,29 @@ impl Conversation {
             scrub.moved |= !released;
             if released {
                 self.timeline_release(event.position.y, strip, layout, sent, cx);
-            } else {
-                self.timeline_scrub(layout.dash_at(y), layout, sent, cx);
+                return;
             }
+            // A page came in since the strip was drawn: its dashes (and `sent`) are the old rows', so the chat stays
+            // where the list kept it until the next move, which goes on from there.
+            if let Some(rows_now) = rows_now
+                && rows_now != scrub.rows_seen
+            {
+                scrub.rows_seen = rows_now;
+                scrub.pos = None;
+                scrub.rows_changed = true;
+                scrub.last_y = Some(event.position.y);
+                return;
+            }
+            let changed = std::mem::take(&mut scrub.rows_changed);
+            let at = scrub.last_y.replace(event.position.y).map_or(y, |last| f32::from(last - strip.top()));
+            // Since a page came in: on from the dash the pointer was at, and the place the chat is at.
+            if changed {
+                let from_here = Some((layout.dash_at(at), self.timeline_place(sent)));
+                if let Some(scrub) = &mut self.timeline.scrub {
+                    scrub.from_here = from_here;
+                }
+            }
+            self.timeline_scrub(layout.dash_at(y), layout, sent, cx);
             return;
         }
         let hover = hovered.then(|| layout.dash_at(y).round().clamp(0., (layout.dashes - 1) as f32) as usize);
@@ -234,9 +299,14 @@ impl Conversation {
     }
 
     /// The chat at dash `dash` (fractional): its top at that place, the start or end past either end of the column.
+    /// Since a page came in under the drag, it goes from where that left it instead (`Scrub::from_here`).
     fn timeline_scrub(&mut self, dash: f32, layout: Layout, sent: &[usize], cx: &mut Context<Self>) {
         let last = (layout.dashes - 1) as f32;
-        let pos = (dash.clamp(0., last) * layout.per as f32).min((sent.len() - 1) as f32);
+        let newest = (sent.len() - 1) as f32;
+        let pos = match self.timeline.scrub.as_ref().and_then(|scrub| scrub.from_here) {
+            Some(from) => from_here(dash, from, last, newest, layout.per as f32),
+            None => (dash.clamp(0., last) * layout.per as f32).min(newest),
+        };
         if let Some(scrub) = &mut self.timeline.scrub {
             scrub.pos = Some(pos);
         }
@@ -244,7 +314,8 @@ impl Conversation {
             self.jump_to_latest(cx);
             return;
         }
-        let row = if dash < -0.5 { 0. } else { row_for(sent, pos) };
+        // Past the top of the column: the very top of the chat, once at its oldest sent message.
+        let row = if dash < -0.5 && pos <= 0. { 0. } else { row_for(sent, pos) };
         let item_ix = row.floor() as usize;
         let into = self
             .list_state
@@ -253,7 +324,11 @@ impl Conversation {
         self.list_state.scroll_to(ListOffset { item_ix, offset_in_item: into });
         self.at_bottom = false;
         self.held_at_end = false;
-        if item_ix <= 2 {
+        // The reader moved the chat: a message held in place as rows changed above it stays where the drag put it,
+        // as after the wheel (`scrolled`); the hold put it back the next frame.
+        self.held = None;
+        // The page before the oldest loaded is on its way before the drag gets there.
+        if item_ix <= 2 || pos < LOAD_AHEAD {
             self.request_older(cx);
         }
         cx.notify();
@@ -276,16 +351,22 @@ impl Conversation {
                 self.list_state.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
                 self.at_bottom = false;
                 self.held_at_end = false;
+                self.held = None;
             }
         }
         cx.notify();
     }
 
-    /// Esc while pressing: the chat back where the press found it.
+    /// Esc while pressing: the chat back where the press found it, its row found again if pages came in above it.
     fn timeline_cancel(&mut self, cx: &mut Context<Self>) {
         let Some(scrub) = self.timeline.scrub.take() else { return };
-        self.list_state.scroll_to(scrub.from);
+        let item_ix = scrub
+            .from_row
+            .and_then(|key| self.row_sigs.iter().position(|row| row.key == key))
+            .unwrap_or(scrub.from.item_ix);
+        self.list_state.scroll_to(ListOffset { item_ix, ..scrub.from });
         (self.at_bottom, self.at_end, self.held_at_end) = scrub.from_flags;
+        self.held = None;
         cx.notify();
     }
 
@@ -298,6 +379,16 @@ impl Conversation {
             return None;
         }
         let colors = *cx.colors();
+        let rows_now = self.sent_rows_seen(&sent);
+        if let Some(scrub) = &mut self.timeline.scrub
+            && scrub.rows_seen != rows_now
+        {
+            // A page came in under the drag: the place shown is read off the list (which kept the message on screen)
+            // until the pointer moves on from it.
+            scrub.rows_seen = rows_now;
+            scrub.pos = None;
+            scrub.rows_changed = true;
+        }
         let scrub = self.timeline.scrub.as_ref();
         let scrubbing = scrub.is_some_and(|scrub| scrub.moved);
         let pos = scrub.and_then(|scrub| scrub.pos).unwrap_or_else(|| self.timeline_place(&sent)) / layout.per as f32;
@@ -480,6 +571,29 @@ mod tests {
         }
         assert_eq!(row_for(&sent, -1.), 1.);
         assert_eq!(row_for(&sent, 9.), 15.);
+    }
+
+    #[test]
+    fn a_drag_goes_on_from_where_a_page_left_it() {
+        // 30 dashes, the chat at place 50 of 120 with the pointer at dash 10 when the page came in.
+        let at = |dash: f32| from_here(dash, (10., 50.), 29., 120., 4.);
+        assert_eq!(at(10.), 50.);
+        // Up to the oldest at the first dash, in order; down to the newest at the last.
+        assert_eq!(at(5.), 25.);
+        assert_eq!(at(0.), 0.);
+        assert_eq!(at(-3.), 0.);
+        assert!((at(19.5) - 85.).abs() < 1e-4);
+        assert_eq!(at(29.), 120.);
+        assert_eq!(at(40.), 120.);
+        // Small moves either side stay close (no jump), and up is always older.
+        assert!((at(10.2) - 50.).abs() < 1. && (at(9.8) - 50.).abs() < 2.);
+        assert!((0..=290).all(|step| at(step as f32 / 10.) <= at((step + 1) as f32 / 10.)));
+        // With the pointer over or above the first dash, the older ones go on up from it.
+        let above = |dash: f32| from_here(dash, (-2., 50.), 29., 120., 4.);
+        assert_eq!(above(-2.), 50.);
+        assert_eq!(above(-4.), 42.);
+        assert_eq!(above(-20.), 0.);
+        assert!(above(0.) > 50.);
     }
 
     #[test]

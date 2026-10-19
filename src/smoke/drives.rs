@@ -904,6 +904,320 @@ fn run_chat_timing(window: &mut Window, cx: &mut Context<AppShell>) {
     .detach();
 }
 
+/// CPU time this process has used, all threads (user and system).
+fn process_cpu() -> Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let time = |t: libc::timeval| Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64);
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// CPU time the calling thread has used (the main thread, from a drive).
+fn thread_cpu() -> Duration {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+/// `FILO_OPEN=chat-scroll-timing` with `FILO_TIMING_CHATS=<session id>`, on a copy of the user's data (nothing of it
+/// runs, `smoke::quiet_backend`): opens that agent's chat at its newest message, then turns the wheel over the feed
+/// (`FILO_SCROLL_STEP` points a frame, default 60, a wheel event posted to the window) until it's at the
+/// top of all the history it loads; with `FILO_TIMING_SCRUB=1` it drags the timeline at the chat's right instead, fast
+/// up and down across the pages of history as they load. Logs each frame's draw (from the frame starting until it's
+/// presented, and the main thread's CPU in that), the time between frames and the main thread's CPU in it, the
+/// process's and the main thread's CPU over it, then 5 s with nothing happening; and whether each page that came in
+/// kept the message on screen, any frame that moved the chat the wrong way for the input, and any with messages out
+/// of order. `FILO_DRIVE_VIDEO=<file.mp4>` records the window meanwhile (window_shot.rs `Recording`, needs `ffmpeg`);
+/// `FILO_TIMING_TRACE=1` logs every frame's place.
+fn run_chat_scroll_timing(window: &mut Window, cx: &mut Context<AppShell>) {
+    let session = std::env::var("FILO_TIMING_CHATS").unwrap_or_default().split(',').next().unwrap_or("").trim().to_string();
+    let step: f32 = std::env::var("FILO_SCROLL_STEP").ok().and_then(|step| step.parse().ok()).unwrap_or(60.);
+    let scrubbing = std::env::var_os("FILO_TIMING_SCRUB").is_some();
+    let backend = backend(cx);
+    cx.spawn_in(window, async move |this, cx| {
+        let executor = cx.background_executor().clone();
+        let wait = |ms: u64| executor.timer(Duration::from_millis(ms));
+        let quit = |cx: &mut gpui::AsyncWindowContext| {
+            if std::env::var_os("FILO_DRIVE_STAY").is_none() {
+                cx.update(|_, cx| cx.quit()).ok();
+            }
+        };
+        if !crate::test_run::own_config() || session.is_empty() {
+            eprintln!("chat-scroll-timing: FAIL needs FILO_TIMING_CHATS and a FILO_CONFIG_DIR of its own");
+            return quit(cx);
+        }
+        let agents = backend.call_raw("agents:list", json!({})).await.unwrap_or_default();
+        let agent = agents
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row.get("sessionId").and_then(Value::as_str) == Some(session.as_str())))
+            .and_then(id_of);
+        let Some(agent) = agent else {
+            eprintln!("chat-scroll-timing: FAIL {session} isn't an agent's chat");
+            return quit(cx);
+        };
+        this.update_in(cx, |shell, window, cx| shell.open_agent(agent.clone(), window, cx)).ok();
+        let opened = std::time::Instant::now();
+        let conversation = loop {
+            let shown = shown_conversation(&this, cx).1.filter(|conversation| {
+                conversation
+                    .read_with(cx, |conversation, _| {
+                        conversation.session_id() == Some(session.as_str()) && conversation.history_loaded().0 > 0
+                    })
+                    .unwrap_or(false)
+            });
+            if let Some(conversation) = shown {
+                break conversation;
+            }
+            if opened.elapsed() > Duration::from_secs(20) {
+                eprintln!("chat-scroll-timing: FAIL the chat didn't open");
+                return quit(cx);
+            }
+            wait(10).await;
+        };
+        // Its glances, pictures and coding rows come in.
+        wait(4000).await;
+        drawn(cx).await;
+        let size = cx.update(|window, _| window.viewport_size()).unwrap_or_default();
+        let (width, height) = (f64::from(f32::from(size.width)), f64::from(f32::from(size.height)));
+        let read = |cx: &mut gpui::AsyncWindowContext| {
+            conversation
+                .read_with(cx, |conversation, _| {
+                    (
+                        conversation.scroll_position(),
+                        conversation.history_loaded(),
+                        conversation.top_message(),
+                        conversation.messages_in_order(),
+                        conversation.timeline_strip().map(|(strip, _)| strip),
+                        conversation.timeline_strip().map(|(_, place)| place),
+                    )
+                })
+                .ok()
+        };
+        // The drag: where along the timeline's strip the pointer goes, frame by frame (0 its first dash, 1 its last),
+        // fast from the newest to the oldest and back across the pages as they load, then on past its top.
+        let scrub: Option<Vec<f32>> = scrubbing.then(|| {
+            let mut plan = Vec::new();
+            let go = |plan: &mut Vec<f32>, from: f32, to: f32, frames: usize| {
+                plan.extend((1..=frames).map(|frame| from + (to - from) * frame as f32 / frames as f32));
+            };
+            for _ in 0..6 {
+                go(&mut plan, 1., 0., 18);
+                go(&mut plan, 0., 0., 10);
+                go(&mut plan, 0., 0.6, 12);
+                go(&mut plan, 0.6, 0., 12);
+                go(&mut plan, 0., 0., 10);
+                go(&mut plan, 0., 1., 18);
+            }
+            go(&mut plan, 1., -0.15, 20);
+            go(&mut plan, -0.15, -0.15, 20);
+            plan
+        });
+        let strip_y = |strip: gpui::Bounds<gpui::Pixels>, along: f32| {
+            // The first and last dashes are 14 points in from the strip's ends (timeline.rs `PAD`).
+            let (top, bottom) = (f32::from(strip.top()) + 14., f32::from(strip.bottom()) - 14.);
+            f64::from(top + (bottom - top) * along)
+        };
+        let (mut strip_x, mut pointer_y) = (0., 0.);
+        if let Some(plan) = &scrub {
+            let Some((_, _, _, _, Some(strip), _)) = read(cx) else {
+                eprintln!("chat-scroll-timing: FAIL the timeline isn't showing");
+                return quit(cx);
+            };
+            (strip_x, pointer_y) = (f64::from(f32::from(strip.center().x)), strip_y(strip, 1.));
+            native_input::drag_step(width, native_input::Drag::Down, strip_x, pointer_y);
+            eprintln!("chat-scroll-timing: dragging the timeline, {} moves", plan.len());
+        } else {
+            eprintln!("chat-scroll-timing: scrolling");
+        }
+        let recording = std::env::var("FILO_DRIVE_VIDEO").ok().and_then(|file| {
+            let number = native_input::window_number(width)?;
+            let recording = crate::window_shot::Recording::start(number, std::path::Path::new(&file));
+            if recording.is_none() {
+                eprintln!("chat-scroll-timing: couldn't record {file}");
+            }
+            recording
+        });
+        DETAIL_HANDLED.lock().unwrap().clear();
+        let mut draws: Vec<Duration> = Vec::new();
+        let mut draw_cpus: Vec<Duration> = Vec::new();
+        let mut frame_cpus: Vec<Duration> = Vec::new();
+        let mut gaps: Vec<Duration> = Vec::new();
+        let (started, cpu, main_cpu) = (std::time::Instant::now(), process_cpu(), thread_cpu());
+        let mut last_frame: Option<(std::time::Instant, Duration)> = None;
+        let (mut still, mut stuck) = (0, 0);
+        let (wheel_y, mut wheel_at) = ([0.4, 0.25, 0.6, 0.15], 0);
+        let mut position = (usize::MAX, 0.);
+        // What each frame showed: the loaded messages and the one at the top (how many loaded are older), to tell a
+        // page that came in without moving it, and a move the wrong way.
+        let mut before = read(cx).and_then(|(_, (loaded, _), top, ..)| Some((loaded, top?)));
+        let (mut pages, mut kept, mut wrong_way, mut unordered) = (Vec::new(), 0, Vec::new(), 0);
+        let mut along_before = 1.;
+        // Where the input went: up the chat (older) is up the strip, or the wheel turned up.
+        let (mut toward_before, mut toward_earlier) = (0f32, 0f32);
+        // More than this many messages is a jump (a page is 40); up to it, the input's own move in that frame.
+        const JUMP: i64 = 5;
+        let mut frame_index = 0;
+        while started.elapsed() < Duration::from_secs(240) {
+            // Up the chat: older messages, through AppKit as a person's wheel or pointer.
+            let toward = match &scrub {
+                Some(plan) => {
+                    let Some(&along) = plan.get(frame_index) else { break };
+                    // Moving, to that place on the strip as it shows now; holding, the pointer stays where it is
+                    // while the strip grows under it with the pages that come in, as a hand's does.
+                    let strip = read(cx).and_then(|(.., strip, _)| strip);
+                    if let Some(strip) = strip
+                        && along != along_before
+                    {
+                        pointer_y = strip_y(strip, along);
+                    }
+                    native_input::drag_step(width, native_input::Drag::Move, strip_x, pointer_y);
+                    pointer_y as f32
+                }
+                None => {
+                    // Over the feed, right of the agents' list and above the composer; elsewhere over it while a web
+                    // page shown in it (a glance's) is under the pointer, which takes the wheel itself.
+                    if stuck >= 10 {
+                        let (native, _) = native_input::native_at(width, width * 0.7, height * wheel_y[wheel_at]);
+                        eprintln!("chat-scroll-timing: the wheel stopped at {position:?} over {native:?}; moving it");
+                        wheel_at = (wheel_at + 1) % wheel_y.len();
+                        stuck = 0;
+                    }
+                    if !native_input::scroll_in(width, width * 0.7, height * wheel_y[wheel_at], -f64::from(step)) {
+                        eprintln!("chat-scroll-timing: FAIL couldn't post a wheel event");
+                        break;
+                    }
+                    toward_before - 1.
+                }
+            };
+            frame_index += 1;
+            // The input notifies the chat, as a person's does: nothing else is drawn again (no `refresh`, which
+            // would draw views kept as drawn afresh).
+            let (tx, rx) = futures::channel::oneshot::channel();
+            cx.update(|window, _| {
+                window.on_next_frame(move |_, _| {
+                    let _ = tx.send((std::time::Instant::now(), thread_cpu()));
+                });
+            })
+            .ok();
+            let Ok((frame, frame_cpu)) = rx.await else { break };
+            // This runs once the frame that began at `frame` has been drawn and presented.
+            draws.push(frame.elapsed());
+            draw_cpus.push(thread_cpu().saturating_sub(frame_cpu));
+            if let Some((last, last_cpu)) = last_frame.replace((frame, frame_cpu)) {
+                gaps.push(frame - last);
+                // All the main thread did from one frame to the next: the frame, the input, what arrived.
+                frame_cpus.push(frame_cpu.saturating_sub(last_cpu));
+            }
+            if let Some(recording) = &recording {
+                recording.frame();
+            }
+            let Some((now, (loaded, more), top, in_order, _, place)) = read(cx) else { break };
+            if std::env::var_os("FILO_TIMING_TRACE").is_some() {
+                eprintln!(
+                    "chat-scroll-timing: frame {frame_index} input {toward:.1} place {place:?} loaded {loaded} top {now:?} {top:?}"
+                );
+            }
+            unordered += usize::from(!in_order);
+            if let (Some((loaded_before, (id_before, older_before))), Some((id, older))) = (&before, &top) {
+                let added = loaded.saturating_sub(*loaded_before);
+                // How far the top moved in messages, older ones that came in above it not counted (- older).
+                let moved = *older as i64 - (*older_before + added) as i64;
+                if added > 0 {
+                    pages.push(format!("+{added}: {}", if id == id_before { "kept".into() } else { format!("moved {moved}") }));
+                    kept += usize::from(moved.abs() <= JUMP);
+                }
+                // Up the strip (or the wheel up) never shows newer messages, down it never older ones. A posted event
+                // can land a frame late, so the step before counts too.
+                let up = toward < toward_before || toward_before < toward_earlier;
+                let down = toward > toward_before || toward_before > toward_earlier;
+                // Where the input turned back, either way is the input's.
+                let turned = up && down;
+                if !turned && ((up && moved > JUMP) || (down && moved < -JUMP) || (!up && !down && moved.abs() > JUMP)) {
+                    wrong_way.push(format!("frame {frame_index}: {moved:+}"));
+                }
+            }
+            before = top.map(|top| (loaded, top));
+            (toward_earlier, toward_before) = (toward_before, toward);
+            if let Some(plan) = &scrub {
+                along_before = plan[frame_index - 1];
+            }
+            // Scrolling: at the top with nothing more to load, for half a second of frames.
+            still = if now == position && now == (0, 0.) && !more { still + 1 } else { 0 };
+            stuck = if now == position && now != (0, 0.) { stuck + 1 } else { 0 };
+            position = now;
+            if scrub.is_none() && still >= 30 {
+                break;
+            }
+        }
+        if scrub.is_some() {
+            native_input::drag_step(width, native_input::Drag::Up, strip_x, pointer_y);
+        }
+        if let Some(recording) = recording {
+            eprintln!("chat-scroll-timing: video saved: {}", recording.finish());
+        }
+        eprintln!(
+            "chat-scroll-timing: pages that came in: {} of {} kept the message on screen, within {JUMP} [{}]",
+            kept,
+            pages.len(),
+            pages.join(", ")
+        );
+        eprintln!(
+            "chat-scroll-timing: jumps (the wrong way for the input, or with none): {} [{}]; frames with messages out of \
+             order: {unordered}",
+            wrong_way.len(),
+            wrong_way.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+        );
+        let (took, cpu, main_cpu) = (started.elapsed(), process_cpu() - cpu, thread_cpu() - main_cpu);
+        let (loaded, more) = conversation.read_with(cx, |conversation, _| conversation.history_loaded()).unwrap_or_default();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.;
+        let stats = |times: &mut Vec<Duration>| {
+            times.sort();
+            let at = |q: f64| times.get(((times.len() as f64 - 1.) * q).round() as usize).copied().map_or(0., ms);
+            format!(
+                "median {:.1} ms, p90 {:.1}, p99 {:.1}, max {:.1}; over 16.7 ms: {}, over 33 ms: {}",
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                at(1.),
+                times.iter().filter(|t| ms(**t) > 16.7).count(),
+                times.iter().filter(|t| ms(**t) > 33.4).count()
+            )
+        };
+        eprintln!(
+            "chat-scroll-timing: {} frames in {:.1} s ({:.0} fps), {} messages loaded{}, at the top: {}",
+            draws.len(),
+            took.as_secs_f64(),
+            draws.len() as f64 / took.as_secs_f64(),
+            loaded,
+            if more { ", more to load" } else { "" },
+            position == (0, 0.)
+        );
+        eprintln!("chat-scroll-timing: draw {}", stats(&mut draws));
+        eprintln!("chat-scroll-timing: draw, main thread CPU {}", stats(&mut draw_cpus));
+        eprintln!("chat-scroll-timing: between frames {}", stats(&mut gaps));
+        eprintln!("chat-scroll-timing: main thread CPU from frame to frame {}", stats(&mut frame_cpus));
+        eprintln!(
+            "chat-scroll-timing: CPU while scrolling {:.0}% (main thread {:.0}%)",
+            100. * cpu.as_secs_f64() / took.as_secs_f64(),
+            100. * main_cpu.as_secs_f64() / took.as_secs_f64()
+        );
+        let handled: Vec<String> =
+            DETAIL_HANDLED.lock().unwrap().iter().map(|took| format!("{:.0}", ms(*took))).collect();
+        eprintln!("chat-scroll-timing: pages of history taken in (ms): [{}]", handled.join(", "));
+        let (idle_from, cpu, main_cpu) = (std::time::Instant::now(), process_cpu(), thread_cpu());
+        wait(5000).await;
+        let idle = idle_from.elapsed().as_secs_f64();
+        eprintln!(
+            "chat-scroll-timing: CPU idle after {:.1}% (main thread {:.1}%)",
+            100. * (process_cpu() - cpu).as_secs_f64() / idle,
+            100. * (thread_cpu() - main_cpu).as_secs_f64() / idle
+        );
+        eprintln!("chat-scroll-timing: done");
+        quit(cx);
+    })
+    .detach();
+}
+
 fn run_soak(home: Option<String>, window: &mut Window, cx: &mut Context<AppShell>) {
     let backend = backend(cx);
     let every = Duration::from_secs(std::env::var("FILO_SOAK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(90));
@@ -1180,11 +1494,12 @@ type Drive = fn(Option<String>, &mut Window, &mut Context<AppShell>);
 
 /// The drives `open_from_env` starts by name. They click and type through the window like a person (in-app AppKit
 /// events, `native_input`), so while one runs the elements it looks for record where they are (`driving`).
-const DRIVES: [(&str, Drive); 38] = [
+const DRIVES: [(&str, Drive); 39] = [
     ("shared-delete-drive", |_, window, cx| shared_delete::run(window, cx)),
     ("list-reorder-timing", |_, window, cx| list_reorder::run(window, cx)),
     ("feed-drive", |_, window, cx| run_feed_drive(window, cx)),
     ("chat-timing", |_, window, cx| run_chat_timing(window, cx)),
+    ("chat-scroll-timing", |_, window, cx| run_chat_scroll_timing(window, cx)),
     ("feed-glance-drive", |_, window, cx| run_feed_glance_drive(window, cx)),
     ("feed-chat", |_, window, cx| run_feed_chat(window, cx)),
     ("feed-refresh", |_, window, cx| run_feed_refresh(window, cx)),

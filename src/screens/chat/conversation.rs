@@ -83,8 +83,6 @@ const AWAIT_TURN: Duration = Duration::from_secs(15);
 /// How long a message kept in place as older history came in above it stays held there while that history's rows
 /// settle (pictures loading), unless the reader scrolls first.
 const HOLD_FOR: Duration = Duration::from_millis(1500);
-/// The row that stays at the top of the chat while older history comes in under it: never what the place is kept by.
-const ABOVE_HISTORY: &str = "older";
 /// Lines of the group's ask shown on its card in an agent's chat before "Show more".
 const GROUP_CALL_LINES: usize = 4;
 const REACTIONS: [(&str, &str); 7] = [
@@ -669,6 +667,14 @@ fn row_key(row: &ViewRow, handed_over: &HashMap<String, String>) -> String {
     }
 }
 
+/// Whether the row keyed `key` (`row_key`) can keep the reader's place as older history comes in: a message's row, which
+/// stays among the same messages. Not the "loading" row, a coding card or a time mark, which stay at the top of the
+/// chat while history comes in under them or move up above the same day's older messages (the chat went with them,
+/// to the top of the page that came in).
+fn holds_place(key: &str) -> bool {
+    ["m:", "group-link:", "group-call:", "routine:"].iter().any(|kind| key.starts_with(kind))
+}
+
 /// Whether a turn has a line under the message that asked for it: its error, or, settled, a quiet line.
 fn shows_failure(turn: &ChatTurn) -> bool {
     matches!(turn.state.as_str(), "failed" | "settled")
@@ -909,6 +915,47 @@ impl Conversation {
     pub fn scroll_position(&self) -> (usize, f32) {
         let top = self.list_state.logical_scroll_top();
         (top.item_ix, f32::from(top.offset_in_item))
+    }
+
+    /// The messages loaded, and whether an older page can still come (`request_older`) (`FILO_OPEN=chat-scroll-timing`).
+    #[cfg(feature = "dev")]
+    pub fn history_loaded(&self) -> (usize, bool) {
+        let loaded = self.detail().map_or(0, |detail| detail.messages.len());
+        let more = self.detail().is_some_and(|detail| detail.has_more) && self.limit < MAX_LOADED;
+        (loaded, more)
+    }
+
+    /// The first message at or below the top of the view: its id, and how many loaded messages are older
+    /// (`FILO_OPEN=chat-scroll-timing`).
+    #[cfg(feature = "dev")]
+    pub fn top_message(&self) -> Option<(String, usize)> {
+        let top = self.list_state.logical_scroll_top();
+        let message = self.rows.iter().skip(top.item_ix).find_map(|row| match row {
+            ViewRow::Message { message, .. } => Some(message),
+            _ => None,
+        })?;
+        let older = self.detail()?.messages.iter().filter(|other| other.creation_time < message.creation_time).count();
+        Some((message.id.clone(), older))
+    }
+
+    /// The timeline's strip in the window as last drawn, and its bright place in dashes (`FILO_OPEN=chat-scroll-timing`).
+    #[cfg(feature = "dev")]
+    pub fn timeline_strip(&self) -> Option<(gpui::Bounds<Pixels>, f32)> {
+        self.timeline.drawn().map(|drawn| (drawn.strip, drawn.place))
+    }
+
+    /// Whether the feed's messages go from the oldest to the newest (`FILO_OPEN=chat-scroll-timing`).
+    #[cfg(feature = "dev")]
+    pub fn messages_in_order(&self) -> bool {
+        let times: Vec<f64> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                ViewRow::Message { message, .. } => Some(message.creation_time),
+                _ => None,
+            })
+            .collect();
+        times.windows(2).all(|pair| pair[0] <= pair[1])
     }
 
     /// The timeline in short (the fixture's checks): messages by id, cards as "?id", other rows by kind.
@@ -1999,9 +2046,8 @@ impl Conversation {
                 RowSig { key, sig: feed_rows::sig(format!("{row:?}")) }
             })
             .collect();
-        // Older history arriving above the message being read leaves it where it is on screen: the "loading" row
-        // on top, or a time mark that goes as the page joins, aren't what the place is kept by.
-        let pin = feed_rows::sync_list_anchored(&self.list_state, &self.row_sigs, &sigs, |key| key != ABOVE_HISTORY);
+        // Older history arriving above the message being read leaves it where it is on screen (`holds_place`).
+        let pin = feed_rows::sync_list_anchored(&self.list_state, &self.row_sigs, &sigs, holds_place);
         if let Some(pin) = pin {
             self.held = Some(Held { pin, since: std::time::Instant::now(), placed: None, viewport: px(0.) });
         } else if let Some(held) = &mut self.held {
