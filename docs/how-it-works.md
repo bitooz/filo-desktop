@@ -527,6 +527,14 @@ cloud worker: everything runs on this Mac.
   done; after 5 rounds only with `userSaidSo`), `stop_coding_task`, `answer_coding_request` and
   `ask_user_about_coding_request`. A brief that shouts (NOT, MUST…) or restates workspace or git rules is refused with
   why, and so is a second copy of work under way in the conversation unless `separate`.
+- **Reasoning level:** a task starts with its tool's level from the Coding page (also when `start_work` names only a
+  model), or the `effort` asked for. `effort` with `continues` or `tell_coding_task` changes it from the task's next
+  round (a round under way keeps its own; `default` is the Coding page's again); both tools say to pass it only when
+  the user asked, as a change can break the tool's prompt cache. Each round runs at the nearest level its model takes
+  (`Local::chat_effort`, saved on the task), and OpenCode, given a level without a model of the task's own, sets it as
+  the variant of its session's model. A task with no level reads as the one its tool runs the model at (Claude Code's
+  `modelSettings`/`effortLevel`, Codex's `model_reasoning_effort` or its catalogue's, Muse Code's, OpenCode's and pi's
+  model default), else "Default".
 - **Runs:** the MCP server only writes rows; the app's loop (`local_backend/handoff.rs`, every 0.7 s) starts queued
   tasks, applies Stop and sends wakes. A round keeps the tool talking (crates/filo-local `coding_session`): Claude Code
   with `--input-format stream-json --permission-prompt-tool stdio` (its `can_use_tool` requests and AskUserQuestion),

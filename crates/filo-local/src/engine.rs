@@ -689,6 +689,14 @@ pub fn codex_options() -> Vec<ModelOption> {
     codex_options_from(&catalogue, default.as_deref())
 }
 
+/// The reasoning level Codex's `config.toml` sets (`model_reasoning_effort`, the picked profile's first), whatever the
+/// model; none when it sets none.
+pub fn codex_config_effort() -> Option<String> {
+    std::fs::read_to_string(codex_home().join("config.toml"))
+        .ok()
+        .and_then(|config| codex_config_value(&config, "model_reasoning_effort"))
+}
+
 fn codex_options_from(catalogue: &[u8], default: Option<&str>) -> Vec<ModelOption> {
     let option = |model: Model| ModelOption {
         engine: Engine::Codex,

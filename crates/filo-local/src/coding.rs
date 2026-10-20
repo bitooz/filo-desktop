@@ -732,6 +732,12 @@ pub fn set_running(db: &Db, id: &str, now: i64) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The task's reasoning level from its next round (none: its tool's own); a round under way keeps the one it started
+/// with.
+pub fn set_effort(db: &Db, id: &str, effort: Option<&str>) -> Result<(), String> {
+    db.write(|tx| tx.execute("UPDATE coding_tasks SET effort = ?2 WHERE id = ?1", params![id, effort])).map(|_| ())
+}
+
 pub fn set_session(db: &Db, id: &str, session: &str) -> Result<(), String> {
     db.write(|tx| tx.execute("UPDATE coding_tasks SET session = ?2 WHERE id = ?1", params![id, session])).map(|_| ())
 }

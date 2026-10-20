@@ -164,6 +164,16 @@ impl Local {
         if let Some(session) = &new_session {
             coding::set_session(db, &id, session)?;
         }
+        // Its level (the Coding page's, or one asked for since) as the nearest its model takes, saved so its row shows
+        // what it runs at.
+        let model = task.model.clone().or_else(|| coding::run_model(db, &id).ok().flatten());
+        let effort = task
+            .effort
+            .as_deref()
+            .map(|level| self.chat_effort(engine, model.as_deref(), level).unwrap_or_else(|| level.to_string()));
+        if effort != task.effort {
+            coding::set_effort(db, &id, effort.as_deref())?;
+        }
         let spec = coding_session::Spec {
             engine,
             program,
@@ -175,7 +185,7 @@ impl Local {
             mode: task.mode.clone(),
             look_only: owner.look_only,
             model: task.model.clone(),
-            effort: task.effort.clone(),
+            effort,
             instructions: handoff::instructions(
                 &task,
                 &owner,
@@ -1083,6 +1093,52 @@ mod tests {
     /// A chat hands a task off: the loop starts it, the tool asks for permission and the chat is woken to answer; the
     /// user's tap answers it; the round ends with proof, and the chat is woken with the result, whose reply carries the
     /// round's Open proof.
+    #[test]
+    fn a_level_asked_for_since_is_the_next_rounds_as_the_nearest_its_model_takes() {
+        let local = temp();
+        let folder = local.root.join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let args = local.root.join("args.txt");
+        // Notes how it was run, and is done.
+        let fake = script(
+            &local.root,
+            "claude",
+            &format!(
+                r#"#!/bin/sh
+echo "$@" >> '{}'
+read init
+read message
+echo '{{"type":"system","subtype":"init","session_id":"s-1"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"Done.","session_id":"s-1"}}'
+read rest
+"#,
+                args.display()
+            ),
+        );
+        local.set_coding_program("claude-code", fake);
+        let chat = local.agent_chats.create_chat(Engine::Claude).unwrap();
+        let task = hand_off(&local, &chat.id, None, &folder);
+        let db = local.db().unwrap();
+        let round = |rounds: i64| {
+            local.handoff_tick();
+            wait_for("the round's end", || {
+                let task = coding::task(db, &task.id).unwrap().unwrap();
+                task.status == "done" && task.rounds == rounds && !local.coding_round_running(&task.id)
+            });
+        };
+        round(1);
+        // Ultra, which Claude Code doesn't take, from the next round: it runs at Max, and its row says so.
+        coding::set_effort(db, &task.id, Some("ultra")).unwrap();
+        coding::follow_up(db, &task.id, "Once more", 5).unwrap();
+        round(2);
+        let runs = std::fs::read_to_string(&args).unwrap();
+        let runs: Vec<&str> = runs.lines().collect();
+        assert!(!runs[0].contains("--effort"), "{}", runs[0]);
+        assert!(runs[1].contains("--effort max"), "{}", runs[1]);
+        assert_eq!(coding::task(db, &task.id).unwrap().unwrap().effort.as_deref(), Some("max"));
+        assert_eq!(call(&local, "coding:tasks", json!({})).unwrap()[0]["reasoning"], "Max");
+    }
+
     #[test]
     fn a_chat_hears_its_tasks_question_and_result() {
         let local = temp();

@@ -226,11 +226,13 @@ impl Local {
                 self.db().and_then(|db| {
                     let tasks = coding::tasks(db, limit)?;
                     let models = self.all_model_options();
+                    let levels = DefaultLevels::default();
                     let pending = filo_local::coding_handoff::pending_counts(db)?;
                     let now = now_ms();
                     let row = |task: &Task| {
                         let pending = pending.get(&task.id).copied().unwrap_or(0);
-                        let mut row = task_row(task, coding::run_model(db, &task.id).ok().flatten(), &models, pending);
+                        let run_model = coding::run_model(db, &task.id).ok().flatten();
+                        let mut row = task_row(task, run_model, &models, &levels, pending);
                         if let Some(worked) = filo_local::coding_handoff::worked_ms(db, &task.id)? {
                             row["workedMs"] = json!(worked as f64);
                         }
@@ -464,7 +466,7 @@ impl Local {
         let run_model = coding::run_model(db, &task.id)?;
         let pending = filo_local::coding_handoff::pending_counts(db)?.get(&task.id).copied().unwrap_or(0);
         Ok(
-            json!({ "task": task_row(&task, run_model, &self.all_model_options(), pending), "now": task.status, "entries": entries }),
+            json!({ "task": task_row(&task, run_model, &self.all_model_options(), &DefaultLevels::default(), pending), "now": task.status, "entries": entries }),
         )
     }
 
@@ -813,11 +815,24 @@ const PAGE_TASK: &str = "An older Filo started this task on the Coding page, and
 
 /// The page's row for a task: the model's name (from the picker's rows, `Local::model_options`) and the reasoning level
 /// as they read. The model is the one the tool said it started on (`run_model`), else the one chosen for the task; none
-/// when neither is known, as its tool's current default may not be what the task got (`codingTaskRunsWith`). `pending`:
-/// its requests still waiting on an answer.
-fn task_row(task: &Task, run_model: Option<String>, models: &[engine::ModelOption], pending: usize) -> Value {
+/// when neither is known, as its tool's current default may not be what the task got (`codingTaskRunsWith`). The level
+/// is the task's, else the one its tool runs the model at (`DefaultLevels`), else "Default". `pending`: its requests
+/// still waiting on an answer.
+fn task_row(
+    task: &Task,
+    run_model: Option<String>,
+    models: &[engine::ModelOption],
+    levels: &DefaultLevels,
+    pending: usize,
+) -> Value {
     let engine = coding::engine_of(&task.tool);
-    let model = run_model.or_else(|| task.model.clone()).map(|id| match engine {
+    let model_id = run_model.or_else(|| task.model.clone());
+    let reasoning = task
+        .effort
+        .clone()
+        .or_else(|| levels.of(engine, model_id.as_deref()))
+        .map_or_else(|| "Default".to_string(), |level| effort_label(&level));
+    let model = model_id.map(|id| match engine {
         Some(Engine::Muse | Engine::OpenCode | Engine::Pi) => {
             tool_models(&task.tool).into_iter().find(|model| model.id == id).map_or(id, |model| model.name)
         }
@@ -826,8 +841,44 @@ fn task_row(task: &Task, run_model: Option<String>, models: &[engine::ModelOptio
             .find(|option| Some(option.engine) == engine && option.matches(&id))
             .map_or_else(|| coding::model_label(&id), |option| option.label.clone()),
     });
-    let reasoning = task.effort.as_deref().map_or_else(|| "Default".to_string(), effort_label);
     coding::task_json(task, model, reasoning, pending)
+}
+
+/// The level each tool runs a model at when it's given none, its files read once for a page of tasks: Claude Code's
+/// settings (the model's `modelSettings` level, else `effortLevel`), Codex's `config.toml` level, else its catalogue's
+/// for the model, and what Muse Code, OpenCode and pi said of the model (else of their default one).
+#[derive(Default)]
+struct DefaultLevels {
+    claude: std::cell::OnceCell<Value>,
+    codex: std::cell::OnceCell<(Option<String>, HashMap<String, (Vec<String>, Option<String>)>)>,
+}
+
+impl DefaultLevels {
+    fn of(&self, engine: Option<Engine>, model: Option<&str>) -> Option<String> {
+        match engine? {
+            Engine::Claude => {
+                let settings = self.claude.get_or_init(|| {
+                    dirs::home_dir()
+                        .and_then(|home| std::fs::read(home.join(".claude/settings.json")).ok())
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .unwrap_or_default()
+                });
+                claude_level(settings, model)
+            }
+            Engine::Codex => {
+                let (config, catalogue) = self.codex.get_or_init(|| (engine::codex_config_effort(), codex_efforts()));
+                config.clone().or_else(|| catalogue.get(model?)?.1.clone())
+            }
+            tool @ (Engine::Muse | Engine::OpenCode | Engine::Pi) => {
+                let models = tool_models(coding::tool_of(tool));
+                let found = match model {
+                    Some(id) => models.iter().find(|row| row.id == id),
+                    None => models.iter().find(|row| row.is_default),
+                };
+                found?.default_effort.clone()
+            }
+        }
+    }
 }
 
 /// How a reasoning level reads, and the levels in order (crates/filo-local coding.rs, which `start_work` takes too).
@@ -942,6 +993,17 @@ fn codex_efforts() -> HashMap<String, (Vec<String>, Option<String>)> {
             ))
         })
         .collect()
+}
+
+/// The level Claude Code's `settings` give `model`: its own under `modelSettings` (keyed by its full name, which its
+/// dated and [1m] names start with and its alias is in), else `effortLevel`.
+fn claude_level(settings: &Value, model: Option<&str>) -> Option<String> {
+    let for_model = model.and_then(|model| {
+        settings["modelSettings"].as_object()?.iter().find_map(|(name, set)| {
+            (model.starts_with(name.as_str()) || name.contains(model)).then(|| set["effortLevel"].as_str())?
+        })
+    });
+    for_model.or(settings["effortLevel"].as_str()).map(str::to_string)
 }
 
 /// `level` when `offered` has it, else the nearest below it there, else the lowest there; none from an empty `offered`.
@@ -1786,6 +1848,13 @@ read rest
         assert_eq!(nearest_effort("low", &levels(&["medium", "high"])).as_deref(), Some("medium"));
         // Levels it doesn't know, or none to pick from: nothing.
         assert_eq!(nearest_effort("high", &[]), None);
+        // What Claude Code runs a model at without --effort: its own level, else the one for all, else not known.
+        let settings =
+            json!({ "effortLevel": "medium", "modelSettings": { "claude-opus-5-5": { "effortLevel": "xhigh" } } });
+        assert_eq!(claude_level(&settings, Some("claude-opus-5-5[1m]")).as_deref(), Some("xhigh"));
+        assert_eq!(claude_level(&settings, Some("opus")).as_deref(), Some("xhigh"));
+        assert_eq!(claude_level(&settings, Some("haiku")).as_deref(), Some("medium"));
+        assert_eq!(claude_level(&json!({}), Some("opus")), None);
         assert_eq!(nearest_effort("high", &levels(&["turbo"])), None);
         let local = temp();
         assert_eq!(local.chat_effort(Engine::Claude, Some("opus"), "max").as_deref(), Some("max"));

@@ -42,6 +42,7 @@ pub fn handles(name: &str) -> bool {
 
 pub fn tools() -> Vec<Value> {
     let id = json!({ "type": "string", "description": "The task's id (taskId), as start_work or watch_coding_task gave it." });
+    let effort = json!({ "type": "string", "enum": std::iter::once("default").chain(crate::coding::EFFORT_ORDER).collect::<Vec<_>>(), "description": "Only when the user asked for a reasoning level. With continues or tell_coding_task, the task's level from its next round." });
     vec![
         json!({
             "name": "list_coding_projects",
@@ -60,7 +61,7 @@ pub fn tools() -> Vec<Value> {
             "description": "Hands work in one of the user's projects to a coding tool on their Mac (Claude Code, Codex, Muse Code, OpenCode or pi): their code, a review of it, research inside it. Do small things yourself; hand work off when it needs the project (editing code, running it, its tests) or would take a while. One piece of work per task: two unrelated asks are two hand-offs. \
         Say what the work is, not how to do it: title (a few words for its row), goal (the outcome in one line, in the user's terms), doneWhen (what finished looks like, in a sentence; name a check only when it is the point, like a failing test that should pass), and changes (false when it only looks: investigate, review, research; it then can't edit anything). notes, when needed at all, is a line or two it can't learn from the code or the goal (where the problem shows, what must stay as it is): never workspace, git, permission or testing rules, which it already has. Write plainly, in sentence case: capitalised words for emphasis are refused. Name a file the user sent where it matters, by its path on their Mac. \
         project is a project's name from list_coding_projects or the full path of any folder. tool is claude-code, codex, muse (Muse Code), opencode (OpenCode) or pi: the one the user named, else leave it out for your own engine. model, effort and workspace follow the Coding page's settings: pass them only when the user asked (workspace \"worktree\": its own branch in its own worktree; \"checkout\": their folder as it is). \
-        To add to a task already under way or finished, pass its id as continues (the next round in the same session) instead of starting it again; a hand-off that looks like one under way in this conversation is refused unless you pass separate: true. \
+        To add to a task already under way or finished, pass its id as continues (the next round in the same session) instead of starting it again; a hand-off that looks like one under way in this conversation is refused unless you pass separate: true. With continues, effort changes the task's reasoning level from its next round (a round under way keeps its own): pass it only when the user asked for a different level, as a change can break the tool's prompt cache. \
         You are told in this conversation, in a turn of its own, when the tool asks something or finishes a round. Tell the user in a line that it started; don't check on it unless they ask.",
             "inputSchema": {
                 "type": "object",
@@ -73,7 +74,7 @@ pub fn tools() -> Vec<Value> {
                     "notes": { "type": "string", "description": "Optional: a line or two it can't learn from the code or the goal." },
                     "tool": { "type": "string", "enum": ["default", "claude-code", "codex", "muse", "opencode", "pi"], "description": "The coding tool: the one the user named; default (or left out) is your own engine." },
                     "model": { "type": "string", "description": "Only when the user asked for a model." },
-                    "effort": { "type": "string", "enum": std::iter::once("default").chain(crate::coding::EFFORT_ORDER).collect::<Vec<_>>(), "description": "Only when the user asked for a reasoning level." },
+                    "effort": effort,
                     "workspace": { "type": "string", "enum": ["default", "worktree", "checkout"], "description": "Only when the user said where the work goes." },
                     "continues": { "type": "string", "description": "A task's id to add this to as its next round, instead of starting a new task." },
                     "separate": { "type": "boolean", "description": "True when this is different work from a similar task under way here." },
@@ -94,10 +95,15 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tell_coding_task",
             "title": "Tell coding task",
-            "description": "Says something short to the tool, in its thread: a sentence or two, never the brief or its rules again. While it works, it reads your note at its next step: steer it, add something it needs, or correct it. Once a round has finished, your message starts the next round in the same session. After 5 rounds ask the user whether to keep going, and pass userSaidSo once they say yes.",
+            "description": "Says something short to the tool, in its thread: a sentence or two, never the brief or its rules again. While it works, it reads your note at its next step: steer it, add something it needs, or correct it. Once a round has finished, your message starts the next round in the same session. After 5 rounds ask the user whether to keep going, and pass userSaidSo once they say yes. effort changes the task's reasoning level from its next round (a round under way keeps its own): pass it only when the user asked for a different level, as a change can break the tool's prompt cache.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": id, "message": { "type": "string" }, "userSaidSo": { "type": "boolean" } },
+                "properties": {
+                    "taskId": id,
+                    "message": { "type": "string" },
+                    "userSaidSo": { "type": "boolean" },
+                    "effort": effort.clone()
+                },
                 "required": ["taskId", "message"],
                 "additionalProperties": false
             },
@@ -203,6 +209,19 @@ fn chosen<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     text(args, key).filter(|value| *value != "default")
 }
 
+/// The reasoning level asked for with continues or tell_coding_task: none when it isn't, `Some(None)` for the Coding
+/// page's (`default`), else the level.
+fn effort_change(args: &Value) -> Result<Option<Option<String>>, String> {
+    match text(args, "effort") {
+        None => Ok(None),
+        Some("default") => Ok(Some(None)),
+        Some(level) if crate::coding::EFFORT_ORDER.contains(&level) => Ok(Some(Some(level.to_string()))),
+        Some(other) => {
+            Err(format!("effort is default or one of {}, not {other}.", crate::coding::EFFORT_ORDER.join(", ")))
+        }
+    }
+}
+
 pub fn call(target: &Target, name: &str, args: &Value) -> Result<String, String> {
     let db = Db::open(&target.db).map_err(|error| format!("Filo's database couldn't open: {error}"))?;
     let now = crate::now_ms() as i64;
@@ -218,7 +237,8 @@ pub fn call(target: &Target, name: &str, args: &Value) -> Result<String, String>
                         required(args, "doneWhen")?,
                         text(args, "notes"),
                     );
-                    continue_task(&db, &origin, task_id, &message, flag(args, "userSaidSo"), now)
+                    let effort = effort_change(args)?;
+                    continue_task(&db, &origin, task_id, &message, effort, flag(args, "userSaidSo"), now)
                         .map(|done| asked(&db, target, done, now))
                         .map(reply)
                 }
@@ -237,6 +257,7 @@ pub fn call(target: &Target, name: &str, args: &Value) -> Result<String, String>
                 &origin,
                 required(args, "taskId")?,
                 required(args, "message")?,
+                effort_change(args)?,
                 flag(args, "userSaidSo"),
                 now,
             )
@@ -531,12 +552,14 @@ fn same_work(a: &str, b: &str) -> bool {
     a.intersection(&b).count() * 4 >= a.union(&b).count() * 3
 }
 
-/// More for a task: a note while it works, its next round once it's done.
+/// More for a task: a note while it works, its next round once it's done. `effort` (`effort_change`) is its reasoning
+/// level from its next round on: a round under way keeps the one it started with.
 fn continue_task(
     db: &Db,
     origin: &Origin,
     task_id: &str,
     message: &str,
+    effort: Option<Option<String>>,
     user_said_so: bool,
     now: i64,
 ) -> Result<Value, String> {
@@ -544,28 +567,43 @@ fn continue_task(
     if let Some(problem) = handoff::brief_problem("", message, "", None) {
         return Err(problem);
     }
+    let finished = coding::is_finished(&task.status);
+    if finished && task.rounds >= handoff::MAX_ROUNDS && !user_said_so {
+        return Err(format!(
+            "It has run {} rounds. Ask the user whether to keep going, then pass userSaidSo: true.",
+            task.rounds
+        ));
+    }
     if handoff::get(db, &task.id)?.is_none() {
         handoff::adopt(db, &task, &origin.chat_id, origin.agent_id.as_deref(), origin.speaker.as_deref(), now)?;
     }
-    if !coding::is_finished(&task.status) {
+    let effort = match effort {
+        Some(None) => Some(coding::tool(db, &task.tool)?.effort),
+        asked => asked,
+    };
+    let level = match effort.filter(|effort| *effort != task.effort) {
+        Some(effort) => {
+            coding::set_effort(db, &task.id, effort.as_deref())?;
+            let level = effort.as_deref().map_or_else(|| "its tool's own level".to_string(), coding::effort_label);
+            format!(" It thinks at {level} from its next round.")
+        }
+        None => String::new(),
+    };
+    if !finished {
         handoff::add_note(db, &task.id, message, now)?;
         let note = if task.status == "monitoring" {
             "It's waiting on background work: your note reaches it now, and it carries on with it."
         } else {
             "It's working: it reads your note at its next step."
         };
-        return Ok(json!({ "ok": true, "taskId": task.id, "note": note }));
-    }
-    if task.rounds >= handoff::MAX_ROUNDS && !user_said_so {
-        return Err(format!(
-            "It has run {} rounds. Ask the user whether to keep going, then pass userSaidSo: true.",
-            task.rounds
-        ));
+        return Ok(json!({ "ok": true, "taskId": task.id, "note": format!("{note}{level}") }));
     }
     coding::follow_up(db, &task.id, message, now)?;
-    Ok(
-        json!({ "ok": true, "taskId": task.id, "note": "Sent as its next round, in the same session. You'll be told here when it asks something or finishes." }),
-    )
+    Ok(json!({
+        "ok": true,
+        "taskId": task.id,
+        "note": format!("Sent as its next round, in the same session.{level} You'll be told here when it asks something or finishes."),
+    }))
 }
 
 #[cfg(test)]
@@ -704,6 +742,65 @@ mod tests {
             tools,
             [("Claude Code", true), ("Codex", true), ("Muse Code", false), ("OpenCode", false), ("pi", false)]
         );
+        drop(db);
+        std::fs::remove_dir_all(store.root()).ok();
+    }
+
+    #[test]
+    fn a_level_asked_for_with_continues_or_a_message_is_the_tasks_from_its_next_round() {
+        let store = temp_store("coding-mcp-effort");
+        let chat = store.create_chat(Engine::Claude).unwrap();
+        let target = target(&store, &chat.id);
+        let db = Db::open(&target.db).unwrap();
+        let folder = store.root().join("app");
+        std::fs::create_dir_all(&folder).unwrap();
+        coding::update_tool(&db, "claude-code", |tool| {
+            tool.effort = Some("high".into());
+            Ok(())
+        })
+        .unwrap();
+        let started = reply(call(
+            &target,
+            "start_work",
+            &json!({ "title": "Wrap table text", "goal": "Long table cells wrap", "doneWhen": "A long cell wraps", "changes": true, "project": folder.display().to_string() }),
+        ));
+        let id = started["taskId"].as_str().unwrap().to_string();
+        let effort = || coding::task(&db, &id).unwrap().unwrap().effort;
+        assert_eq!(effort().as_deref(), Some("high"));
+        // While it works: saved for its next round, and the note says so.
+        let told = reply(call(
+            &target,
+            "tell_coding_task",
+            &json!({ "taskId": id, "message": "Think it through", "effort": "max" }),
+        ));
+        assert!(told["note"].as_str().unwrap().contains("Max from its next round"), "{told}");
+        assert_eq!(effort().as_deref(), Some("max"));
+        assert_eq!(handoff::undelivered_notes(&db, &id).unwrap().len(), 1);
+        // With continues once it's done; default is the Coding page's again; none leaves it as it is.
+        coding::finish_round(&db, &id, "done", None, Some("Done"), 5).unwrap();
+        let next = |effort: Option<&str>| {
+            let mut args = json!({ "continues": id, "title": "More", "goal": "Also the footer", "doneWhen": "The footer wraps", "changes": true });
+            if let Some(effort) = effort {
+                args["effort"] = json!(effort);
+            }
+            call(&target, "start_work", &args)
+        };
+        assert!(next(Some("turbo")).unwrap_err().contains("not turbo"));
+        assert_eq!(effort().as_deref(), Some("max"));
+        let sent = reply(next(Some("low")));
+        assert!(sent["note"].as_str().unwrap().contains("Low from its next round"), "{sent}");
+        assert_eq!(effort().as_deref(), Some("low"));
+        coding::finish_round(&db, &id, "done", None, Some("Done"), 6).unwrap();
+        reply(next(Some("default")));
+        assert_eq!(effort().as_deref(), Some("high"));
+        coding::finish_round(&db, &id, "done", None, Some("Done"), 7).unwrap();
+        let same = reply(next(None));
+        assert!(!same["note"].as_str().unwrap().contains("thinks at"), "{same}");
+        assert_eq!(effort().as_deref(), Some("high"));
+        // Refused after five rounds without the user's yes: the level stays as it was.
+        db.write(|tx| tx.execute("UPDATE coding_tasks SET status = 'done', rounds = 5 WHERE id = ?1", [&id])).unwrap();
+        assert!(next(Some("low")).unwrap_err().contains("userSaidSo"));
+        assert_eq!(effort().as_deref(), Some("high"));
         drop(db);
         std::fs::remove_dir_all(store.root()).ok();
     }

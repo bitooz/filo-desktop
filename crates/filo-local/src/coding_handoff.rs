@@ -191,8 +191,9 @@ pub fn create(db: &Db, task_id: &str, new: &NewHandoff, now: i64) -> Result<Task
             ],
         )?;
         tx.execute("UPDATE coding_tasks SET title = ?2 WHERE id = ?1", params![task_id, coding::title_of(&new.title)])?;
+        // A model alone keeps the Coding page's level, which its rounds move to the nearest the model takes.
         if new.model.is_some() {
-            tx.execute("UPDATE coding_tasks SET model = ?2, effort = NULL WHERE id = ?1", params![task_id, new.model])?;
+            tx.execute("UPDATE coding_tasks SET model = ?2 WHERE id = ?1", params![task_id, new.model])?;
         }
         if new.effort.is_some() {
             tx.execute("UPDATE coding_tasks SET effort = ?2 WHERE id = ?1", params![task_id, new.effort])?;
@@ -1551,6 +1552,21 @@ mod tests {
     use super::*;
     use crate::coding::{NewTask, Project};
 
+    fn new_handoff(chat: &str) -> NewHandoff {
+        NewHandoff {
+            chat_id: chat.into(),
+            agent_id: None,
+            speaker: None,
+            title: "Wrap table text".into(),
+            goal: "Tables wrap long text".into(),
+            done_when: "A long cell wraps".into(),
+            notes: None,
+            look_only: false,
+            model: Some("haiku".into()),
+            effort: Some("low".into()),
+        }
+    }
+
     pub(crate) fn task_with_handoff(db: &Db, chat: &str) -> (Task, Handoff) {
         let project = Project {
             name: "app".into(),
@@ -1567,19 +1583,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let new = NewHandoff {
-            chat_id: chat.into(),
-            agent_id: None,
-            speaker: None,
-            title: "Wrap table text".into(),
-            goal: "Tables wrap long text".into(),
-            done_when: "A long cell wraps".into(),
-            notes: None,
-            look_only: false,
-            model: Some("haiku".into()),
-            effort: Some("low".into()),
-        };
-        let task = create(db, &task.id, &new, 2).unwrap();
+        let task = create(db, &task.id, &new_handoff(chat), 2).unwrap();
         let handoff = get(db, &task.id).unwrap().unwrap();
         (task, handoff)
     }
@@ -1623,9 +1627,38 @@ mod tests {
             ("Wrap table text", Some("haiku"), Some("low"), "queued")
         );
         assert_eq!(handoff.chat_id, "chat-1");
-        assert_eq!(for_chat(&db, "chat-1").unwrap().len(), 1);
+        // A model alone keeps the level the task got from the Coding page.
+        coding::update_tool(&db, "claude-code", |tool| {
+            tool.effort = Some("high".into());
+            Ok(())
+        })
+        .unwrap();
+        let brief = render_brief("Tables wrap long text", "A long cell wraps", None);
+        let paged = coding::create_task(
+            &db,
+            &NewTask {
+                brief,
+                tool: "claude-code".into(),
+                project: Project {
+                    name: "app".into(),
+                    path: "/p/app".into(),
+                    branch: None,
+                    remote: None,
+                    plain_folder: true,
+                    added: true,
+                },
+                worktree: false,
+                owner: "Filo".into(),
+            },
+            3,
+        )
+        .unwrap();
+        let only_model = NewHandoff { model: Some("opus".into()), effort: None, ..new_handoff("chat-1") };
+        let paged = create(&db, &paged.id, &only_model, 3).unwrap();
+        assert_eq!((paged.model.as_deref(), paged.effort.as_deref()), (Some("opus"), Some("high")));
+        assert_eq!(for_chat(&db, "chat-1").unwrap().len(), 2);
         assert!(for_chat(&db, "chat-2").unwrap().is_empty());
-        assert_eq!(unfinished(&db).unwrap().len(), 1);
+        assert_eq!(unfinished(&db).unwrap().len(), 2);
         request_stop(&db, &task.id).unwrap();
         assert_eq!(take_stop_requests(&db).unwrap(), [task.id.clone()]);
         assert!(take_stop_requests(&db).unwrap().is_empty());

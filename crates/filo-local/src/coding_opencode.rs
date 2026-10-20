@@ -4,7 +4,8 @@
 //
 // - `GET /api/event`: every event as server-sent events, read on a thread of its own; this round's carry its session.
 // - `POST /api/session` in the task's folder, with its model and permission rules (or `GET /api/session/<id>` to carry
-//   on in the task's session), then `POST /api/session/<id>/prompt` with the message.
+//   on in the task's session), then `POST /api/session/<id>/prompt` with the message. A level without a model of the
+//   task's own goes on as the variant of the session's model (`POST /api/session/<id>/model`).
 // - What it does: `session.tool.input.started` (a tool's name), `session.tool.called` (its input),
 //   `session.tool.success` / `.failed`, `session.text.ended` (each message, whole).
 // - A permission it needs: `permission.asked`, answered with `POST …/permission/<id>/reply` (once, always or reject).
@@ -141,6 +142,17 @@ fn model_ref(model: &str, effort: Option<&str>) -> Option<Value> {
         reference["variant"] = json!(variant);
     }
     Some(reference)
+}
+
+/// The task's reasoning level as the variant of the model `session` (OpenCode's) has, when the task names no model of
+/// its own (`model_ref` carries it then): none when the session has that variant already, or no model.
+fn level_of(spec: &Spec, session: &Value) -> Option<Value> {
+    let effort = spec.effort.as_deref().filter(|_| spec.model.is_none())?;
+    let model = &session["model"];
+    if model["variant"].as_str() == Some(effort) {
+        return None;
+    }
+    Some(json!({ "providerID": model["providerID"].as_str()?, "id": model["id"].as_str()?, "variant": effort }))
 }
 
 /// What it asked, waiting on answers.
@@ -341,20 +353,11 @@ impl<'a> Talk<'a> {
         let model = self.spec.model.as_deref().and_then(|model| model_ref(model, self.spec.effort.as_deref()));
         if let Some(session) = self.spec.resume.clone() {
             match self.call(reqwest::Method::GET, &format!("/api/session/{session}"), None) {
-                Ok(_) => {
+                Ok(found) => {
                     self.session = Some(session.clone());
                     host.session(&session);
-                    if let Some(model) = model
-                        && let Err(why) = self.call(
-                            reqwest::Method::POST,
-                            &format!("/api/session/{session}/model"),
-                            Some(json!({ "model": model })),
-                        )
-                    {
-                        host.step(Step::marker(
-                            "note",
-                            format!("OpenCode didn't take the model ({why}): it goes on with the session's"),
-                        ));
+                    if let Some(model) = model.or_else(|| level_of(self.spec, &found)) {
+                        self.set_model(&session, model, host);
                     }
                     let message = self.spec.message.clone();
                     let _ = self.prompt(&message, None);
@@ -378,12 +381,26 @@ impl<'a> Talk<'a> {
                     let id = id.to_string();
                     self.session = Some(id.clone());
                     host.session(&id);
+                    if let Some(model) = level_of(self.spec, &session) {
+                        self.set_model(&id, model, host);
+                    }
                     let message = format!("{}\n\n{}", self.spec.instructions, self.spec.message);
                     let _ = self.prompt(&message, None);
                 }
                 None => self.fail("OpenCode didn't start a session.".into()),
             },
             Err(why) => self.fail(format!("OpenCode: {why}")),
+        }
+    }
+
+    /// The session's model from here on; one OpenCode doesn't take leaves it on the session's.
+    fn set_model(&mut self, session: &str, model: Value, host: &mut dyn Host) {
+        let set = json!({ "model": model });
+        if let Err(why) = self.call(reqwest::Method::POST, &format!("/api/session/{session}/model"), Some(set)) {
+            host.step(Step::marker(
+                "note",
+                format!("OpenCode didn't take the model ({why}): it goes on with the session's"),
+            ));
         }
     }
 
@@ -1084,6 +1101,21 @@ mod tests {
         );
         assert_eq!(model_ref("cline-pass/glm", Some("max")).unwrap()["variant"], "max");
         assert_eq!(model_ref("no-provider", None), None);
+        // A level without a model of the task's own: the session's model at that variant, unless it's on it already.
+        let session = json!({ "model": { "providerID": "opencode", "id": "space-bunny-free", "variant": "xhigh" } });
+        let mut leveled = spec("full_access", false);
+        assert_eq!(level_of(&leveled, &session), None);
+        leveled.effort = Some("low".into());
+        assert_eq!(
+            level_of(&leveled, &session),
+            Some(json!({ "providerID": "opencode", "id": "space-bunny-free", "variant": "low" }))
+        );
+        leveled.effort = Some("xhigh".into());
+        assert_eq!(level_of(&leveled, &session), None);
+        assert_eq!(level_of(&leveled, &json!({ "model": null })), None);
+        leveled.model = Some("opencode/space-bunny-free".into());
+        leveled.effort = Some("low".into());
+        assert_eq!(level_of(&leveled, &session), None);
 
         let model = |provider: &str, id: &str, name: &str, cost: f64| json!({ "providerID": provider, "id": id, "name": name, "enabled": true, "variants": [{ "id": "default" }, { "id": "high" }], "cost": [{ "input": cost, "output": cost }] });
         let all = json!([
