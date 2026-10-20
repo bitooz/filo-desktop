@@ -579,6 +579,10 @@ impl Protocol for Talk<'_> {
         self.finished
     }
 
+    fn holding(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     fn close(&mut self) {
         self.pipe.close();
     }

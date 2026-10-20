@@ -54,8 +54,6 @@ pub(super) const NEWS_THREAD: &str = "coding-";
 
 /// How often the loop looks for work.
 const LOOK_EVERY: Duration = Duration::from_millis(700);
-/// A round that runs longer is stopped (waiting on an answer included).
-const ROUND_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 /// `coding:trayTasks` lists tasks finished this recently (the pet keeps them up for less).
 const TRAY_FINISHED_MS: i64 = 10 * 60 * 1000;
 
@@ -186,7 +184,8 @@ impl Local {
                 &self.agent_chats.skill_folder(filo_local::skills::ARTIFACTS_NAME),
             ),
             writable: vec![proof.clone()],
-            timeout: ROUND_TIMEOUT,
+            // No time in all: it's stopped only once its tool has gone quiet for this long, not waiting on anything.
+            timeout: filo_local::turn::HUNG_AFTER,
             servers: Vec::new(),
             skills: None,
             chat: false,

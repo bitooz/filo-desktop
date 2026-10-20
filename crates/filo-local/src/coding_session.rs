@@ -339,8 +339,8 @@ pub struct Spec {
     pub instructions: String,
     /// Folders it may write in besides its own (the round's proof folder).
     pub writable: Vec<PathBuf>,
-    /// A round is stopped after this long in all; a chat turn, which takes as long as its work does, once nothing has
-    /// come from the tool for this long (it has hung).
+    /// It takes as long as its work does, and is stopped once nothing has come from the tool for this long (it has
+    /// hung). A coding round's clock doesn't run while the tool waits on an answer or on its background work.
     pub timeout: Duration,
     /// MCP servers it gets (a chat's: Filo's and the user's apps; none for a coding task). Muse Code and OpenCode only.
     pub servers: Vec<crate::engine::McpServer>,
@@ -572,14 +572,8 @@ pub fn run(spec: &Spec, host: &mut dyn Host, on_start: impl FnOnce(Stopper)) -> 
     end.stopped = stopper.is_stopped() && !timed_out && !talk.finished();
     if end.stopped {
         end.error = None;
-    } else if timed_out && spec.chat {
-        end.error = Some(crate::engine::hung_error(spec.engine, spec.timeout));
     } else if timed_out {
-        end.error = Some(format!(
-            "{} took longer than {} minutes and was stopped.",
-            spec.engine.label(),
-            spec.timeout.as_secs() / 60
-        ));
+        end.error = Some(crate::engine::hung_error(spec.engine, spec.timeout));
     } else if end.error.is_none() && !talk.finished() {
         let code =
             status.and_then(|status| status.code()).map_or("a signal".to_string(), |code| format!("status {code}"));
@@ -616,7 +610,7 @@ impl crate::engine::Conversation for Round<'_, '_> {
         }
         self.host.line(line);
         self.talk.line(line, self.host);
-        self.chat
+        true
     }
 
     fn look(&mut self) -> bool {
@@ -624,8 +618,8 @@ impl crate::engine::Conversation for Round<'_, '_> {
             self.stopper.stop();
         }
         self.talk.look(self.host);
-        // It carried on after background work: the follow-up gets the round's time again.
-        self.talk.carried_on() || (self.chat && self.talk.heard())
+        // A coding round's tool is quiet while it waits on an answer or on its background work: that isn't hanging.
+        self.talk.carried_on() || self.talk.heard() || (!self.chat && self.talk.holding())
     }
 
     fn finished(&self) -> bool {
@@ -652,11 +646,13 @@ pub(crate) trait Protocol {
     fn carried_on(&mut self) -> bool {
         false
     }
-    /// Something of the round's came from it since last asked other than a line of its output (OpenCode's events): a
-    /// chat turn's deadline starts again.
+    /// Something of the round's came from it since last asked other than a line of its output (OpenCode's events): the
+    /// deadline starts again.
     fn heard(&mut self) -> bool {
         false
     }
+    /// It's quiet for a reason: what it asked waits on an answer, or its turn ended with background work going.
+    fn holding(&self) -> bool;
     fn close(&mut self);
     /// How the round ended, from what it said.
     fn end(&mut self) -> End;
@@ -684,6 +680,10 @@ impl Protocol for Talk<'_> {
 
     fn carried_on(&mut self) -> bool {
         std::mem::take(&mut self.carried_on)
+    }
+
+    fn holding(&self) -> bool {
+        !self.waiting.is_empty() || self.monitoring
     }
 
     fn close(&mut self) {
@@ -1660,6 +1660,9 @@ mod tests {
         stop: bool,
         /// Set once something is asked.
         on_ask: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Answers come this long after the last ask.
+        answer_after: Duration,
+        asked_at: Option<Instant>,
         /// Each turn that ended with background work going: what it said, and what it waited on.
         background: Vec<(Option<String>, Vec<String>)>,
         /// Each time it carried on after waiting, with why.
@@ -1677,12 +1680,16 @@ mod tests {
         }
         fn ask(&mut self, ask: &Ask) -> String {
             self.asks.push(ask.clone());
+            self.asked_at = Some(Instant::now());
             if let Some(flag) = &self.on_ask {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             format!("ask-{}", self.asks.len())
         }
         fn answer(&mut self, key: &str) -> Option<String> {
+            if self.asked_at.is_some_and(|at| at.elapsed() < self.answer_after) {
+                return None;
+            }
             self.answers.get(key).cloned()
         }
         fn notes(&mut self) -> Vec<String> {
@@ -2978,6 +2985,59 @@ read rest
         assert!(end.stopped && end.error.is_none(), "{end:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(host.asks.len(), 1);
+    }
+
+    /// A round takes as long as its work: a tool that keeps talking runs past its timeout, and one that waits on an
+    /// answer for longer is waited for. Only a tool that goes quiet waiting on nothing is stopped, as stuck.
+    #[test]
+    fn a_round_has_no_time_in_all_but_a_quiet_tool_is_stopped() {
+        let dir = crate::test_support::temp_dir("session-quiet");
+        let talking = script(
+            &dir,
+            "claude",
+            r#"#!/bin/sh
+read init
+read message
+echo '{"type":"system","subtype":"init","session_id":"s-new"}'
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]},"parent_tool_use_id":null}'
+  sleep 0.5
+done
+echo '{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"npm test"},"tool_use_id":"tu-1"}}'
+read answer
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"s-new"}'
+read rest
+"#,
+        );
+        let mut round = spec(Engine::Claude, talking, &dir);
+        round.timeout = Duration::from_secs(2);
+        let mut host = Recorder { answer_after: Duration::from_secs(5), ..Recorder::default() };
+        host.answers.insert("ask-1".into(), "allow".into());
+        let started = Instant::now();
+        let end = run(&round, &mut host, |_| {});
+        assert_eq!((end.error.as_deref(), end.final_text.as_deref(), end.timed_out), (None, Some("Done"), false));
+        assert!(started.elapsed() >= Duration::from_secs(10), "{:?}", started.elapsed());
+
+        let quiet = script(
+            &dir,
+            "claude-quiet",
+            r#"#!/bin/sh
+read init
+read message
+echo '{"type":"system","subtype":"init","session_id":"s-new"}'
+sleep 30
+"#,
+        );
+        let mut round = spec(Engine::Claude, quiet, &dir);
+        round.timeout = Duration::from_secs(2);
+        let started = Instant::now();
+        let end = run(&round, &mut Recorder::default(), |_| {});
+        assert!(end.timed_out && !end.stopped, "{end:?}");
+        assert_eq!(
+            end.error.as_deref(),
+            Some("Claude Code seemed stuck: nothing came from it for 2 seconds, so it was stopped.")
+        );
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
     }
 
     /// The installed CLI doing a small task in a scratch folder in Supervised mode, so it has to ask: every ask is

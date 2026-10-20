@@ -729,6 +729,10 @@ impl Protocol for Talk<'_> {
         std::mem::take(&mut self.heard)
     }
 
+    fn holding(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     fn close(&mut self) {
         self.events = None;
         self.stdin = None;

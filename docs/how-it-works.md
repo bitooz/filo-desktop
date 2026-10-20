@@ -509,7 +509,9 @@ cloud worker: everything runs on this Mac.
   Codex through `codex app-server` (its approval and `requestUserInput` requests, `turn/steer` for notes). The task
   keeps its tool's mode from the Coding page (Auto or Full access), and `changes: false` takes
   away the edit tools (Claude Code) or gives a read-only sandbox (Codex). Each round gets a proof folder,
-  `local/coding/proof/<task>/round-<n>`, where the tool is told to save screenshots, recordings or logs.
+  `local/coding/proof/<task>/round-<n>`, where the tool is told to save screenshots, recordings or logs. A round has no
+  time limit: it's stopped only when nothing has come from the tool for 30 minutes (`turn::HUNG_AFTER`, "seemed
+  stuck"), a clock that doesn't run while the tool waits on an answer or on its background work.
 - **Background work:** a turn that ends with work still running in the background (a build, a Monitor) leaves the task
   Monitoring and the tool running; it picks the task back up when that work ends. A command that never ends on its own
   (`engine::endless_watcher`: `tail -f`, `log stream`, `journalctl -f`…, run in the background or as a Monitor) is a
