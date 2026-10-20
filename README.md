@@ -2,6 +2,8 @@
 
 Your own team of AI agents, on your Mac.
 
+![A conversation in Filo](https://filo.im/img/blog/chat-glance-2.webp)
+
 Filo is a native macOS app where you make agents, each with a name, a picture and instructions of its own, and talk with
 them one at a time or all together in a group chat. The answers come from a coding tool you already use, [Claude
 Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), Muse Code or
@@ -12,6 +14,9 @@ What's in it:
 
 - **Agents and a group chat.** Each agent has its own conversation, memory and skills. In the group, the agents read
   each other's messages and answer when you @mention them.
+
+  ![An agent's profile in Filo](https://filo.im/img/blog/agent-profile-3.webp)
+
 - **Coding.** Hand a task to Claude Code, Codex, Muse Code or OpenCode, from the Coding page or from any conversation.
   It runs in your project or in a git worktree of its own, and you can follow each step as it happens.
 - **Artifacts.** Reports, pages, diagrams and small tools your agents make, with every version kept.
@@ -21,6 +26,8 @@ What's in it:
   Helium or Chrome.
 - **Scheduled work.** Reminders, routines that run on a schedule, and check-ins, even while Filo is closed.
 - **Voice messages, a Feed and Notes,** plus apps (MCP servers) your agents can use, a menu bar item and a desktop pet.
+
+![Pictures in a Filo conversation](https://filo.im/img/blog/chat-pictures-2.webp)
 
 Built with [GPUI](https://www.gpui.rs/), the UI framework behind the [Zed](https://zed.dev) editor, and
 [gpui-component](https://github.com/longbridge/gpui-component).
