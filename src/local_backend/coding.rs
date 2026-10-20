@@ -15,7 +15,8 @@
 //   next round resumes it (`catch_up`, crates/filo-local `compaction`).
 // - The tools: where each CLI is, its version and the account it's signed in with, read from the CLI and its own
 //   files, kept a couple of minutes; how much of each one's plan is left (`coding:usage`, crates/filo-local
-//   `plan_usage`), asked when the page opens and every couple of minutes while it's open.
+//   `plan_usage`), asked when the page opens and every couple of minutes while it's open; each one's newest version,
+//   looked up about once a day, and its own updater run when the user clicks "Update to vX" (local_backend/tool_updates.rs).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,7 @@ pub const CODING: &[&str] = &[
     "coding:projects",
     "coding:thread",
     "coding:setPlugged",
+    "coding:updateTool",
     "coding:setToolMode",
     "coding:setToolModel",
     "coding:setToolEffort",
@@ -100,6 +102,8 @@ pub struct State {
     /// Where the walk looks for repos; none: it doesn't (tests).
     scan_root: Mutex<Option<PathBuf>>,
     scanning: AtomicBool,
+    /// Each tool's newest version and its updates (local_backend/tool_updates.rs).
+    pub(super) updates: super::tool_updates::State,
     /// The CLI each tool runs, when set (tests); otherwise found on the login shell's PATH.
     #[cfg(test)]
     programs: Mutex<HashMap<String, PathBuf>>,
@@ -118,6 +122,7 @@ impl Default for State {
             woken: Mutex::new(Vec::new()),
             scan_root: Mutex::new(if cfg!(test) { None } else { root }),
             scanning: AtomicBool::new(false),
+            updates: Default::default(),
             #[cfg(test)]
             programs: Mutex::new(HashMap::new()),
         }
@@ -332,6 +337,14 @@ impl Local {
             "coding:removeProject" => {
                 required(args, "path").and_then(|path| self.write_db(|db| coding::remove_project(db, path)))
             }
+            // Runs the tool's own updater; the overview shows it updating, then its version or what went wrong.
+            "coding:updateTool" => required(args, "tool").and_then(|tool| {
+                let program = self.tool_program(tool).ok_or_else(|| {
+                    let name = coding::engine_of(tool).map_or_else(|| tool.to_string(), |engine| engine.label().into());
+                    format!("{name} isn't installed on this Mac.")
+                })?;
+                self.update_tool(tool, program)
+            }),
             "coding:refreshProjects" => {
                 let local = self.clone();
                 std::thread::spawn(move || local.scan_projects());
@@ -339,6 +352,15 @@ impl Local {
             }
             _ => return None,
         })
+    }
+
+    /// The CLI a tool runs on this Mac, as last looked at.
+    fn tool_program(&self, tool: &str) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(program) = self.coding.programs.lock().unwrap().get(tool) {
+            return Some(program.clone());
+        }
+        tool_infos().into_iter().find(|info| info.id == tool)?.program
     }
 
     /// Each tool's state: enabled on the Coding page (saved in Filo's database), installed and signed in on this Mac.
@@ -363,7 +385,7 @@ impl Local {
             .collect())
     }
 
-    fn coding_overview(&self) -> Result<Value, String> {
+    fn coding_overview(self: &Arc<Self>) -> Result<Value, String> {
         let db = self.db()?;
         let settings = coding::tools(db)?;
         let tools = tool_infos();
@@ -378,6 +400,7 @@ impl Local {
                     .cloned()
                     .unwrap_or_else(|| ToolInfo::missing(&settings.id));
                 let state = states.iter().find(|state| state.id == settings.id);
+                let version = info.version.clone();
                 let (installed, signed_in) =
                     (state.is_some_and(|state| state.installed), state.is_some_and(|state| state.signed_in));
                 let mut row = json!({
@@ -402,6 +425,9 @@ impl Local {
                     if let Some(value) = value {
                         row[key] = json!(value);
                     }
+                }
+                if installed {
+                    self.add_update_fields(&mut row, &settings.id, version.as_deref());
                 }
                 row
             })
@@ -1080,6 +1106,23 @@ fn refresh_tools() -> Vec<ToolInfo> {
     });
     *tool_cache().lock().unwrap() = Some((Instant::now(), infos.clone()));
     infos
+}
+
+/// The installed tools' versions, by tool id, as last looked at (local_backend/tool_updates.rs looks for newer ones).
+pub(super) fn tool_versions() -> Vec<(String, String)> {
+    tool_infos()
+        .into_iter()
+        .filter(|info| info.program.is_some())
+        .filter_map(|info| Some((info.id, info.version?)))
+        .collect()
+}
+
+/// A tool's version read again after its update (`program` is its CLI), and what the Coding page has kept with it.
+pub(super) fn tool_version_again(tool: &str, program: &Path) -> Option<String> {
+    if cfg!(test) {
+        return crate::command::cli_version(program, login_path());
+    }
+    refresh_tools().into_iter().find(|info| info.id == tool)?.version
 }
 
 /// A sign-in just checked (`tool_status`: Welcome, problem reports) goes into what the Coding page has kept.

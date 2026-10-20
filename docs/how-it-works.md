@@ -479,6 +479,21 @@ The Coding page runs your own Claude Code, Codex, Muse Code, OpenCode or pi on t
   plan windows, so none of them shows one. In `dev` builds `FILO_PLAN_USAGE=<json>` (as `coding:usage` answers) stands in
   for the accounts', to see the pills run low, and `FILO_PLAN_USAGE_AFTER=<seconds>` holds the answer back that long,
   to see them while it's on its way.
+- **Tool updates** (local_backend/tool_updates.rs): about once a day (on the first overview after the last look is a
+  day old, saved in `local/tool-updates.json`; a look that finds nothing tries again after an hour) Filo looks up each
+  installed tool's newest version where its own updater does: Claude Code's release channel
+  (`downloads.claude.ai/claude-code-releases/latest`, or `stable` when `autoUpdatesChannel` says so), Codex's
+  (`releases.openai.com/codex/channels/latest`), Muse Code's (`api.meta.ai/muse-code/channels/muse-stable`, its build
+  number dropped), OpenCode's (`opencode.ai/update/api/latest/cli/npm`; a 1.x install the `opencode-ai` npm package) and
+  pi's (`pi.dev/api/installer/releases/latest`). When it's newer than the CLI's `--version`, the row gets an accent
+  "Update to vX" pill after its chip (`latestVersion` in `coding:overview`). Nothing updates by itself: a click
+  (`coding:updateTool`) runs the tool's own updater, `claude update`, `codex update`, `opencode upgrade`, `pi update`
+  or Muse Code's installer again (`curl -fsSL https://dev.meta.ai/install.sh | bash`), from the home folder with the
+  login shell's PATH, given 10 minutes; the pill reads "Updating…" with a spinner meanwhile (`updating`). Then the tool
+  is read again: its line shows the new version, or a red "Couldn't update: …" line has the updater's last lines
+  (`updateError`, kept until the next try). Running rounds and turns keep the process they started with.
+  `FILO_OPEN=coding-update-drive FILO_DRIVE_TOOLS="pi codex"` shows the pills and clicks those tools' only when they're
+  stand-ins in the first folder of `FILO_LOGIN_PATH`, so a check never updates a real tool.
 - **Chat turns follow the tools' modes:** Filo's, an agent's, a group member's and a routine's turn works as its
   engine's tool does here (`coding::turn_mode`). Full access: Claude Code's shell is allowed outright (`--permission-mode
   dontAsk`) and Codex runs with `danger-full-access`. Auto: Claude Code's shell goes to `--permission-mode auto`, and

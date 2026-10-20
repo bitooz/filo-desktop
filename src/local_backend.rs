@@ -65,6 +65,9 @@ mod feed;
 mod group;
 // Turns that failed on a usage limit, tried again once it lifts (local_backend/limit_retry.rs).
 mod limit_retry;
+// The coding tools' newest versions and their updates, the Coding page's "Update to vX" (local_backend/tool_updates.rs).
+mod tool_updates;
+pub(crate) use tool_updates::update_command;
 
 /// While the app is open: the group's turns run (local_backend/group.rs), and turns that failed on a usage limit are
 /// tried again once it lifts (local_backend/limit_retry.rs).

@@ -1537,7 +1537,7 @@ type Drive = fn(Option<String>, &mut Window, &mut Context<AppShell>);
 
 /// The drives `open_from_env` starts by name. They click and type through the window like a person (in-app AppKit
 /// events, `native_input`), so while one runs the elements it looks for record where they are (`driving`).
-const DRIVES: [(&str, Drive); 40] = [
+const DRIVES: [(&str, Drive); 41] = [
     ("shared-delete-drive", |_, window, cx| shared_delete::run(window, cx)),
     ("shared-show-drive", |_, window, cx| shared_show::run(window, cx)),
     ("list-reorder-timing", |_, window, cx| list_reorder::run(window, cx)),
@@ -1568,6 +1568,7 @@ const DRIVES: [(&str, Drive); 40] = [
     ("artifact-tooltip-drive", run_artifact_tooltip_drive),
     ("overlays-drive", run_overlays_drive),
     ("coding-pickers-drive", |_, window, cx| run_coding_pickers_drive(window, cx)),
+    ("coding-update-drive", |_, window, cx| run_coding_update_drive(window, cx)),
     ("pages-bottom-drive", |_, window, cx| run_pages_bottom_drive(window, cx)),
     ("agent-model-drive", |_, window, cx| run_agent_model_drive(window, cx)),
     ("agent-save-keys-drive", |_, window, cx| run_agent_save_keys_drive(window, cx)),
@@ -3654,6 +3655,90 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             place(LIST).unwrap_or_else(|| "closed".into())
         );
         eprintln!("agent-model-drive: done");
+        if std::env::var_os("FILO_DRIVE_STAY").is_none() {
+            cx.update(|_, cx| cx.quit()).ok();
+        }
+    })
+    .detach();
+}
+
+/// `FILO_OPEN=coding-update-drive`: the Coding page's "Update to vX" pills (every tool plugged in, the newest versions
+/// looked up as the page opens), then the pill of each tool in `FILO_DRIVE_TOOLS` (default "pi") clicked, but only when
+/// its CLI is a stand-in in the first folder of `FILO_LOGIN_PATH`: a real tool is never updated. The rows are logged,
+/// with shots in `FILO_DRIVE_SHOTS`, before, while and after the updates.
+fn run_coding_update_drive(window: &mut Window, cx: &mut Context<AppShell>) {
+    let backend = backend(cx);
+    cx.on_next_frame(window, |shell, window, cx| shell.open_tab(Tab::Coding, window, cx));
+    cx.spawn_in(window, async move |this, cx| {
+        for tool in filo_local::coding::TOOLS {
+            backend.call_raw("coding:setPlugged", json!({ "tool": tool, "plugged": true })).await.ok();
+        }
+        let executor = cx.background_executor().clone();
+        let wait = |ms: u64| executor.timer(Duration::from_millis(ms));
+        let rows = async || {
+            let overview = backend.call_raw("coding:overview", json!({})).await.unwrap_or_default();
+            overview["tools"].as_array().cloned().unwrap_or_default()
+        };
+        let log = |when: &str, rows: &[Value]| {
+            for row in rows {
+                eprintln!(
+                    "coding-update-drive: {when}: {} version {} latest {} updating {} error {}",
+                    row["id"].as_str().unwrap_or("-"),
+                    row["version"].as_str().unwrap_or("-"),
+                    row["latestVersion"].as_str().unwrap_or("-"),
+                    row["updating"] == true,
+                    row["updateError"].as_str().unwrap_or("-"),
+                );
+            }
+        };
+        let wanted = std::env::var("FILO_DRIVE_TOOLS").unwrap_or_else(|_| "pi".into());
+        let stand_ins = std::env::var("FILO_LOGIN_PATH").ok().and_then(|path| path.split(':').next().map(str::to_string));
+        let tools: Vec<String> = wanted
+            .split_whitespace()
+            .filter(|tool| {
+                let Some(engine) = filo_local::coding::engine_of(tool) else { return false };
+                let stand_in =
+                    stand_ins.as_ref().is_some_and(|dir| std::path::Path::new(dir).join(engine.program()).is_file());
+                if !stand_in {
+                    eprintln!("coding-update-drive: {tool} isn't a stand-in in FILO_LOGIN_PATH's first folder: not clicked");
+                }
+                stand_in
+            })
+            .map(str::to_string)
+            .collect();
+        // The look for newer versions goes out as the page opens; its pills come when it answers.
+        for _ in 0..60 {
+            if tools.iter().all(|tool| on_screen(&format!("coding-update-{tool}")).is_some()) {
+                break;
+            }
+            wait(1000).await;
+        }
+        log("opened", &rows().await);
+        shot("coding-update-pills");
+        for tool in &tools {
+            let pill = format!("coding-update-{tool}");
+            if let (Some(width), Some(bounds)) = (window_width(&this, cx), on_screen(&pill))
+                && f32::from(bounds.top()) > 600.
+            {
+                native_input::hover(width, width / 2., 300.);
+                native_input::scroll_in(width, width / 2., 300., f64::from(f32::from(bounds.top())) - 300.);
+                wait(800).await;
+            }
+            eprintln!("coding-update-drive: clicked {tool}'s pill ({})", click(&this, cx, &pill));
+        }
+        wait(700).await;
+        log("clicked", &rows().await);
+        shot("coding-updating");
+        for _ in 0..120 {
+            if !rows().await.iter().any(|row| row["updating"] == true) {
+                break;
+            }
+            wait(500).await;
+        }
+        wait(1000).await;
+        log("updated", &rows().await);
+        shot("coding-updated");
+        eprintln!("coding-update-drive: done");
         if std::env::var_os("FILO_DRIVE_STAY").is_none() {
             cx.update(|_, cx| cx.quit()).ok();
         }

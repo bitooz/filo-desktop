@@ -320,6 +320,13 @@ struct ToolSummary {
     account: Option<String>,
     plan: Option<String>,
     version: Option<String>,
+    /// A newer version than `version` that's out (looked up about once a day): the row's "Update to vX".
+    latest_version: Option<String>,
+    /// Its updater is running.
+    #[serde(default)]
+    updating: bool,
+    /// What its last update said went wrong.
+    update_error: Option<String>,
     ready: bool,
     /// Its default mode for new tasks (`MODES`).
     #[serde(default = "default_mode")]
@@ -710,6 +717,8 @@ pub struct CodingScreen {
     query: String,
     /// Switches flipped and waiting for the backend, by tool or runner id.
     plugging: HashMap<String, bool>,
+    /// "Update to vX" clicked, until the backend answers (its row says `updating` from then on).
+    update_asked: std::collections::HashSet<String>,
     /// A mode change on its way, by tool.
     moding: HashMap<String, String>,
     /// A model or reasoning level change on its way, by tool ("" for the tool's own).
@@ -778,6 +787,7 @@ impl CodingScreen {
             search,
             query: String::new(),
             plugging: HashMap::new(),
+            update_asked: Default::default(),
             moding: HashMap::new(),
             modeling: HashMap::new(),
             efforting: HashMap::new(),
@@ -1448,6 +1458,49 @@ impl CodingScreen {
         );
     }
 
+    /// Runs the tool's own updater (local_backend/tool_updates.rs); the pill turns while it does.
+    fn update_tool(&mut self, tool: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.update_asked.insert(tool.clone()) {
+            return;
+        }
+        cx.notify();
+        mutate(
+            window,
+            cx,
+            "coding:updateTool",
+            json!({ "tool": tool }),
+            "Couldn't update it",
+            move |this: &mut Self, _, cx| {
+                this.update_asked.remove(&tool);
+                cx.notify();
+            },
+        );
+    }
+
+    /// "Update to vX" when a newer version is out (clicked, the tool's own updater runs), "Updating…" with a spinner
+    /// while it does.
+    fn render_update(&self, tool: &ToolSummary, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = *cx.colors();
+        let id = format!("coding-update-{}", tool.id);
+        if tool.updating || self.update_asked.contains(&tool.id) {
+            let pill = ui::chip("Updating…", Tone::Neutral, true, cx).gap(px(space::XXS)).child(ui::spinner(10., cx));
+            return Some(crate::smoke::tracked(id, pill));
+        }
+        let latest = tool.latest_version.as_ref()?;
+        let engine = filo_local::coding::engine_of(&tool.id)?;
+        let tip = SharedString::from(format!("Runs `{}`", crate::local_backend::update_command(engine)));
+        let tool_id = tool.id.clone();
+        let pill = ui::chip(format!("Update to v{latest}"), Tone::Accent, true, cx)
+            .gap(px(space::XXS))
+            .child(ui::icon_sized("download", 10., colors.accent))
+            .id(SharedString::from(id.clone()))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.8))
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| this.update_tool(tool_id.clone(), window, cx)));
+        Some(crate::smoke::tracked(id, pill))
+    }
+
     fn render_tool(&self, tool: &ToolSummary, cx: &mut Context<Self>) -> AnyElement {
         let colors = *cx.colors();
         let engine = filo_local::coding::engine_of(&tool.id);
@@ -1484,6 +1537,15 @@ impl CodingScreen {
             lines.push(line(format!("Installed on {}, not signed in.", tool.installed_on.join(", "))));
         } else {
             lines.push(line("Not installed on your computers.".into()));
+        }
+        if let Some(error) = tool.update_error.as_ref().filter(|_| !tool.updating) {
+            lines.push(
+                div()
+                    .footnote()
+                    .text_color(colors.danger)
+                    .child(format!("Couldn't update: {error}"))
+                    .into_any_element(),
+            );
         }
         if tool.signed_in_on.is_empty() && !tool.installed_on.is_empty() && !sign_in.is_empty() {
             lines.push(
@@ -1526,6 +1588,7 @@ impl CodingScreen {
                             .gap(px(space::SM))
                             .child(div().callout().medium().child(name.to_string()))
                             .child(ui::chip(chip, tone, true, cx))
+                            .children(self.render_update(tool, cx))
                             .children(if tool.signed_in_on.is_empty() {
                                 Vec::new()
                             } else {
@@ -1906,6 +1969,9 @@ impl Render for CodingScreen {
                                 account: None,
                                 plan: None,
                                 version: None,
+                                latest_version: None,
+                                updating: false,
+                                update_error: None,
                                 ready: false,
                                 mode: default_mode(),
                                 model: None,
@@ -2024,6 +2090,9 @@ mod tests {
             account: None,
             plan: None,
             version: None,
+            latest_version: None,
+            updating: false,
+            update_error: None,
             ready,
             mode: default_mode(),
             model: None,
