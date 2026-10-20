@@ -41,6 +41,7 @@ use crate::reseed;
 use crate::skills;
 use crate::steer;
 use crate::store::{Message, Role, Session, Store};
+use crate::turn_state;
 
 /// A turn takes as long as its work does: it's stopped only when nothing at all has come from its engine for this long,
 /// when it has hung (engine.rs `Limit::Silence`).
@@ -339,23 +340,18 @@ fn run_inner(store: &Store, runtime: &Runtime, chat_id: &str, turn_id: &str, on_
             resume = None;
             continue;
         }
-        // A turn Filo's app started on its own (a hidden message) may end without telling the user anything; so may a
-        // routine's run, when the routine says to stay quiet with nothing to report; or the group, when the user isn't
-        // the one waiting there. Not once a message the user sent meanwhile went into it.
-        let quiet_allowed = (of_turn(&messages, turn_id).any(Message::from_app)
+        // A turn Filo's app started on its own (turn_state.rs `may_end_quietly`: a hidden message, a check-in, a
+        // routine's run when the routine says to stay quiet with nothing to report) may end without telling the user
+        // anything; so may the group, when the user isn't the one waiting there. Not once a message the user sent
+        // meanwhile went into it.
+        let quiet_allowed = (turn_state::may_end_quietly(of_turn(&messages, turn_id))
             || group_call.as_ref().is_some_and(|call| !call.answers_user))
             && !steered.load(Ordering::SeqCst);
         let stderr = outcome.stderr;
         let error = match (outcome.error, replies) {
             (Some(error), _) => Some(error),
             (None, 0) if quiet_allowed => None,
-            (None, 0) => Some(match outcome.final_text {
-                Some(text) => format!(
-                    "{} finished without sending a message with Filo's send_message tool. What it wrote instead:\n\n{text}",
-                    engine.label()
-                ),
-                None => format!("{} finished without replying.", engine.label()),
-            }),
+            (None, 0) => Some(turn_state::without_message(engine.label(), outcome.final_text.as_deref())),
             (None, _) => None,
         };
         return Report { replies, stopped: false, error, stderr };

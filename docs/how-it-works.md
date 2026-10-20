@@ -987,7 +987,8 @@ skipped and says so, and so is one whose previous run is still working; a run wh
 **check-in** is a turn in the conversation that planned it (one planned in the group is the planner's turn there, run
 by the app); one missed by more than 6 hours expires. Its message is marked as Filo's (`Message::check_in`; the chat
 still shows it), so like a routine's run it may end without sending anything when there's nothing new, and its message
-says so. When a scheduled
+says so. One that ended that way before it could, saved as an error then, reads as done in the chat too
+(`turn_state::may_end_quietly`, the rule turn.rs goes by). When a scheduled
 turn sends something, a notification shows it. Notifications use macOS's notification centre, which only serves a signed
 app bundle: run Filo as Filo.app (`scripts/app.sh`, signed with the Mac's Developer ID or Apple Development certificate).
 Only Filo.app installs the launchd agent, so the helper runs the bundle's binary and its banners are Filo's too; the

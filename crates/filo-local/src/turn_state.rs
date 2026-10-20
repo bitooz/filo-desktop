@@ -2,7 +2,8 @@
 // shows the error with Retry, and its row in the lists says "Reply failed". Once a turn in the chat goes through after
 // it (a reply in a turn that didn't fail, or one ending quietly as it may, `Chat::last_ok_at`), the error no longer
 // stands: the turn is settled, its error a quiet line under what asked for it, and nothing says the reply failed. That
-// covers the failed turn itself retried, when it then had nothing to say.
+// covers the failed turn itself retried, when it then had nothing to say. A turn that may end quietly (`may_end_quietly`)
+// and ended without a message (`without_message`) didn't fail at all, also one saved as failed before it could.
 //
 // A failure on a plan's usage limit says when the limit resets ("You've hit your session limit · resets 2:50pm"):
 // `retry_at` reads when to try it again, shortly after. The app does, once (local_backend/limit_retry.rs).
@@ -32,6 +33,30 @@ pub enum End<'a> {
     Settled(&'a Message),
 }
 
+/// How a turn that ended without a message fails (turn.rs), read back by `ended_without_message`.
+const NO_MESSAGE: &str = " finished without sending a message with Filo's send_message tool.";
+const NO_REPLY: &str = " finished without replying.";
+
+/// The error of a turn on `engine` (its label) that ended without sending a message, with the text it wrote instead.
+pub fn without_message(engine: &str, final_text: Option<&str>) -> String {
+    match final_text {
+        Some(text) => format!("{engine}{NO_MESSAGE} What it wrote instead:\n\n{text}"),
+        None => format!("{engine}{NO_REPLY}"),
+    }
+}
+
+/// Whether `error` is a turn's that ended without a message (`without_message`).
+fn ended_without_message(error: &str) -> bool {
+    let first = error.trim().split("\n\n").next().unwrap_or_default();
+    first.contains(NO_MESSAGE) || first.ends_with(NO_REPLY)
+}
+
+/// Whether a turn whose messages are `turn` may end without telling the user anything: one Filo's app started on its
+/// own (`Message::from_app`: a coding task's news, a routine's run, a check-in).
+pub fn may_end_quietly<'a>(mut turn: impl Iterator<Item = &'a Message>) -> bool {
+    turn.any(Message::from_app)
+}
+
 /// Each turn's end, in the order of the messages that started them. `last_ok_at` is when a turn in the chat last
 /// ended without an error (`Chat::last_ok_at`).
 pub fn ends(messages: &[Message], last_ok_at: Option<u64>) -> Vec<(&str, End<'_>)> {
@@ -45,9 +70,15 @@ pub fn ends(messages: &[Message], last_ok_at: Option<u64>) -> Vec<(&str, End<'_>
         }
         last.insert(turn, message);
     }
-    let failed = |message: &Message| {
-        message.turn.as_deref().and_then(|turn| last.get(turn)).is_some_and(|last| last.role == Role::Error)
+    // Its last message an error, unless it was one the turn may end with (saved before turn.rs let it).
+    let quiet = |turn: &str, error: &Message| {
+        ended_without_message(&error.text)
+            && may_end_quietly(
+                messages.iter().filter(|message| message.role == Role::User && message.turn.as_deref() == Some(turn)),
+            )
     };
+    let failed_turn = |turn: &str| last.get(turn).is_some_and(|last| last.role == Role::Error && !quiet(turn, last));
+    let failed = |message: &Message| message.turn.as_deref().is_some_and(failed_turn);
     // The latest reply in a turn that didn't fail, or the latest turn that went through without one.
     let replied = messages
         .iter()
@@ -59,6 +90,7 @@ pub fn ends(messages: &[Message], last_ok_at: Option<u64>) -> Vec<(&str, End<'_>
         .into_iter()
         .map(|turn| {
             let end = match last.get(turn) {
+                _ if !failed_turn(turn) => End::Done,
                 Some(error) if error.role == Role::Error && went_through.is_some_and(|at| at > error.at) => {
                     End::Settled(error)
                 }
@@ -244,6 +276,47 @@ mod tests {
             message(Role::Error, "b", 40),
         ];
         assert_eq!(states(&messages, None), [("a".into(), "failed"), ("b".into(), "failed")]);
+    }
+
+    /// As in Animation Developer's chat on Oct 21: a check-in saved before it had its mark (known by its words) ended
+    /// without a message three times, saved as errors then; it didn't fail. Nor did a marked one, or a coding task's
+    /// news. The user's own message ending that way still failed, as did a check-in on anything else.
+    #[test]
+    fn a_turn_that_may_end_quietly_didnt_fail_when_it_did() {
+        let quiet = without_message("Claude Code", Some("Nothing needed doing at this check-in."));
+        let error = |turn: &str, text: &str, at: u64| Message { text: text.into(), ..message(Role::Error, turn, at) };
+        let check_in = |turn: &str, at: u64| Message {
+            text: format!("{}Destroy the Vast GPU when the round is done", crate::store::CHECK_IN),
+            ..message(Role::User, turn, at)
+        };
+        let messages = vec![
+            check_in("old", 10),
+            error("old", &quiet, 20),
+            error("old", &quiet, 30),
+            error("old", &without_message("Claude Code", None), 40),
+            Message { check_in: true, ..message(Role::User, "marked", 50) },
+            error("marked", &quiet, 60),
+            Message { hidden: true, ..message(Role::User, "news", 70) },
+            error("news", &without_message("Codex", None), 80),
+            message(Role::User, "user", 90),
+            error("user", &quiet, 100),
+            check_in("limit", 110),
+            error("limit", "You've hit your session limit · resets 2:50pm", 120),
+        ];
+        assert_eq!(
+            states(&messages, None),
+            [
+                ("old".into(), "done"),
+                ("marked".into(), "done"),
+                ("news".into(), "done"),
+                ("user".into(), "failed"),
+                ("limit".into(), "failed")
+            ]
+        );
+        assert!(
+            ended_without_message(&quiet)
+                && quiet.ends_with("What it wrote instead:\n\nNothing needed doing at this check-in.")
+        );
     }
 
     fn at(tz: &FixedOffset, text: &str) -> i64 {

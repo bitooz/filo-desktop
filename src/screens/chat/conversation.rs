@@ -681,13 +681,17 @@ fn shows_failure(turn: &ChatTurn) -> bool {
     matches!(turn.state.as_str(), "failed" | "settled")
 }
 
-/// A settled failure's quiet line: what went wrong then, its first paragraph (the rest is advice for when it stood).
+/// A settled failure's quiet line: what went wrong then, its first paragraph (the rest is advice for when it stood, or
+/// what the agent wrote instead), without the words that lead into the rest ("What it wrote instead:").
 fn settled_words(turn: &ChatTurn) -> String {
     let reason = turn
         .error
         .as_deref()
         .and_then(|error| error.trim().split("\n\n").next())
-        .map(str::trim)
+        .map(|first| match first.trim().strip_suffix(':') {
+            Some(lead) => lead.rfind(". ").map_or(lead, |end| &lead[..=end]).trim(),
+            None => first.trim(),
+        })
         .filter(|reason| !reason.is_empty());
     reason.map_or_else(|| "Couldn't reply then.".into(), |reason| format!("Couldn't reply then: {reason}"))
 }
@@ -5557,6 +5561,32 @@ mod tests {
         assert_eq!(super::failure_message(&earlier, Some(&retry_error)), "Retry could not be confirmed.");
         assert_eq!(super::failure_message(&current, Some(&retry_error)), "Codex: could not reply");
         assert_eq!(super::failure_message(&earlier, None), "Claude Code: session limit");
+    }
+
+    /// A settled failure's line keeps the error's first paragraph and ends on what went wrong, not on the words that lead
+    /// into what the agent wrote instead.
+    #[test]
+    fn a_settled_line_says_what_went_wrong() {
+        let words = |error: Option<&str>| {
+            super::settled_words(
+                &serde_json::from_value(
+                    json!({ "turnId": "t", "requestId": "t", "createdAt": 0., "state": "settled", "error": error }),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            words(Some(
+                "Claude Code finished without sending a message with Filo's send_message tool. What it wrote instead:\n\nAll done."
+            )),
+            "Couldn't reply then: Claude Code finished without sending a message with Filo's send_message tool."
+        );
+        assert_eq!(
+            words(Some("You've hit your session limit · resets 2:50pm\n\nTry again after it resets.")),
+            "Couldn't reply then: You've hit your session limit · resets 2:50pm"
+        );
+        assert_eq!(words(Some("Here's why:\n\nIt broke.")), "Couldn't reply then: Here's why");
+        assert_eq!(words(None), "Couldn't reply then.");
     }
 
     #[test]
