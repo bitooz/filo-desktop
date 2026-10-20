@@ -275,6 +275,22 @@ pub fn call(
             command.args(["run", "-m", &model, prompt]);
             stdin = None;
         }
+        Engine::Pi => {
+            command.args([
+                "-p",
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+            ]);
+            command.args(["--no-context-files", "--model", model]);
+            if let Some(level) = reasoning {
+                command.args(["--thinking", level]);
+            }
+            command.args(["--", prompt]).env("PI_OFFLINE", "1");
+            stdin = None;
+        }
     }
     let ran = crate::engine::run_for(&mut command, stdin, TIMEOUT);
     let _ = std::fs::remove_file(&prompt_file);

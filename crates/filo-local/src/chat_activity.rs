@@ -117,7 +117,7 @@ impl Tracker {
                 }
             }
             // A session's steps as `start_turn` hands them on: a command runs until it does or says anything else.
-            Engine::Muse | Engine::OpenCode => {
+            Engine::Muse | Engine::OpenCode | Engine::Pi => {
                 self.running.clear();
                 if event.get("filo_step").and_then(Value::as_str) == Some("command") {
                     self.running.insert("command".into());

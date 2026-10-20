@@ -74,7 +74,7 @@ impl Default for State {
 }
 
 fn engine_arg(args: &Value) -> Result<Engine, String> {
-    Engine::parse(required(args, "engine")?).ok_or_else(|| "`engine` is claude, codex, muse or opencode".into())
+    Engine::parse(required(args, "engine")?).ok_or_else(|| "`engine` is claude, codex, muse, opencode or pi".into())
 }
 
 impl Local {
@@ -579,7 +579,7 @@ mod tests {
         assert!(list["presets"].as_array().unwrap().iter().any(|preset| preset["id"] == "linear"));
         let engines: Vec<&str> =
             list["engines"].as_array().unwrap().iter().map(|engine| engine["name"].as_str().unwrap()).collect();
-        assert_eq!(engines, ["Claude Code", "Codex", "Muse Code", "OpenCode"]);
+        assert_eq!(engines, ["Claude Code", "Codex", "Muse Code", "OpenCode", "pi"]);
         // Fresh data has the Filo agent, which leads the access list.
         assert_eq!(list["agents"][0]["id"], apps::FILO_AGENT);
         assert_eq!(list["agents"][0]["isFilo"], true);

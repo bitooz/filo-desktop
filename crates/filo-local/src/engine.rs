@@ -1,4 +1,4 @@
-// Runs one turn of the user's own coding tool (Claude Code, Codex, Muse Code or OpenCode) with Filo's MCP server
+// Runs one turn of the user's own coding tool (Claude Code, Codex, Muse Code, OpenCode or pi) with Filo's MCP server
 // plugged in.
 //
 // Claude Code: `claude -p --output-format stream-json --verbose --mcp-config <json> --strict-mcp-config
@@ -36,8 +36,8 @@
 //
 // A chat turn runs as a session the CLI is kept talking to (`start_turn`, coding_session.rs), so a message the user
 // sends while it works reaches it at its next step (`Steer`, turn.rs `Steering`): one more user message on Claude Code's
-// stdin, `turn/steer` on Codex's app-server and Muse Code's, a prompt delivered as `steer` on OpenCode's server
-// (coding_session.rs `Notes`, the same for each). A turn that keeps refusing the steer is interrupted, and goes on in a
+// stdin, `turn/steer` on Codex's app-server and Muse Code's, a prompt delivered as `steer` on OpenCode's server, a
+// `steer` on pi's RPC (coding_session.rs `Notes`, the same for each). A turn that keeps refusing the steer is interrupted, and goes on in a
 // new turn with the message.
 //
 // A chat turn ends once the agent has replied, whatever still runs in its shell: Claude Code's stdin closes at its
@@ -77,11 +77,12 @@ pub enum Engine {
     Codex,
     Muse,
     OpenCode,
+    Pi,
 }
 
 impl Engine {
     /// Every engine, in the order pickers list them (the Coding page's too).
-    pub const ALL: [Engine; 4] = [Engine::Claude, Engine::Codex, Engine::Muse, Engine::OpenCode];
+    pub const ALL: [Engine; 5] = [Engine::Claude, Engine::Codex, Engine::Muse, Engine::OpenCode, Engine::Pi];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -89,6 +90,7 @@ impl Engine {
             Engine::Codex => "Codex",
             Engine::Muse => "Muse Code",
             Engine::OpenCode => "OpenCode",
+            Engine::Pi => "pi",
         }
     }
 
@@ -98,6 +100,7 @@ impl Engine {
             Engine::Codex => "codex",
             Engine::Muse => "muse",
             Engine::OpenCode => "opencode",
+            Engine::Pi => "pi",
         }
     }
 
@@ -107,13 +110,14 @@ impl Engine {
             "codex" => Some(Engine::Codex),
             "muse" | "muse-code" | "muse code" => Some(Engine::Muse),
             "opencode" | "open-code" | "open code" => Some(Engine::OpenCode),
+            "pi" | "pi-coding-agent" => Some(Engine::Pi),
             _ => None,
         }
     }
 
     /// Claude Code and Codex: a chat turn runs their own command line (`invocation`), whose JSON lines the chat reads as
-    /// they come, and they see the message's pictures themselves and keep their own models. Muse Code and OpenCode get
-    /// the turn as a session of Filo's making (coding_session.rs), whose steps come as lines of Filo's own.
+    /// they come, and they see the message's pictures themselves and keep their own models. Muse Code, OpenCode and pi
+    /// get the turn as a session of Filo's making (coding_session.rs), whose steps come as lines of Filo's own.
     pub fn runs_invocation(self) -> bool {
         matches!(self, Engine::Claude | Engine::Codex)
     }
@@ -125,6 +129,7 @@ impl Engine {
             Engine::Codex => "codex",
             Engine::Muse => "muse",
             Engine::OpenCode => "opencode",
+            Engine::Pi => "pi",
         }
     }
 
@@ -134,12 +139,14 @@ impl Engine {
         match self {
             Engine::Claude | Engine::OpenCode => "auth login",
             Engine::Codex | Engine::Muse => "login",
+            // pi signs in from inside itself, with /login.
+            Engine::Pi => "",
         }
     }
 
     /// The whole command that signs it in (`codex login`).
     pub fn sign_in_command(self) -> String {
-        format!("{} {}", self.program(), self.sign_in_args())
+        format!("{} {}", self.program(), self.sign_in_args()).trim_end().to_string()
     }
 
     /// What to run in a terminal when the CLI says it isn't signed in.
@@ -148,11 +155,12 @@ impl Engine {
             Engine::OpenCode => {
                 format!("Run `{}` in Terminal to add a provider, then try again.", self.sign_in_command())
             }
+            Engine::Pi => "Run `pi` in Terminal and type /login to sign in to a provider, then try again.".into(),
             _ => format!("Run `{}` in Terminal, then try again.", self.sign_in_command()),
         }
     }
 
-    /// Whether a CLI's error or output says it isn't signed in, in any of the four tools' words.
+    /// Whether a CLI's error or output says it isn't signed in, in any of the tools' words.
     pub fn signed_out(text: &str) -> bool {
         let text = text.to_lowercase();
         [
@@ -166,6 +174,10 @@ impl Engine {
             "codex login",
             "muse login",
             "opencode auth login",
+            // pi's, from its providers: a key that ran out, a sign-in that can't be renewed.
+            "api key expired",
+            "oauth refresh failed",
+            "no api key found",
         ]
         .iter()
         .any(|needle| text.contains(needle))
@@ -858,6 +870,16 @@ fn capabilities(engine: Engine, mode: &str, servers: &[McpServer], computer: Opt
             },
             "load when you search for them with tool search",
         ),
+        Engine::Pi => (
+            "Filo's tools (the `filo` MCP server, named `mcp__filo__<tool>`)",
+            "reading, searching and listing files on this Mac (read, grep, find, ls) and writing them (write, edit); skills: the user's own from Filo and ones for charts (dataviz), making a desktop pet (desktop-pet) and making artifacts (artifacts); no web search of its own, so use Filo's browser for the web",
+            if full {
+                "a shell (bash) that runs any command on this Mac, with network"
+            } else {
+                "a shell (bash) on this Mac, with network; writing a file outside your working folder and the user's skills folder is refused, since nobody can approve it while you work"
+            },
+            "are there among your tools",
+        ),
         Engine::Muse | Engine::OpenCode => (
             "Filo's tools (the `filo` MCP server)",
             "web search and opening web pages; reading and searching files on this Mac; skills: the user's own from Filo and ones for charts (dataviz), making a desktop pet (desktop-pet) and making artifacts (artifacts)",
@@ -1443,7 +1465,7 @@ pub fn invocation(spec: &TurnSpec) -> Invocation {
             Invocation { program: spec.program.clone(), args, stdin: first, env: Vec::new() }
         }
         // Their turns run as sessions (`start_turn`), which take the spec itself: the command line is just the CLI.
-        Engine::Muse | Engine::OpenCode => {
+        Engine::Muse | Engine::OpenCode | Engine::Pi => {
             Invocation { program: spec.program.clone(), args: Vec::new(), stdin: String::new(), env: Vec::new() }
         }
     }
@@ -1793,7 +1815,7 @@ fn shell_segments(command: &str) -> Vec<Vec<String>> {
 }
 
 /// A turn under way: a chat's session run on a thread of its own (`start_turn`), whose lines come as the CLI printed them
-/// (Claude Code, Codex) or as steps of Filo's own (Muse Code, OpenCode); or a CLI whose JSON lines are read here (a page
+/// (Claude Code, Codex) or as steps of Filo's own (Muse Code, OpenCode, pi); or a CLI whose JSON lines are read here (a page
 /// shared to claude.ai, `start_invocation`).
 pub enum Running {
     Cli(CliRun),
@@ -2145,7 +2167,7 @@ fn explain(engine: Engine, error: &str, stderr: &[String]) -> String {
 fn limit_hint(engine: Engine) -> String {
     let other = match engine {
         Engine::Claude => Engine::Codex,
-        Engine::Codex | Engine::Muse | Engine::OpenCode => Engine::Claude,
+        Engine::Codex | Engine::Muse | Engine::OpenCode | Engine::Pi => Engine::Claude,
     };
     format!(
         "That's your {} plan's limit, not Filo's: this chat picks up where it left off once it lifts. To keep going before then, use {}: for an agent, Duplicate with {} in its profile.",
@@ -2166,6 +2188,7 @@ fn session_gone(error: &str, stderr: &[String]) -> bool {
         "no rollout found",
         "thread not found",
         "session not found",
+        "no session found matching",
     ]
     .iter()
     .any(|needle| haystack.contains(needle))
@@ -2240,7 +2263,7 @@ impl EventReader {
                 _ => {}
             },
             // They run as sessions (coding_session.rs), never through here: chats are Claude Code's or Codex's.
-            Engine::Muse | Engine::OpenCode => {}
+            Engine::Muse | Engine::OpenCode | Engine::Pi => {}
         }
     }
 
@@ -2633,7 +2656,7 @@ mod tests {
             "{codex}"
         );
         // The browser, on every engine.
-        for engine in [Engine::Claude, Engine::Codex, Engine::Muse, Engine::OpenCode] {
+        for engine in Engine::ALL {
             let text = capabilities(engine, "auto", &[], None, Pages { feed: false, notes: false });
             assert!(
                 text.contains("Filo's browser is always yours")
@@ -2727,6 +2750,7 @@ mod tests {
     fn only_a_missing_session_counts_as_gone() {
         assert!(session_gone("Claude Code stopped with status 1: No conversation found with session ID: s-1", &[]));
         assert!(session_gone("Codex stopped with status 1.", &["Error: No saved session found with ID th-1".into()]));
+        assert!(session_gone("pi stopped with status 1.", &["No session found matching '01a1597b'".into()]));
         assert!(!session_gone("Claude Code: You've hit your session limit · resets 3:50am (Asia/Tashkent)", &[]));
         assert!(!session_gone("Codex: usage limit reached", &[]));
         assert!(!session_gone("Claude Code: Invalid API key · Please run /login", &[]));

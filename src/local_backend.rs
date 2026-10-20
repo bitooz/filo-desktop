@@ -225,7 +225,7 @@ something important is unclear, and use the tools you have (notes, memories, ski
 /// Why `agents:remove` refuses the main agent.
 pub const MAIN_AGENT_STAYS: &str = "This is your main agent. Pick another main agent first, then remove it.";
 /// Why `agents:create` refuses while neither coding tool is plugged in on the Coding page (`coding_tools`).
-pub const NO_CODING_TOOL: &str = "Agents answer with a coding tool (Claude Code, Codex, Muse Code or OpenCode), and all of them are unplugged. Plug one in on the Coding page, then create your agent.";
+pub const NO_CODING_TOOL: &str = "Agents answer with a coding tool (Claude Code, Codex, Muse Code, OpenCode or pi), and all of them are unplugged. Plug one in on the Coding page, then create your agent.";
 
 /// The profile as the pages read it (`users:current`), from its rows (crates/filo-local `app_data`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -560,9 +560,9 @@ impl Local {
         let kept = |engine: Engine| before.iter().filter(|row| row.engine == engine).cloned().collect::<Vec<_>>();
         let mut rows = claude.unwrap_or_else(|| kept(Engine::Claude));
         rows.extend(codex);
-        // Muse Code's and OpenCode's as they said, else as they were (none when it isn't installed), saved either way so
-        // a restart soon after doesn't ask again.
-        for engine in [Engine::Muse, Engine::OpenCode] {
+        // Muse Code's, OpenCode's and pi's as they said, else as they were (none when it isn't installed), saved either
+        // way so a restart soon after doesn't ask again.
+        for engine in [Engine::Muse, Engine::OpenCode, Engine::Pi] {
             let said = others
                 .iter()
                 .find(|(other, _)| *other == engine)
@@ -2027,18 +2027,19 @@ pub fn set_default_engine(engine: Engine) {
     }
 }
 
-/// What Muse Code and OpenCode offer, for the composer's picker (each starts a server of its own to say); None for one
-/// that isn't installed or couldn't say.
+/// What Muse Code, OpenCode and pi offer, for the composer's picker (each starts a server of its own to say); None for
+/// one that isn't installed or couldn't say.
 fn probe_session_models() -> Vec<(Engine, Option<Vec<ModelOption>>)> {
     let path = login_path();
     let workspace = Store::at(crate::config::config_dir().join("local/agents"))
         .workspace()
         .unwrap_or_else(|_| std::env::temp_dir());
-    [Engine::Muse, Engine::OpenCode]
+    [Engine::Muse, Engine::OpenCode, Engine::Pi]
         .into_iter()
         .map(|engine| {
             let rows = engine::find_program(engine, Some(path)).map(|program| match engine {
                 Engine::Muse => filo_local::coding_muse::models(&program, Some(path)),
+                Engine::Pi => filo_local::coding_pi::models(&program, Some(path)),
                 _ => filo_local::coding_opencode::models(&program, Some(path), &workspace),
             });
             (

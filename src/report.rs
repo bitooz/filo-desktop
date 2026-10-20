@@ -127,6 +127,8 @@ impl Fix {
             Fix::SignIn(Engine::OpenCode, _) => "sign-in-opencode",
             Fix::Install(Engine::Muse) => "install-muse",
             Fix::Install(Engine::OpenCode) => "install-opencode",
+            Fix::SignIn(Engine::Pi, _) => "sign-in-pi",
+            Fix::Install(Engine::Pi) => "install-pi",
             Fix::FreeDisk => "free-disk",
         }
     }
@@ -185,7 +187,7 @@ impl Check {
 
 /// The checks, in the order they show; each runs on its own (`run`), the slow ones (the test reply, the network)
 /// alongside the rest.
-pub const CHECKS: [(&str, &str); 11] = [
+pub const CHECKS: [(&str, &str); 12] = [
     ("filo", "Filo"),
     ("macos", "macOS"),
     ("chip", "Chip"),
@@ -193,6 +195,7 @@ pub const CHECKS: [(&str, &str); 11] = [
     ("codex", "Codex"),
     ("muse", "Muse Code"),
     ("opencode", "OpenCode"),
+    ("pi", "pi"),
     ("sign-in", "Signed in"),
     ("test-reply", "Test reply"),
     ("disk", "Disk space"),
@@ -233,6 +236,7 @@ pub fn run(id: &str, engine: Engine) -> Check {
         "codex" => cli_check(Engine::Codex, engine),
         "muse" => cli_check(Engine::Muse, engine),
         "opencode" => cli_check(Engine::OpenCode, engine),
+        "pi" => cli_check(Engine::Pi, engine),
         "sign-in" => sign_in_check(engine),
         "test-reply" => test_reply(engine),
         "disk" => disk_check(),
@@ -340,6 +344,7 @@ fn test_reply(engine: Engine) -> Check {
         // Reports check the chat engines (`Engine::ALL`); these answer a prompt headless all the same.
         Engine::Muse => command.args(["exec", "--json", "--no-session-log", "Reply with the word ok."]),
         Engine::OpenCode => command.args(["run", "--format", "json", "Reply with the word ok."]),
+        Engine::Pi => command.args(["-p", "--no-session", "--no-tools", "--no-extensions", "Reply with the word ok."]),
     };
     command
         .current_dir(std::env::temp_dir())
@@ -363,7 +368,7 @@ fn test_reply(engine: Engine) -> Check {
         Engine::Claude => serde_json::from_str::<Value>(stdout.trim())
             .ok()
             .map(|result| (result["is_error"] != true, result["result"].as_str().unwrap_or_default().to_string())),
-        Engine::Codex | Engine::Muse | Engine::OpenCode => None,
+        Engine::Codex | Engine::Muse | Engine::OpenCode | Engine::Pi => None,
     };
     let worked = ran.success && said.as_ref().is_none_or(|(ok, _)| *ok);
     if worked {
@@ -416,6 +421,8 @@ fn network_check(engine: Engine) -> Check {
         Engine::Codex => "api.openai.com",
         Engine::Muse => "api.meta.ai",
         Engine::OpenCode => "opencode.ai",
+        // Its providers are the user's; pi.dev is its own.
+        Engine::Pi => "pi.dev",
     };
     let missed: Vec<&str> = ["dev.filo.im", api].into_iter().filter(|host| !reachable(host)).collect();
     match missed.len() {
@@ -527,6 +534,7 @@ pub fn payload(
             "engine": engine,
             "museCode": cli("muse"),
             "opencode": cli("opencode"),
+            "pi": cli("pi"),
             "appLabel": crate::updater::version_label(),
             "checks": checks.iter().map(|check| json!({ "id": check.id, "status": check.status, "fix": check.fix.as_ref().map(Fix::id) })).collect::<Vec<_>>(),
             "failure": details.failure.as_ref().map(|failure| json!({

@@ -26,8 +26,8 @@
 // notes are the messages the user sends while it works (steer.rs), followed the same way with every engine (`Notes`).
 // Claude Code replays each user message as it takes it into the conversation (`--replay-user-messages`), and one it
 // hasn't acted on by its result starts another turn of its own, which the chat's turn waits for; one Codex accepted but
-// didn't act on before its turn ended, or refused as it ended, starts a new turn with the message. Muse Code's and
-// OpenCode's chat turns take theirs as steers too (coding_muse.rs, coding_opencode.rs).
+// didn't act on before its turn ended, or refused as it ended, starts a new turn with the message. Muse Code's,
+// OpenCode's and pi's chat turns take theirs as steers too (coding_muse.rs, coding_opencode.rs, coding_pi.rs).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -342,10 +342,11 @@ pub struct Spec {
     /// It takes as long as its work does, and is stopped once nothing has come from the tool for this long (it has
     /// hung). A coding round's clock doesn't run while the tool waits on an answer or on its background work.
     pub timeout: Duration,
-    /// MCP servers it gets (a chat's: Filo's and the user's apps; none for a coding task). Muse Code and OpenCode only.
+    /// MCP servers it gets (a chat's: Filo's and the user's apps; none for a coding task). Muse Code, OpenCode and pi
+    /// only.
     pub servers: Vec<crate::engine::McpServer>,
-    /// The skills it may use besides its built-in ones (a chat's: Filo's), or any (None: a coding task). OpenCode only:
-    /// Muse Code has no allow-list.
+    /// The skills it may use besides its built-in ones (a chat's: Filo's), or any (None: a coding task). OpenCode and pi
+    /// only: Muse Code has no allow-list.
     pub skills: Option<Vec<String>>,
     /// A chat turn rather than a coding round: a session it can't resume fails (the chat starts afresh with its
     /// context), rather than going on in a new one, and the turn ends with its reply, whatever runs in the background.
@@ -539,6 +540,10 @@ pub fn run(spec: &Spec, host: &mut dyn Host, on_start: impl FnOnce(Stopper)) -> 
         (Engine::Codex, None) => (vec!["app-server".to_string()], Vec::new()),
         (Engine::Muse, _) => (crate::coding_muse::args(spec), crate::coding_muse::env()),
         (Engine::OpenCode, _) => (crate::coding_opencode::args(), crate::coding_opencode::env(&password, Some(spec))),
+        (Engine::Pi, _) => match crate::coding_pi::extension_file() {
+            Ok(extension) => (crate::coding_pi::args(spec, &extension), crate::coding_pi::env(spec)),
+            Err(error) => return End { error: Some(error), ..End::default() },
+        },
     };
     let mut started = match crate::engine::spawn_cli(
         spec.engine,
@@ -560,6 +565,7 @@ pub fn run(spec: &Spec, host: &mut dyn Host, on_start: impl FnOnce(Stopper)) -> 
         Engine::Claude | Engine::Codex => Box::new(Talk::new(spec, stdin)),
         Engine::Muse => Box::new(crate::coding_muse::Talk::new(spec, stdin)),
         Engine::OpenCode => Box::new(crate::coding_opencode::Talk::new(spec, stdin, password)),
+        Engine::Pi => Box::new(crate::coding_pi::Talk::new(spec, stdin)),
     };
     let mut round = Round { talk, host, stopper: stopper.clone(), chat: spec.chat, trace: session_trace() };
     round.talk.begin(round.host);
@@ -2433,6 +2439,192 @@ cat >> "$0.heard"
         assert!(!std::fs::read_to_string(dir.join("muse.heard")).unwrap().contains("turn/interrupt"));
     }
 
+    /// What a stand-in pi does with the lines Filo sends: `expect` reads up to one that matches, `id` is its id.
+    const PI_HELPERS: &str = r#"#!/bin/sh
+echo "$@" > "$0.args"
+expect() { while read -r line; do echo "$line" >> "$0.heard"; case "$line" in $1) return 0;; esac; done; echo "never: $1" >&2; exit 3; }
+id() { printf '%s\n' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/'; }
+answer() { echo "{\"type\":\"response\",\"id\":\"$(id)\",\"command\":\"$1\",\"success\":${2:-true}}"; }
+expect '*"type":"get_state"*'
+echo "{\"type\":\"response\",\"id\":\"$(id)\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"pi-1\",\"model\":{\"provider\":\"openrouter\",\"id\":\"google/gemini-3.5-flash\"}}}"
+"#;
+
+    /// A round on pi: an extension's dialog of its own is dismissed at once (project trust can't hold it up), Filo's
+    /// permission card is asked and answered, a note goes in as a steer, and the round ends once pi settles.
+    #[test]
+    fn pi_asks_on_filos_card_hears_a_note_and_finishes() {
+        let dir = crate::test_support::temp_dir("session-pi");
+        let body = format!(
+            "{PI_HELPERS}{}",
+            r#"expect '*"type":"prompt"*Goal: list the files*'
+answer prompt
+echo '{"type":"agent_start"}'
+echo '{"type":"extension_ui_request","id":"ui-0","method":"confirm","title":"Trust this project?","message":"/w"}'
+expect '*"extension_ui_response"*"id":"ui-0"*'
+case "$line" in *'"cancelled":true'*) ;; *) exit 4;; esac
+echo '{"type":"tool_execution_start","toolCallId":"c-1","toolName":"bash","args":{"command":"npm install"}}'
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-1","method":"select","title":"Run `npm install`\n\nInstall the packages","options":["Allow","Allow always","Deny"]}'
+expect '*"extension_ui_response"*"id":"ui-1"*'
+case "$line" in *'"value":"Allow"'*) ;; *) exit 5;; esac
+echo '{"type":"tool_execution_end","toolCallId":"c-1","toolName":"bash","result":{"content":[]},"isError":false}'
+echo '{"type":"tool_execution_start","toolCallId":"c-2","toolName":"edit","args":{"path":"package.json"}}'
+echo '{"type":"tool_execution_end","toolCallId":"c-2","toolName":"edit","args":{"path":"package.json"},"result":{"content":[]},"isError":false}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Installed, kept the lockfile."}],"stopReason":"stop"}}'
+echo '{"type":"agent_end","messages":[]}'
+echo '{"type":"agent_settled"}'
+cat >> "$0.heard"
+"#
+        );
+        let fake = script(&dir, "pi", &body);
+        let mut spec = spec(Engine::Pi, fake, &dir);
+        spec.mode = "auto".into();
+        spec.model = Some("openrouter/google/gemini-3.5-flash".into());
+        let mut host = Recorder::default();
+        host.answers.insert("ask-1".into(), "allow".into());
+        host.notes.push("keep the lockfile".into());
+        let end = run(&spec, &mut host, |_| {});
+        assert_eq!(
+            (end.error.as_deref(), end.final_text.as_deref(), end.session_id.as_deref()),
+            (None, Some("Installed, kept the lockfile."), Some("pi-1")),
+            "{end:?}"
+        );
+        assert_eq!(
+            (host.asks.len(), host.asks[0].title.as_str(), host.asks[0].detail.as_deref()),
+            (1, "Run `npm install`", Some("Install the packages"))
+        );
+        assert_eq!(
+            host.steps,
+            [
+                Step::marker("note", "pi asked \"Trust this project?\": dismissed, as nobody answers it here"),
+                Step::did("command", "npm install"),
+                Step::did("files", "Changed package.json"),
+                Step::said("Installed, kept the lockfile.")
+            ]
+        );
+        let heard = std::fs::read_to_string(dir.join("pi.heard")).unwrap();
+        assert!(
+            heard.lines().any(|line| line.contains("\"type\":\"steer\"") && line.contains("keep the lockfile")),
+            "{heard}"
+        );
+        let args = std::fs::read_to_string(dir.join("pi.args")).unwrap();
+        assert!(
+            args.starts_with("--mode rpc -e ") && args.contains("--model openrouter/google/gemini-3.5-flash"),
+            "{args}"
+        );
+        assert!(args.contains("--append-system-prompt Work well."), "{args}");
+    }
+
+    /// A chat turn on pi: a message steered in is the turn's once pi delivers it and answers; one still queued when the
+    /// run settles is taken back and starts the next prompt in the same session, as it is.
+    #[test]
+    fn a_chat_turn_on_pi_steers_and_carries_a_held_message_into_the_next_prompt() {
+        let dir = crate::test_support::temp_dir("session-pi-steer");
+        let body = format!(
+            "{PI_HELPERS}{}",
+            r#"expect '*"type":"prompt"*Fill in the shoutouts*'
+answer prompt
+echo '{"type":"agent_start"}'
+expect '*"type":"steer"*Keep them short*'
+answer steer
+echo '{"type":"queue_update","steering":["Keep them short"],"followUp":[]}'
+expect '*"type":"steer"*Hold them*'
+answer steer
+echo '{"type":"queue_update","steering":["Keep them short","Hold them"],"followUp":[]}'
+echo '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Keep them short"}]}}'
+echo '{"type":"queue_update","steering":["Hold them"],"followUp":[]}'
+echo '{"type":"message_start","message":{"role":"assistant","content":[]}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Short ones."}],"stopReason":"stop"}}'
+echo '{"type":"agent_settled"}'
+expect '*"type":"clear_queue"*'
+echo "{\"type\":\"response\",\"id\":\"$(id)\",\"command\":\"clear_queue\",\"success\":true,\"data\":{\"steering\":[\"Hold them\"],\"followUp\":[]}}"
+expect '*"type":"prompt"*'
+case "$line" in *stopped*) exit 4;; *Hold\ them*) ;; *) exit 5;; esac
+answer prompt
+echo '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Hold them"}]}}'
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Holding them."}],"stopReason":"stop"}}'
+echo '{"type":"agent_settled"}'
+cat >> "$0.heard"
+"#
+        );
+        let fake = script(&dir, "pi", &body);
+        let spec = Spec {
+            chat: true,
+            message: "Fill in the shoutouts".into(),
+            new_session: None,
+            skills: Some(Vec::new()),
+            ..spec(Engine::Pi, fake, &dir)
+        };
+        let mut host = Recorder::default();
+        host.notes.extend(["Keep them short".to_string(), "Hold them".to_string()]);
+        let end = run(&spec, &mut host, |_| {});
+        assert_eq!(
+            (end.error.as_deref(), end.final_text.as_deref(), end.session_id.as_deref()),
+            (None, Some("Holding them."), Some("pi-1")),
+            "{end:?}"
+        );
+        assert_eq!(host.noted, ["Keep them short", "Hold them"]);
+        let args = std::fs::read_to_string(dir.join("pi.args")).unwrap();
+        assert!(args.contains("--no-extensions") && args.contains("--no-skills"), "{args}");
+    }
+
+    /// A chat turn on pi that keeps refusing a message's steer: offered again for a few seconds, then the run is
+    /// aborted, and the next prompt carries the message, told it was stopped.
+    #[test]
+    fn a_chat_turn_on_pi_aborts_for_a_refused_message() {
+        let dir = crate::test_support::temp_dir("session-pi-abort");
+        let body = format!(
+            "{PI_HELPERS}{}",
+            r#"expect '*"type":"prompt"*'
+answer prompt
+echo '{"type":"tool_execution_start","toolCallId":"c-1","toolName":"bash","args":{"command":"sleep 60"}}'
+while read -r line; do
+  echo "$line" >> "$0.heard"
+  case "$line" in
+    *'"type":"abort"'*) break;;
+    *'"type":"steer"'*) answer steer false;;
+  esac
+done
+answer abort
+echo '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted"}}'
+echo '{"type":"agent_settled"}'
+expect '*"type":"prompt"*stopped mid-turn*Hold them*'
+answer prompt
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Holding them."}],"stopReason":"stop"}}'
+echo '{"type":"agent_settled"}'
+cat >> "$0.heard"
+"#
+        );
+        let fake = script(&dir, "pi", &body);
+        let spec = Spec { chat: true, new_session: None, ..spec(Engine::Pi, fake, &dir) };
+        let mut host = Recorder::default();
+        host.notes.push("Hold them".into());
+        let began = Instant::now();
+        let end = run(&spec, &mut host, |_| {});
+        assert_eq!((end.error.as_deref(), end.final_text.as_deref()), (None, Some("Holding them.")), "{end:?}");
+        assert_eq!(host.noted, ["Hold them"]);
+        assert!(began.elapsed() >= RETRY_FOR, "{:?}", began.elapsed());
+    }
+
+    /// A chat turn on pi whose model call fails says why, with how to sign in again when that's the reason.
+    #[test]
+    fn a_pi_turn_fails_with_its_providers_words() {
+        let dir = crate::test_support::temp_dir("session-pi-fail");
+        let body = format!(
+            "{PI_HELPERS}{}",
+            r#"expect '*"type":"prompt"*'
+answer prompt
+echo '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401: API key expired."}}'
+echo '{"type":"agent_settled"}'
+cat >> "$0.heard"
+"#
+        );
+        let fake = script(&dir, "pi", &body);
+        let spec = Spec { chat: true, new_session: None, ..spec(Engine::Pi, fake, &dir) };
+        let end = run(&spec, &mut Recorder::default(), |_| {});
+        let error = end.error.unwrap_or_default();
+        assert!(error.starts_with("pi: 401: API key expired.") && error.contains("/login"), "{error}");
+    }
+
     /// A chat turn on OpenCode: a message steered in reaches the agent once its inbox delivers it (here in the execution
     /// after the one running, which ended first), and the chat turn ends with that execution.
     #[test]
@@ -3042,8 +3234,8 @@ sleep 30
 
     /// The installed CLI doing a small task in a scratch folder in Supervised mode, so it has to ask: every ask is
     /// allowed. Uses the user's sign-in and usage, so it runs only when asked:
-    /// `cargo test -p filo-local real_ -- --ignored --nocapture` (`FILO_REAL=claude`, `codex`, `muse` or `opencode` for one
-    /// of them; `FILO_REAL_MODEL` for the model of the last three).
+    /// `cargo test -p filo-local real_ -- --ignored --nocapture` (`FILO_REAL=claude`, `codex`, `muse`, `opencode` or `pi`
+    /// for one of them; `FILO_REAL_MODEL` for the model of the last four).
     fn real_round(engine: Engine) {
         let only = std::env::var("FILO_REAL").unwrap_or_default();
         if !only.is_empty() && Engine::parse(&only) != Some(engine) {
@@ -3059,8 +3251,9 @@ sleep 30
             Engine::Claude => Some("haiku".into()),
             _ => std::env::var("FILO_REAL_MODEL").ok(),
         };
-        spec.effort =
-            std::env::var("FILO_REAL_EFFORT").ok().filter(|_| matches!(engine, Engine::Muse | Engine::OpenCode));
+        spec.effort = std::env::var("FILO_REAL_EFFORT")
+            .ok()
+            .filter(|_| matches!(engine, Engine::Muse | Engine::OpenCode | Engine::Pi));
         spec.new_session = (engine == Engine::Claude).then(|| uuid::Uuid::new_v4().to_string());
         spec.message = "Create a file named hello.txt in the current folder containing exactly the word hi, using a shell command. Then reply with one short sentence.".into();
         spec.instructions = format!("You work in {}. Save nothing else.", dir.display());
@@ -3190,6 +3383,96 @@ sleep 30
     #[ignore]
     fn real_opencode_asks_and_carries_on() {
         real_round(Engine::OpenCode);
+    }
+
+    #[test]
+    #[ignore]
+    fn real_pi_asks_and_carries_on() {
+        real_round(Engine::Pi);
+    }
+
+    /// The installed pi, its model the scripted stand-in of tests/pi/scripted-provider.ts (no sign-in, nothing
+    /// called) replying as `script` says: a wrapper that runs pi with that extension too, on pi's own PATH.
+    fn scripted_pi(dir: &Path, script: Value) -> PathBuf {
+        let pi = crate::engine::find_program(Engine::Pi, None).expect("pi is installed");
+        let provider = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pi/scripted-provider.ts");
+        let real = pi.canonicalize().unwrap_or(pi.clone());
+        let bins =
+            [pi.parent(), real.parent()].into_iter().flatten().map(|dir| dir.display().to_string()).collect::<Vec<_>>();
+        crate::test_support::script(
+            dir,
+            "pi",
+            &format!(
+                "#!/bin/sh\nexport PATH='{}':\"$PATH\"\nexport FILO_PI_SCRIPT='{}'\nexec '{}' -e '{}' --session-dir '{}' \"$@\"\n",
+                bins.join(":"),
+                script,
+                pi.display(),
+                provider.display(),
+                dir.join("sessions").display()
+            ),
+        )
+    }
+
+    /// The installed pi in a round on Auto: a command it asks about first on Filo's card (allowed, it runs), a file
+    /// outside its folder (denied, it isn't written), and the round ends with its reply.
+    /// `cargo test -p filo-local real_pi_scripted -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_pi_scripted_round_asks_on_filos_card() {
+        let dir = crate::test_support::temp_dir("real-pi-round");
+        let outside = crate::test_support::temp_dir("real-pi-outside");
+        let script = json!([
+            [{ "tool": "bash", "args": { "command": "touch made.txt" } }],
+            [{ "tool": "write", "args": { "path": outside.join("x.txt").display().to_string(), "content": "x" } }],
+            [{ "text": "Made it, left the other alone." }]
+        ]);
+        let mut spec = spec(Engine::Pi, scripted_pi(&dir, script), &dir);
+        (spec.mode, spec.model, spec.new_session) = ("auto".into(), Some("filo-test/script".into()), None);
+        let mut host = Recorder::default();
+        host.answers.insert("ask-1".into(), "allow".into());
+        host.answers.insert("ask-2".into(), "deny".into());
+        let end = run(&spec, &mut host, |_| {});
+        println!("ended: {end:?}\nasked: {:?}\nsteps: {:?}", host.asks, host.steps);
+        assert_eq!((end.error.as_deref(), end.final_text.as_deref()), (None, Some("Made it, left the other alone.")));
+        assert!(end.session_id.is_some());
+        let titles: Vec<&str> = host.asks.iter().map(|ask| ask.title.as_str()).collect();
+        assert_eq!(titles, ["Run `touch made.txt`".to_string(), format!("Change {}", outside.join("x.txt").display())]);
+        assert!(dir.join("made.txt").is_file() && !outside.join("x.txt").exists());
+        assert_eq!(host.steps[0], Step::did("command", "touch made.txt"));
+    }
+
+    /// The installed pi in a chat turn: a message sent while it works is steered in, delivered after its command, and
+    /// answered in the same run; the next turn resumes the session.
+    /// `cargo test -p filo-local real_pi_scripted -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_pi_scripted_chat_turn_steers_and_resumes() {
+        let dir = crate::test_support::temp_dir("real-pi-chat");
+        let script = json!([
+            [{ "wait": 1500 }, { "tool": "bash", "args": { "command": "sleep 1" } }],
+            [{ "echo": true }]
+        ]);
+        let program = scripted_pi(&dir, script);
+        let mut spec =
+            Spec { chat: true, new_session: None, skills: Some(Vec::new()), ..spec(Engine::Pi, program, &dir) };
+        spec.model = Some("filo-test/script".into());
+        let mut host = Recorder::default();
+        host.notes.push("Keep them short".into());
+        let end = run(&spec, &mut host, |_| {});
+        println!("ended: {end:?}\nsteps: {:?}", host.steps);
+        assert_eq!((end.error.as_deref(), end.final_text.as_deref()), (None, Some("heard: Keep them short")));
+        assert_eq!(host.noted, ["Keep them short"]);
+        let session = end.session_id.expect("a session");
+        spec.resume = Some(session.clone());
+        spec.message = "And again".into();
+        let end = run(&spec, &mut Recorder::default(), |_| {});
+        assert_eq!((end.error.as_deref(), end.final_text.as_deref()), (None, Some("heard: And again")), "{end:?}");
+        assert_eq!(end.session_id.as_deref(), Some(session.as_str()));
+        // One it can't find fails as gone.
+        spec.resume = Some("0b5e1b2c-0000-4000-8000-000000000000".into());
+        let end = run(&spec, &mut Recorder::default(), |_| {});
+        println!("gone: {end:?}");
+        assert!(end.error.is_some_and(|error| error.contains("No session found matching")));
     }
 
     /// The installed Claude Code ending its turn with a command still running in the background: kept running, it

@@ -3531,7 +3531,7 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
     let backend = backend(cx);
     cx.on_next_frame(window, |shell, window, cx| shell.open_tab(Tab::Agents, window, cx));
     cx.spawn_in(window, async move |this, cx| {
-        for tool in ["claude-code", "codex", "muse", "opencode"] {
+        for tool in filo_local::coding::TOOLS {
             backend.call_raw("coding:setPlugged", json!({ "tool": tool, "plugged": true })).await.ok();
         }
         let executor = cx.background_executor().clone();
@@ -3662,15 +3662,15 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
 }
 
 /// `FILO_OPEN=coding-pickers-drive`: the Coding page's Model, Reasoning and Mode pickers (every tool plugged in), whose
-/// places it logs for each tool (all on one line when their middles match). Then OpenCode's model picker, used like a
-/// person would: a click, `FILO_DRIVE_SEARCH` typed (default "free") and Return, the places logged again (Reasoning
-/// and Mode where they were).
+/// places it logs for each tool (all on one line when their middles match). Then one tool's model picker
+/// (`FILO_DRIVE_TOOL`, default "opencode"), used like a person would: a click, `FILO_DRIVE_SEARCH` typed (default
+/// "free") and Return, the places logged again (Reasoning and Mode where they were), with shots in `FILO_DRIVE_SHOTS`.
 fn run_coding_pickers_drive(window: &mut Window, cx: &mut Context<AppShell>) {
     let backend = backend(cx);
     cx.on_next_frame(window, |shell, window, cx| shell.open_tab(Tab::Coding, window, cx));
     cx.spawn_in(window, async move |this, cx| {
         // Every tool plugged in, so each shows its pickers (run it on a config of its own: `FILO_CONFIG_DIR`).
-        for tool in ["claude-code", "codex", "muse", "opencode"] {
+        for tool in filo_local::coding::TOOLS {
             let plugged = backend.call_raw("coding:setPlugged", json!({ "tool": tool, "plugged": true })).await;
             eprintln!("coding-pickers-drive: plugged {tool} ({})", if plugged.is_ok() { "ok" } else { "failed" });
         }
@@ -3688,7 +3688,7 @@ fn run_coding_pickers_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             })
         };
         let log = |when: &str| {
-            for tool in ["claude-code", "codex", "muse", "opencode"] {
+            for tool in filo_local::coding::TOOLS {
                 let places: Vec<String> = ["model", "reasoning", "mode"]
                     .iter()
                     .map(|picker| {
@@ -3711,51 +3711,49 @@ fn run_coding_pickers_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             }
         };
         wait(3000).await;
-        // The Muse Code and OpenCode lists come in the background, from their own servers.
+        let tool = std::env::var("FILO_DRIVE_TOOL").unwrap_or_else(|_| "opencode".into());
+        let (picker, list) = (format!("coding-model-{tool}"), format!("coding-model-search-{tool}-list"));
+        // The Muse Code, OpenCode and pi lists come in the background, from their own servers.
         for _ in 0..90 {
-            if on_screen("coding-model-opencode").is_some() && on_screen("coding-model-muse").is_some() {
+            if on_screen(&picker).is_some() && on_screen("coding-model-muse").is_some() {
                 break;
             }
             wait(1000).await;
         }
         log("opened");
-        // OpenCode's row is below the fold: scrolled up to the window's top third first, as a person would.
-        if let (Some(width), Some(bounds)) = (window_width(&this, cx), on_screen("coding-model-opencode")) {
+        shot("coding-opened");
+        // Its row may be below the fold: scrolled up to the window's top third first, as a person would.
+        if let (Some(width), Some(bounds)) = (window_width(&this, cx), on_screen(&picker)) {
             native_input::hover(width, width / 2., 300.);
             native_input::scroll_in(width, width / 2., 300., f64::from(f32::from(bounds.top())) - 200.);
         }
         wait(1000).await;
         log("scrolled");
-        eprintln!("coding-pickers-drive: clicked OpenCode's model ({})", click(&this, cx, "coding-model-opencode"));
+        shot("coding-scrolled");
+        eprintln!("coding-pickers-drive: clicked {tool}'s model ({})", click(&this, cx, &picker));
         wait(800).await;
-        eprintln!(
-            "coding-pickers-drive: list {}",
-            place("coding-model-search-opencode-list").unwrap_or_else(|| "not open".into())
-        );
+        eprintln!("coding-pickers-drive: list {}", place(&list).unwrap_or_else(|| "not open".into()));
+        shot("coding-model-list");
         let search = std::env::var("FILO_DRIVE_SEARCH").unwrap_or_else(|_| "free".into());
         type_keys(&this, cx, &search, false);
         wait(800).await;
-        eprintln!(
-            "coding-pickers-drive: searched {search:?}: list {}",
-            place("coding-model-search-opencode-list").unwrap_or_else(|| "none".into())
-        );
+        eprintln!("coding-pickers-drive: searched {search:?}: list {}", place(&list).unwrap_or_else(|| "none".into()));
+        shot("coding-model-searched");
         type_keys(&this, cx, "", true);
         wait(1500).await;
-        eprintln!(
-            "coding-pickers-drive: after Return: list {}",
-            place("coding-model-search-opencode-list").unwrap_or_else(|| "closed".into())
-        );
+        eprintln!("coding-pickers-drive: after Return: list {}", place(&list).unwrap_or_else(|| "closed".into()));
         log("picked");
+        shot("coding-picked");
         let overview = backend.call_raw("coding:overview", json!({})).await.unwrap_or_default();
-        let opencode = overview["tools"]
+        let row = overview["tools"]
             .as_array()
             .into_iter()
             .flatten()
-            .find(|tool| tool["id"] == "opencode")
+            .find(|row| row["id"] == tool.as_str())
             .cloned()
             .unwrap_or_default();
-        let offered = opencode["models"].as_array().map_or(0, Vec::len);
-        eprintln!("coding-pickers-drive: OpenCode offers {offered} models; its model now {}", opencode["model"]);
+        let offered = row["models"].as_array().map_or(0, Vec::len);
+        eprintln!("coding-pickers-drive: {tool} offers {offered} models; its model now {}", row["model"]);
         eprintln!("coding-pickers-drive: done");
         if std::env::var_os("FILO_DRIVE_STAY").is_none() {
             cx.update(|_, cx| cx.quit()).ok();
@@ -6811,7 +6809,7 @@ fn run_reasoning_drive(window: &mut Window, cx: &mut Context<AppShell>) {
     cx.on_next_frame(window, |shell, window, cx| shell.open_tab(Tab::Agents, window, cx));
     cx.spawn_in(window, async move |this, cx| {
         use filo_local::Engine::{Claude, Codex, OpenCode};
-        for tool in ["claude-code", "codex", "muse", "opencode"] {
+        for tool in filo_local::coding::TOOLS {
             backend.call_raw("coding:setPlugged", json!({ "tool": tool, "plugged": true })).await.ok();
         }
         let executor = cx.background_executor().clone();

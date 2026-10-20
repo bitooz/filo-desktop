@@ -1,12 +1,12 @@
-// Filo's local chats: no Filo account or hosted backend, the user's own coding tool (Claude Code, Codex, Muse Code or
-// OpenCode) answers.
+// Filo's local chats: no Filo account or hosted backend, the user's own coding tool (Claude Code, Codex, Muse Code,
+// OpenCode or pi) answers.
 //
 // - `coding`: the Coding page in it: tool settings, project folders (found and added), tasks and their history, and
-//   the command lines and steps of a coding task's Claude Code, Codex, Muse Code or OpenCode.
+//   the command lines and steps of a coding task's Claude Code, Codex, Muse Code, OpenCode or pi.
 // - `coding_handoff`: coding tasks a conversation handed off (start_work) and owns: what the tool asks, notes for it,
 //   each round's result and proof, and what the conversation is told; `coding_mcp`: the tools that start and follow
 //   them; `coding_session`: a round of such a task with its tool kept talking to, so it can ask (Muse Code's protocol
-//   in `coding_muse`, OpenCode's in `coding_opencode`).
+//   in `coding_muse`, OpenCode's in `coding_opencode`, pi's in `coding_pi`).
 // - `group`: the group chat of Filo and the user's agents in it: its messages, its queue of turns, who the user's @Name or a member's ask list asks,
 //   and a member's turn of its coding tool; `group_route`: the quick call to the model that picks who answers a post
 //   naming no one; `agent_asks`: an agent asking another while the group is off, each in its own chat.
@@ -86,6 +86,7 @@ pub mod coding_handoff;
 mod coding_mcp;
 pub mod coding_muse;
 pub mod coding_opencode;
+pub mod coding_pi;
 pub mod coding_session;
 pub mod compaction;
 pub mod computer;

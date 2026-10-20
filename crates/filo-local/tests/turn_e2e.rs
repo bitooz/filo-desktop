@@ -1203,7 +1203,59 @@ fn a_muse_code_chat_turn_with_the_real_mcp_server() {
     std::fs::remove_dir_all(store.root()).ok();
 }
 
-/// A real chat on the installed `FILO_REAL_ENGINE` (muse or opencode; `FILO_REAL_MODEL` and `FILO_REAL_EFFORT` for its
+/// A chat on the installed pi, its model the scripted stand-in of tests/pi/scripted-provider.ts (no sign-in, nothing
+/// called): Filo's real MCP server comes in through Filo's extension, the reply goes out with send_message, and the
+/// next message resumes the session. `cargo test -p filo-local --test turn_e2e real_pi_scripted -- --ignored`.
+#[test]
+#[ignore]
+fn real_pi_scripted_chat_turn_with_the_real_mcp_server() {
+    let store = Store::at(common::temp_root("pi"));
+    let (runtime, _) = stand_in(&store);
+    let pi = engine::find_program(Engine::Pi, None).expect("pi is installed");
+    let real = pi.canonicalize().unwrap_or(pi.clone());
+    let bins: Vec<String> =
+        [pi.parent(), real.parent()].into_iter().flatten().map(|dir| dir.display().to_string()).collect();
+    let script = json!([
+        [{ "tool": "mcp__filo__send_message", "args": { "text": "Hi from pi" } }],
+        [{ "text": "sent" }],
+        [{ "tool": "mcp__filo__send_message", "args": { "text": "Hi again" } }],
+        [{ "text": "sent" }]
+    ]);
+    let provider = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/pi/scripted-provider.ts");
+    common::stand_in(
+        &store.root().join("bin"),
+        "pi",
+        &format!(
+            "#!/bin/sh\nexport PATH='{}':\"$PATH\"\nexport FILO_PI_SCRIPT='{script}'\nexec '{}' -e '{}' --session-dir '{}' \"$@\"\n",
+            bins.join(":"),
+            pi.display(),
+            provider.display(),
+            store.root().join("pi-sessions").display()
+        ),
+    );
+    let chat = store.create_chat(Engine::Pi).unwrap();
+    store.update_chat(&chat.id, |chat| chat.model = Some("filo-test/script".into())).unwrap();
+    store.add_user_message(&chat.id, "hello pi", "turn-1").unwrap();
+    let report = turn::run(&store, &runtime, &chat.id, "turn-1", |_| {});
+    assert_eq!(report, Report { replies: 1, stopped: false, error: None, ..Report::default() });
+    let session = store.chat(&chat.id).unwrap().unwrap().session.expect("session kept");
+    assert_eq!(session.engine, Engine::Pi);
+    store.add_user_message(&chat.id, "again", "turn-2").unwrap();
+    let report = turn::run(&store, &runtime, &chat.id, "turn-2", |_| {});
+    assert_eq!(report.replies, 1, "{report:?}");
+    assert_eq!(store.chat(&chat.id).unwrap().unwrap().session.unwrap().id, session.id);
+    let replies: Vec<String> = store
+        .messages(&chat.id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == Role::Assistant)
+        .map(|message| message.text)
+        .collect();
+    assert_eq!(replies, ["Hi from pi", "Hi again"]);
+    std::fs::remove_dir_all(store.root()).ok();
+}
+
+/// A real chat on the installed `FILO_REAL_ENGINE` (muse, opencode or pi; `FILO_REAL_MODEL` and `FILO_REAL_EFFORT` for its
 /// model and reasoning level, `FILO_REAL_MODE` for its Coding page mode, Auto by default) with the real MCP server: it
 /// runs a shell command and replies with Filo's send_message, then answers a follow-up in the same session. Uses the
 /// tool's sign-in: `FILO_REAL_ENGINE=muse cargo test -p filo-local --test turn_e2e real_chat -- --ignored --nocapture`

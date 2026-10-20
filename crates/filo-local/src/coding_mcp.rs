@@ -46,7 +46,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "list_coding_projects",
             "title": "List coding projects",
-            "description": "Shows what you can code with on the user's Mac: which coding tools (Claude Code, Codex, Muse Code, OpenCode) are plugged in on Filo's Coding page and installed, and the project folders Filo knows (the git repos it found, and folders the user added). Call it before start_work when you don't know the project's exact name. Any other folder can be given to start_work by its full path. If no tool is ready, tell the user what's missing (plug a tool in on the Coding page, install or sign it in) rather than starting.",
+            "description": "Shows what you can code with on the user's Mac: which coding tools (Claude Code, Codex, Muse Code, OpenCode, pi) are plugged in on Filo's Coding page and installed, and the project folders Filo knows (the git repos it found, and folders the user added). Call it before start_work when you don't know the project's exact name. Any other folder can be given to start_work by its full path. If no tool is ready, tell the user what's missing (plug a tool in on the Coding page, install or sign it in) rather than starting.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "search": { "type": "string", "description": "Only projects whose name or path has this." } },
@@ -57,9 +57,9 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "start_work",
             "title": "Start work",
-            "description": "Hands work in one of the user's projects to a coding tool on their Mac (Claude Code, Codex, Muse Code or OpenCode): their code, a review of it, research inside it. Do small things yourself; hand work off when it needs the project (editing code, running it, its tests) or would take a while. One piece of work per task: two unrelated asks are two hand-offs. \
+            "description": "Hands work in one of the user's projects to a coding tool on their Mac (Claude Code, Codex, Muse Code, OpenCode or pi): their code, a review of it, research inside it. Do small things yourself; hand work off when it needs the project (editing code, running it, its tests) or would take a while. One piece of work per task: two unrelated asks are two hand-offs. \
         Say what the work is, not how to do it: title (a few words for its row), goal (the outcome in one line, in the user's terms), doneWhen (what finished looks like, in a sentence; name a check only when it is the point, like a failing test that should pass), and changes (false when it only looks: investigate, review, research; it then can't edit anything). notes, when needed at all, is a line or two it can't learn from the code or the goal (where the problem shows, what must stay as it is): never workspace, git, permission or testing rules, which it already has. Write plainly, in sentence case: capitalised words for emphasis are refused. Name a file the user sent where it matters, by its path on their Mac. \
-        project is a project's name from list_coding_projects or the full path of any folder. tool is claude-code, codex, muse (Muse Code) or opencode (OpenCode): the one the user named, else leave it out for your own engine. model, effort and workspace follow the Coding page's settings: pass them only when the user asked (workspace \"worktree\": its own branch in its own worktree; \"checkout\": their folder as it is). \
+        project is a project's name from list_coding_projects or the full path of any folder. tool is claude-code, codex, muse (Muse Code), opencode (OpenCode) or pi: the one the user named, else leave it out for your own engine. model, effort and workspace follow the Coding page's settings: pass them only when the user asked (workspace \"worktree\": its own branch in its own worktree; \"checkout\": their folder as it is). \
         To add to a task already under way or finished, pass its id as continues (the next round in the same session) instead of starting it again; a hand-off that looks like one under way in this conversation is refused unless you pass separate: true. \
         You are told in this conversation, in a turn of its own, when the tool asks something or finishes a round. Tell the user in a line that it started; don't check on it unless they ask.",
             "inputSchema": {
@@ -71,7 +71,7 @@ pub fn tools() -> Vec<Value> {
                     "changes": { "type": "boolean", "description": "False when it only looks (investigate, review, research)." },
                     "project": { "type": "string", "description": "A project's name (list_coding_projects) or a folder's full path." },
                     "notes": { "type": "string", "description": "Optional: a line or two it can't learn from the code or the goal." },
-                    "tool": { "type": "string", "enum": ["default", "claude-code", "codex", "muse", "opencode"], "description": "The coding tool: the one the user named; default (or left out) is your own engine." },
+                    "tool": { "type": "string", "enum": ["default", "claude-code", "codex", "muse", "opencode", "pi"], "description": "The coding tool: the one the user named; default (or left out) is your own engine." },
                     "model": { "type": "string", "description": "Only when the user asked for a model." },
                     "effort": { "type": "string", "enum": std::iter::once("default").chain(crate::coding::EFFORT_ORDER).collect::<Vec<_>>(), "description": "Only when the user asked for a reasoning level." },
                     "workspace": { "type": "string", "enum": ["default", "worktree", "checkout"], "description": "Only when the user said where the work goes." },
@@ -396,7 +396,7 @@ fn pick_tool(db: &Db, origin: &Origin, asked: Option<&str>) -> Result<String, St
     let plugged = |id: &str| tools.iter().any(|tool| tool.id == id && tool.plugged);
     if let Some(asked) = asked {
         let engine = coding::engine_of(asked)
-            .ok_or_else(|| format!("Not a coding tool: {asked}. Use claude-code, codex, muse or opencode."))?;
+            .ok_or_else(|| format!("Not a coding tool: {asked}. Use claude-code, codex, muse, opencode or pi."))?;
         if !plugged(asked) {
             return Err(format!(
                 "{} is unplugged on Filo's Coding page. Tell the user to plug it in there, or use another tool if they don't mind.",
@@ -700,7 +700,10 @@ mod tests {
             .iter()
             .map(|tool| (tool["name"].as_str().unwrap(), tool["pluggedIn"].as_bool().unwrap()))
             .collect();
-        assert_eq!(tools, [("Claude Code", true), ("Codex", true), ("Muse Code", false), ("OpenCode", false)]);
+        assert_eq!(
+            tools,
+            [("Claude Code", true), ("Codex", true), ("Muse Code", false), ("OpenCode", false), ("pi", false)]
+        );
         drop(db);
         std::fs::remove_dir_all(store.root()).ok();
     }

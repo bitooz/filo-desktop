@@ -12,7 +12,7 @@
 // a proxy (`filo --local-mcp --app <id>`, apps_client.rs), which reads the secrets, runs or reaches the server, hides
 // the tools the user turned off and refuses their calls. Claude Code gets it in `--mcp-config` (its tools allowed with
 // `mcp__filo-<slug>`), Codex with `-c mcp_servers.filo-<slug>.…` (engine.rs), Muse Code and OpenCode with their session
-// (coding_muse.rs, coding_opencode.rs).
+// (coding_muse.rs, coding_opencode.rs), pi through Filo's extension (coding_pi.rs).
 
 use std::collections::BTreeMap;
 
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS apps (
     codex          INTEGER NOT NULL DEFAULT 1,
     muse           INTEGER NOT NULL DEFAULT 1,
     opencode       INTEGER NOT NULL DEFAULT 1,
+    pi             INTEGER NOT NULL DEFAULT 1,
     agent_scope    TEXT NOT NULL DEFAULT 'all',
     agents         TEXT NOT NULL DEFAULT '[]',
     enabled_tools  TEXT NOT NULL DEFAULT '[]',
@@ -63,15 +64,16 @@ CREATE TABLE IF NOT EXISTS apps (
 ";
 
 /// Columns added after the table first shipped, each added to a table made without it (`ensure`). `all_tools` comes
-/// in off: apps connected before it keep their tools as they were, only the read-only ones on by themselves. Muse Code
-/// and OpenCode come in on, as Claude Code and Codex are for a new app.
-const ADDED_COLUMNS: [(&str, &str); 6] = [
+/// in off: apps connected before it keep their tools as they were, only the read-only ones on by themselves. Muse Code,
+/// OpenCode and pi come in on, as Claude Code and Codex are for a new app.
+const ADDED_COLUMNS: [(&str, &str); 7] = [
     ("enabled_tools", "TEXT NOT NULL DEFAULT '[]'"),
     ("agent_scope", "TEXT NOT NULL DEFAULT 'all'"),
     ("agents", "TEXT NOT NULL DEFAULT '[]'"),
     ("all_tools", "INTEGER NOT NULL DEFAULT 0"),
     ("muse", "INTEGER NOT NULL DEFAULT 1"),
     ("opencode", "INTEGER NOT NULL DEFAULT 1"),
+    ("pi", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 /// The Filo agent (Agents tab), which Filo's own chats and the group's `filo` speaker are: the id it's made with
@@ -212,6 +214,7 @@ pub struct App {
     pub codex: bool,
     pub muse: bool,
     pub opencode: bool,
+    pub pi: bool,
     /// Which agents (the Agents tab's, Filo among them) may use it: every one, new ones too (`all`), or those in
     /// `agents` (`some`).
     pub agent_scope: String,
@@ -245,6 +248,7 @@ impl App {
             Engine::Codex => self.codex,
             Engine::Muse => self.muse,
             Engine::OpenCode => self.opencode,
+            Engine::Pi => self.pi,
         }
     }
 
@@ -310,7 +314,7 @@ pub struct Fields {
     pub scopes: Option<String>,
 }
 
-const COLUMNS: &str = "id, slug, name, preset, transport, command, args, env, url, auth, key_name, key_prefix, has_secret, oauth, enabled, claude, codex, enabled_tools, disabled_tools, tools, status, status_detail, server_name, checked_at, created_at, updated_at, agent_scope, agents, all_tools, muse, opencode";
+const COLUMNS: &str = "id, slug, name, preset, transport, command, args, env, url, auth, key_name, key_prefix, has_secret, oauth, enabled, claude, codex, enabled_tools, disabled_tools, tools, status, status_detail, server_name, checked_at, created_at, updated_at, agent_scope, agents, all_tools, muse, opencode, pi";
 
 fn json_column<T: for<'de> Deserialize<'de> + Default>(row: &Row, index: usize) -> rusqlite::Result<T> {
     let text: String = row.get(index)?;
@@ -350,6 +354,7 @@ fn app(row: &Row) -> rusqlite::Result<App> {
         all_tools: row.get(28)?,
         muse: row.get(29)?,
         opencode: row.get(30)?,
+        pi: row.get(31)?,
     })
 }
 

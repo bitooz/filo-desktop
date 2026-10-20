@@ -661,6 +661,7 @@ impl ConnectorScreen {
                     Some(filo_local::Engine::Codex) => app.codex,
                     Some(filo_local::Engine::Muse) => app.muse,
                     Some(filo_local::Engine::OpenCode) => app.opencode,
+                    Some(filo_local::Engine::Pi) => app.pi,
                     _ => app.claude,
                 };
                 let on = self.saving.get(&key).copied().unwrap_or(allowed);

@@ -7,7 +7,7 @@ overview and how to build it.
 Filo is a native macOS app built with [GPUI](https://www.gpui.rs/) (Zed's GPU UI framework) and gpui-component, with no
 account and no hosted backend. Each page calls named backend functions (`users:current`, `agents:list`,
 `voiceSessions:detail`…), answered on this Mac. Conversations are answered by your own coding tool: [Claude
-Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), Muse Code or OpenCode.
+Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), Muse Code, OpenCode or [pi](https://pi.dev).
 
 ```bash
 cargo run                         # the app
@@ -16,7 +16,7 @@ cargo test -p filo-local          # chat storage, the database and notes, MCP se
 cargo test --bin filo             # the app's tests, the local backend's included
 ```
 
-You need one of them (`claude`, `codex`, `muse` or `opencode`) installed and signed in. Filo looks for them on your login
+You need one of them (`claude`, `codex`, `muse`, `opencode` or `pi`) installed and signed in. Filo looks for them on your login
 shell's PATH, then in `~/.local/bin`, `~/.claude/local`, `~/.opencode/bin`, `~/.npm-global/bin`, `~/.bun/bin`,
 `/opt/homebrew/bin` and `/usr/local/bin` (crates/filo-local `engine::find_program`). Debug builds compile GPUI's Metal
 shaders at startup (`runtime_shaders`), so no Metal toolchain is needed.
@@ -167,12 +167,14 @@ A chat runs one turn at a time. A message sent while one works goes into it (cra
 message reaches it at its next step: one more user message on Claude Code's stdin, a `turn/steer` on Codex's
 app-server (`codex app-server`, which Codex chats run on; `codex exec` takes nothing mid-turn) and on Muse Code's
 `muse serve` (`expectedTurnId`, the running turn), a prompt delivered as `steer` on OpenCode's server (in its inbox
-until `session.inbox.delivered`). Every engine's events go through one piece of code (coding_session.rs `Notes`): a
-message is the turn's once the CLI has it (Claude Code replays it, the steer is accepted, the inbox delivers it) and
+until `session.inbox.delivered`), a `steer` on pi's RPC (queued until pi delivers it as a user message after the
+tool calls under way). Every engine's events go through one piece of code (coding_session.rs `Notes`): a
+message is the turn's once the CLI has it (Claude Code replays it, the steer is accepted, the inbox or pi delivers it) and
 has done something since, or once a turn it was started with is under way. A CLI that has it but ends its turn first
 hasn't answered it: Claude Code and OpenCode take it in a turn of their own, which is waited for (10 s); for Codex and
-Muse Code a new turn in the same session starts with it. A steer refused mid-turn is offered again every 2 s; refused
-for 6 s, the running turn is interrupted (`turn/interrupt`, `POST …/interrupt`) and a new turn starts with the message,
+Muse Code a new turn in the same session starts with it, and on pi, whose run settled with it still queued, it's
+taken back (`clear_queue`) and the next prompt carries it. A steer refused mid-turn is offered again every 2 s; refused
+for 6 s, the running turn is interrupted (`turn/interrupt`, `POST …/interrupt`, pi's `abort`) and a new turn starts with the message,
 told it was stopped, so it carries on after what it already did and posted. One refused because the turn had just ended
 (Muse Code's `already_terminal`), or that never reached the CLI, interrupts nothing. The message shows in the chat as
 sent, and the replies from then on answer it. Its own turn waits behind the running one and ends without running once
@@ -448,7 +450,7 @@ Feed only. Each post says who shared it (the agent, with its picture).
 
 ## Coding
 
-The Coding page runs your own Claude Code, Codex, Muse Code or OpenCode on this Mac; everything is in `local/filo.db` (crates/filo-local
+The Coding page runs your own Claude Code, Codex, Muse Code, OpenCode or pi on this Mac; everything is in `local/filo.db` (crates/filo-local
 `coding`: `coding_settings`, `coding_tools`, `coding_projects`, `coding_tasks`, `coding_events`).
 
 - **Settings** are saved as they change: each tool plugged in or not (on until you turn it off), its mode, model and
@@ -466,8 +468,8 @@ The Coding page runs your own Claude Code, Codex, Muse Code or OpenCode on this 
   (`api.anthropic.com/api/oauth/usage`), with the sign-in Claude Code keeps in the Keychain, read with `/usr/bin/security`
   as Claude Code reads it (an expired token is left for Claude Code to refresh); Codex's from `account/rateLimits/read`
   on `codex app-server`, started in the temporary folder (started disclaimed in a Desktop checkout, macOS would ask for
-  the Desktop). Muse Code's host reports usage only after a model call in that session, and OpenCode's providers have no
-  plan windows, so neither shows one. In `dev` builds `FILO_PLAN_USAGE=<json>` (as `coding:usage` answers) stands in
+  the Desktop). Muse Code's host reports usage only after a model call in that session, and OpenCode's and pi's providers have no
+  plan windows, so none of them shows one. In `dev` builds `FILO_PLAN_USAGE=<json>` (as `coding:usage` answers) stands in
   for the accounts', to see the pills run low, and `FILO_PLAN_USAGE_AFTER=<seconds>` holds the answer back that long,
   to see them while it's on its way.
 - **Chat turns follow the tools' modes:** Filo's, an agent's, a group member's and a routine's turn works as its
@@ -490,7 +492,7 @@ The Coding page runs your own Claude Code, Codex, Muse Code or OpenCode on this 
 
 ### Coding from a conversation
 
-Filo and your agents hand coding work to Claude Code, Codex, Muse Code or OpenCode from any chat, an agent's conversation or the group,
+Filo and your agents hand coding work to Claude Code, Codex, Muse Code, OpenCode or pi from any chat, an agent's conversation or the group,
 with the MCP tools in crates/filo-local `coding_mcp` (every conversation's server has them). The task belongs to that
 conversation (crates/filo-local `coding_handoff`: `coding_handoffs`, `coding_requests`, `coding_notes`,
 `coding_rounds`, `coding_wakes` in `local/filo.db`), which hears what it asks and how each round ends. There is no
@@ -549,7 +551,43 @@ cloud worker: everything runs on this Mac.
   <task>@<round>` clicks Share and Unshare on a round's page and checks the link with curl in between.
 - A task started while the app is closed (a routine's turn in `filo --scheduler`) stays queued and starts when Filo
   opens. `cargo test -p filo-local real_ -- --ignored --nocapture` runs a Supervised round of each installed coding
-  tool that has to ask (`FILO_REAL=claude`, `codex`, `muse` or `opencode` for one).
+  tool that has to ask (`FILO_REAL=claude`, `codex`, `muse`, `opencode` or `pi` for one).
+
+### pi
+
+[pi](https://pi.dev) runs as `pi --mode rpc`, JSON lines both ways (pi's docs/rpc.md; crates/filo-local `coding_pi`),
+for chat turns and coding rounds alike, through the same session code as the other engines (coding_session.rs). The
+message is a `prompt`, a note a `steer`; what it does comes as events (`tool_execution_start`, each message's
+`message_end`) and the run is over at `agent_settled`. The instructions go in as `--append-system-prompt` on every
+run, a session carries on with `--session <id>` (one pi can't find, "No session found matching", counts as gone, so a
+chat starts afresh with its recent messages), and a new session's id comes from `get_state`. The Coding page's model
+list is pi's `get_available_models` (the providers it's signed in to), ids `provider/model`, with the thinking levels
+each takes (`--thinking`); signed in means a provider in pi's `auth.json` (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`),
+read, never written.
+
+What pi doesn't have comes from Filo's extension (crates/filo-local `pi_extension.ts`, written to the temporary folder
+and loaded with `-e`), told what it needs in `FILO_PI`:
+
+- **MCP servers.** A chat's (Filo's and the apps on for it) go to `pi.registerMcpServer` on a pi that has MCP of its
+  own, with their tools declared to the model; pi 0.84 has none, so there the extension starts each server, lists its
+  tools and registers each as `mcp__<server>__<tool>`, passing calls on as `tools/call`. The user's own `mcp.json` and
+  `PI_CODING_AGENT_DIR` (their login) are left alone.
+- **Modes.** Full access lets everything run. Auto lets reading run, and changes to files in the task's folders; a
+  change elsewhere, and in a coding round a command that isn't plainly a look (`ls`, `git status`, `rg`… with no
+  redirection), is asked first, as an `extension_ui_request` select with Allow, Allow always and Deny: the round's
+  permission card (`Host::ask`), answered with `extension_ui_response`. Allow always lets the same program, or folder,
+  through for the rest of the run. In a chat nobody answers mid-turn, so its shell isn't asked about and a change
+  outside its folders is refused. Work that only looks can't write or edit.
+- **Nothing holds a turn.** pi asks nothing in RPC mode, the extension leaves `project_trust` undecided (saved trust
+  decisions apply; without one pi's default ignores the project's own `.pi` files), and any dialog that isn't Filo's
+  card is dismissed at once, with a line in the thread.
+
+A chat runs with `--no-extensions --no-skills` and its skills given one by one (`--skill`, from the workspace's
+`.agents/skills`); a coding round loads the user's own extensions and skills. `PI_OFFLINE=1` keeps update checks out
+of every run. `cargo test -p filo-local real_pi_scripted -- --ignored` (and `--test turn_e2e real_pi_scripted`) runs the
+installed pi with a scripted model of the tests' own (tests/pi/scripted-provider.ts: no sign-in, nothing called): the
+permission card, a steer mid-run, a resumed session, and a chat turn replying through Filo's real MCP server.
+`FILO_OPEN=coding-pickers-drive FILO_DRIVE_TOOL=pi` drives its model picker on the Coding page.
 
 ## Artifacts
 

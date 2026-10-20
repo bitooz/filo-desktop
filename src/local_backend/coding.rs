@@ -152,8 +152,8 @@ pub fn start(local: Arc<Local>) {
         std::thread::spawn(move || {
             refresh_tools();
             local.changed();
-            // What Muse Code and OpenCode offer, for their pickers (each starts a server of its own to say).
-            for tool in ["muse", "opencode"] {
+            // What Muse Code, OpenCode and pi offer, for their pickers (each starts a server of its own to say).
+            for tool in ["muse", "opencode", "pi"] {
                 let models = ask_tool_models(tool);
                 if !models.is_empty() {
                     tool_models_cache().lock().unwrap().insert(tool.to_string(), (Instant::now(), models));
@@ -388,7 +388,7 @@ impl Local {
                     "ready": state.is_some_and(|state| state.ready),
                     "mode": settings.mode,
                     "models": match coding::engine_of(&settings.id) {
-                        Some(Engine::Muse | Engine::OpenCode) => json!(tool_models(&settings.id)),
+                        Some(Engine::Muse | Engine::OpenCode | Engine::Pi) => json!(tool_models(&settings.id)),
                         _ => json!(models_of(&settings.id, &model_rows)),
                     },
                 });
@@ -730,7 +730,7 @@ impl Local {
                     }
                 }
             }
-            Engine::Muse | Engine::OpenCode => {
+            Engine::Muse | Engine::OpenCode | Engine::Pi => {
                 let tool = coding::tool_of(engine);
                 let model = model.map(str::to_string).or_else(|| {
                     self.db().ok().and_then(|db| coding::tool(db, tool).ok()).and_then(|settings| settings.model)
@@ -792,7 +792,7 @@ const PAGE_TASK: &str = "An older Filo started this task on the Coding page, and
 fn task_row(task: &Task, run_model: Option<String>, models: &[engine::ModelOption], pending: usize) -> Value {
     let engine = coding::engine_of(&task.tool);
     let model = run_model.or_else(|| task.model.clone()).map(|id| match engine {
-        Some(Engine::Muse | Engine::OpenCode) => {
+        Some(Engine::Muse | Engine::OpenCode | Engine::Pi) => {
             tool_models(&task.tool).into_iter().find(|model| model.id == id).map_or(id, |model| model.name)
         }
         _ => models
@@ -819,7 +819,7 @@ fn models_of(tool: &str, models: &[engine::ModelOption]) -> Vec<Value> {
             let (efforts, default_effort) = match option.engine {
                 Engine::Claude => (CLAUDE_EFFORTS.iter().map(|level| level.to_string()).collect(), None),
                 Engine::Codex => catalogue.get(&option.id).cloned().unwrap_or_default(),
-                Engine::Muse | Engine::OpenCode => (Vec::new(), None),
+                Engine::Muse | Engine::OpenCode | Engine::Pi => (Vec::new(), None),
             };
             let mut row =
                 json!({ "id": option.id, "name": option.label, "efforts": efforts, "isDefault": option.default });
@@ -880,6 +880,7 @@ fn ask_tool_models(tool: &str) -> Vec<coding::ToolModel> {
         Engine::OpenCode => {
             filo_local::coding_opencode::models(&program, Some(path), &dirs::home_dir().unwrap_or_default())
         }
+        Engine::Pi => filo_local::coding_pi::models(&program, Some(path)),
         Engine::Claude | Engine::Codex => Vec::new(),
     }
 }
@@ -1012,7 +1013,7 @@ fn plan_usage() -> Value {
                 let ask = scope.spawn(move || match engine {
                     Engine::Claude => filo_local::plan_usage::claude(now),
                     Engine::Codex => filo_local::plan_usage::codex(program, Some(path)),
-                    Engine::Muse | Engine::OpenCode => None,
+                    Engine::Muse | Engine::OpenCode | Engine::Pi => None,
                 });
                 Some((info.id.clone(), ask))
             })
@@ -1069,6 +1070,7 @@ fn refresh_tools() -> Vec<ToolInfo> {
             Engine::Codex => codex_account(),
             Engine::Muse => muse_account(),
             Engine::OpenCode => opencode_account(),
+            Engine::Pi => pi_account(),
         };
         ToolInfo { id: id.to_string(), program: Some(program), version, signed_in, account, plan }
     };
@@ -1092,13 +1094,14 @@ pub(crate) fn saw_sign_in(engine: Engine, signed_in: bool) {
 /// Whether a tool is signed in on this Mac: the one answer Welcome, the Coding page and problem reports give (they
 /// used to disagree, one asking the CLI and the other reading its files). Claude Code and Codex are asked, given 10
 /// seconds: `claude auth status` (JSON with `loggedIn`; an older Claude Code without it counts only on a clear yes) and
-/// `codex login status` (exit 0 when signed in). Muse Code and OpenCode have no status command: their files say.
+/// `codex login status` (exit 0 when signed in). Muse Code, OpenCode and pi have no status command: their files say.
 pub(crate) fn signed_in(engine: Engine, program: &Path, path: &str) -> bool {
     let args: &[&str] = match engine {
         Engine::Claude => &["auth", "status"],
         Engine::Codex => &["login", "status"],
         Engine::Muse => return muse_account().0,
         Engine::OpenCode => return opencode_account().0,
+        Engine::Pi => return pi_account().0,
     };
     let ran = crate::command::run(
         std::process::Command::new(program).args(args).env("PATH", path),
@@ -1201,9 +1204,24 @@ fn opencode_account_in(auth: &Value) -> (bool, Option<String>, Option<String>) {
     (!providers.is_empty(), None, (!providers.is_empty()).then(|| providers.join(", ")))
 }
 
+/// pi signed in: a provider it has credentials for (`/login` in pi, kept in its `auth.json` in `$PI_CODING_AGENT_DIR`,
+/// else `~/.pi/agent`), named as the plan ("OpenRouter, ChatGPT"). It has the same shape as OpenCode's.
+fn pi_account() -> (bool, Option<String>, Option<String>) {
+    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".pi/agent"));
+    let auth: Value = std::fs::read(dir.join("auth.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    opencode_account_in(&auth)
+}
+
 /// "OpenRouter" for `openrouter`, "Cline Pass" for `cline-pass`: a provider id as it reads.
 fn provider_label(id: &str) -> String {
     match id {
+        "openai-codex" => "ChatGPT".into(),
         "openrouter" => "OpenRouter".into(),
         "openai" => "OpenAI".into(),
         "github-copilot" => "GitHub Copilot".into(),

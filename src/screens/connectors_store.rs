@@ -74,6 +74,7 @@ pub struct AppRow {
     pub codex: bool,
     pub muse: bool,
     pub opencode: bool,
+    pub pi: bool,
     /// `all` (every agent, new ones too) or `some` (only `agents`).
     pub agent_scope: String,
     pub agents: Vec<String>,

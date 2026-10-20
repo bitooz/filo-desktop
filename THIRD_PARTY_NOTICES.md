@@ -196,6 +196,14 @@ that come from [Feather](https://feathericons.com) are under Feather's MIT licen
 - Licence: MIT
 - Copyright (c) 2023 LobeHub
 
+### pi
+
+`assets/icons/pi.svg` is pi's logo (https://pi.dev/logo-auto.svg) in one colour, from
+[pi](https://github.com/earendil-works/pi).
+
+- Licence: MIT
+- Copyright (c) 2025 Mario Zechner
+
 ### Simple Icons
 
 `assets/icons/claude.svg`, `meta.svg`, `opencode.svg` and `mcp-linear.svg`, `mcp-stripe.svg`, `mcp-huggingface.svg`,
@@ -212,7 +220,7 @@ says where each came from.
 
 ### Trademarks
 
-Claude and Anthropic, OpenAI and Codex, Meta, OpenCode, Linear, Stripe, Hugging Face, Cloudflare, Notion, Vercel,
+Claude and Anthropic, OpenAI and Codex, Meta, OpenCode, pi, Linear, Stripe, Hugging Face, Cloudflare, Notion, Vercel,
 GitHub, X, Sentry, ClickUp, Context7, Playwright, Upsy, DeepWiki, Executor and Google are trademarks of their owners.
 Their logos appear in Filo only to name the service or tool they stand for. Filo isn't affiliated with or endorsed by
 any of them.

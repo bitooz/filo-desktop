@@ -3,7 +3,7 @@
 //
 //   Welcome         checks every coding tool on this Mac as it shows (`local_backend::tool_status`), so most people go
 //                   straight on to their first agent. Each one installed is a row with where it stands, Claude Code
-//                   and Codex first; the others fold into one quiet line ("Also works with Muse Code and OpenCode")
+//                   and Codex first; the others fold into one quiet line ("Also works with Muse Code, OpenCode and pi")
 //                   that opens to the same rows, with Install (or Sign in) on each;
 //   Set up a tool   only when none is signed in: any of them, one at a time, Install and Sign in as two numbered steps
 //                   run in Terminal. Filo looks again every few seconds, and Continue wakes up once one is ready;
@@ -70,13 +70,13 @@ enum Step {
 const STEP_IN: Duration = Duration::from_millis(260);
 const COLUMN_WIDTH: f32 = 560.;
 /// How often the tools are looked at again while one isn't ready (`claude auth status` and `codex login status` take a
-/// quarter of a second each, Muse Code's and OpenCode's sign-in is read from their files).
+/// quarter of a second each, Muse Code's, OpenCode's and pi's sign-in is read from their files).
 const RECHECK: Duration = Duration::from_millis(2500);
 
 // --- The coding tools ---
 
 /// The tools the first run checks and sets up: every one the Coding page supports, Claude Code and Codex first.
-const TOOLS: [Engine; 4] = Engine::ALL;
+const TOOLS: [Engine; 5] = Engine::ALL;
 
 /// What it takes to set a tool up: its maker and the official install command (`Engine::sign_in_command` signs in).
 struct Setup {
@@ -94,6 +94,8 @@ fn setup(engine: Engine) -> Setup {
         Engine::Muse => Setup { maker: "Meta", install: "curl -fsSL https://dev.meta.ai/install.sh | bash" },
         // https://opencode.ai/docs (the install script)
         Engine::OpenCode => Setup { maker: "OpenCode", install: "curl -fsSL https://opencode.ai/install | bash" },
+        // https://pi.dev (the install script in pi's README)
+        Engine::Pi => Setup { maker: "Earendil", install: "curl -fsSL https://pi.dev/install.sh | sh" },
     }
 }
 
@@ -1041,7 +1043,7 @@ impl WelcomeTour {
         });
     }
 
-    /// The tools that aren't on this Mac, as one quiet line ("Also works with Muse Code and OpenCode") that opens to
+    /// The tools that aren't on this Mac, as one quiet line ("Also works with Muse Code, OpenCode and pi") that opens to
     /// their rows and closes again.
     fn also_line(&self, missing: &[Engine], others: bool, cx: &mut Context<Self>) -> AnyElement {
         let colors = *cx.colors();

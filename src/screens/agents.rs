@@ -167,7 +167,7 @@ pub struct CanCreate {
 fn creation_blocked(can_create: Option<&CanCreate>) -> Option<String> {
     let can_create = can_create.filter(|can_create| !can_create.allowed)?;
     Some(can_create.reason.clone().unwrap_or_else(|| {
-        "Plug in a coding tool (Claude Code, Codex, Muse Code or OpenCode) on the Coding page to create an agent."
+        "Plug in a coding tool (Claude Code, Codex, Muse Code, OpenCode or pi) on the Coding page to create an agent."
             .into()
     }))
 }

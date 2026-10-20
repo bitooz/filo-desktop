@@ -80,7 +80,7 @@ CREATE INDEX coding_events_by_task ON coding_events (task_id, id);
 ";
 
 /// The tools, as the page names them (`CODING_TOOLS`), in `Engine::ALL`'s order.
-pub const TOOLS: [&str; 4] = ["claude-code", "codex", "muse", "opencode"];
+pub const TOOLS: [&str; 5] = ["claude-code", "codex", "muse", "opencode", "pi"];
 
 /// The reasoning levels any tool names, lowest first: what a level's nearest offered one is measured on (the app's
 /// `nearest_effort`) and what `start_work` may ask for.
@@ -97,7 +97,7 @@ pub fn effort_label(effort: &str) -> String {
     }
 }
 /// The tools a page that never touched them has unplugged: the ones added after the first two, for the user to plug in.
-const UNPLUGGED_AT_FIRST: [&str; 2] = ["muse", "opencode"];
+const UNPLUGGED_AT_FIRST: [&str; 3] = ["muse", "opencode", "pi"];
 /// How freely a tool works (`CODING_MODES`); a new task takes its tool's, and so does a chat turn on its engine
 /// (`turn_mode`). A tool saved in a mode the page no longer offers (supervised, auto_accept_edits) reads as the
 /// default; tasks made in one keep it.
@@ -124,6 +124,7 @@ pub fn engine_of(tool: &str) -> Option<Engine> {
         "codex" => Some(Engine::Codex),
         "muse" => Some(Engine::Muse),
         "opencode" => Some(Engine::OpenCode),
+        "pi" => Some(Engine::Pi),
         _ => None,
     }
 }
@@ -134,6 +135,7 @@ pub fn tool_of(engine: Engine) -> &'static str {
         Engine::Codex => "codex",
         Engine::Muse => "muse",
         Engine::OpenCode => "opencode",
+        Engine::Pi => "pi",
     }
 }
 
@@ -1039,8 +1041,8 @@ pub fn steps(engine: Engine, line: &str) -> Vec<Step> {
                 })
                 .collect()
         }
-        // Their rounds read their own events (coding_session.rs, coding_muse.rs, coding_opencode.rs).
-        Engine::Codex | Engine::Muse | Engine::OpenCode => Vec::new(),
+        // Their rounds read their own events (coding_session.rs, coding_muse.rs, coding_opencode.rs, coding_pi.rs).
+        Engine::Codex | Engine::Muse | Engine::OpenCode | Engine::Pi => Vec::new(),
     }
 }
 
@@ -1171,8 +1173,8 @@ mod tests {
         let all = tools(&db).unwrap();
         assert_eq!(all.iter().map(|tool| tool.id.as_str()).collect::<Vec<_>>(), TOOLS);
         assert!(all.iter().all(|tool| tool.mode == DEFAULT_MODE && tool.model.is_none()));
-        // Claude Code and Codex start plugged in; Muse Code and OpenCode wait for the user to plug them in.
-        assert_eq!(all.iter().map(|tool| tool.plugged).collect::<Vec<_>>(), [true, true, false, false]);
+        // Claude Code and Codex start plugged in; Muse Code, OpenCode and pi wait for the user to plug them in.
+        assert_eq!(all.iter().map(|tool| tool.plugged).collect::<Vec<_>>(), [true, true, false, false, false]);
         assert!(
             update_tool(&db, "opencode", |tool| {
                 let _: () = tool.plugged = true;

@@ -6,8 +6,8 @@ Your own team of AI agents, on your Mac.
 
 Filo is a native macOS app where you make agents, each with a name, a picture and instructions of its own, and talk with
 them one at a time or all together in a group chat. The answers come from a coding tool you already use, [Claude
-Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), Muse Code or
-[OpenCode](https://opencode.ai), running on your Mac under your own account. Filo has no account of its own, and your
+Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), Muse Code,
+[OpenCode](https://opencode.ai) or [pi](https://pi.dev), running on your Mac under your own account. Filo has no account of its own, and your
 conversations, notes and agents stay in a folder on your Mac.
 
 What's in it:
@@ -17,7 +17,7 @@ What's in it:
 
   ![An agent's profile in Filo](https://filo.im/img/blog/agent-profile-3.webp)
 
-- **Coding.** Hand a task to Claude Code, Codex, Muse Code or OpenCode, from the Coding page or from any conversation.
+- **Coding.** Hand a task to Claude Code, Codex, Muse Code, OpenCode or pi, from the Coding page or from any conversation.
   It runs in your project or in a git worktree of its own, and you can follow each step as it happens.
 - **Artifacts.** Reports, pages, diagrams and small tools your agents make, with every version kept.
 - **A browser.** Pages on macOS's WebKit that keep your logins, which agents read, click, type, upload and download
@@ -42,8 +42,8 @@ Built with [GPUI](https://www.gpui.rs/), the UI framework behind the [Zed](https
   builds compile GPUI's shaders when the app starts.
 - **At least one coding tool**, installed and signed in:
   [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) (`claude`),
-  [Codex](https://github.com/openai/codex) (`codex`), Muse Code (`muse`) or [OpenCode](https://opencode.ai)
-  (`opencode`). Filo finds them on your login shell's `PATH`, and in `~/.local/bin`, `~/.claude/local`,
+  [Codex](https://github.com/openai/codex) (`codex`), Muse Code (`muse`), [OpenCode](https://opencode.ai)
+  (`opencode`) or [pi](https://pi.dev) (`pi`). Filo finds them on your login shell's `PATH`, and in `~/.local/bin`, `~/.claude/local`,
   `~/.opencode/bin`, `~/.npm-global/bin`, `~/.bun/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
 
 A first build downloads and compiles about 600 crates. Leave it about 20 GB of free disk space for `target/`.
@@ -109,7 +109,7 @@ build from source does neither unless it's given a PostHog key and an update fee
 - `src/`: the app. `main.rs` starts it, `app.rs` and `nav.rs` hold the sidebar and the pages, `screens/` has one
   module per page, and `local_backend.rs` answers every page's calls from the data on your Mac.
 - `crates/filo-local`: everything with no UI. Chat storage and the database, Filo's MCP server (the tools agents get),
-  and the runner that drives Claude Code, Codex, Muse Code and OpenCode. It builds and tests on its own.
+  and the runner that drives Claude Code, Codex, Muse Code, OpenCode and pi. It builds and tests on its own.
 - `crates/filo-resample`: draws a zoomed-in picture sharp, at the screen's pixels.
 - `computer-use/`: the Swift helper behind computer use.
 - `vendor/gpui`, `vendor/gpui-component`: our copies of gpui 0.2.2 and gpui-component 0.5.1 with Filo's fixes. Each

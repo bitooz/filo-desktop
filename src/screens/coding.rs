@@ -1,4 +1,4 @@
-// The Coding page: Claude Code, Codex, Muse Code and OpenCode, run on this Mac with the user's own sign-in. Computers
+// The Coding page: Claude Code, Codex, Muse Code, OpenCode and pi, run on this Mac with the user's own sign-in. Computers
 // (this Mac, always on; "Keep coding after Filo quits"), Tools (plug in or out, each one's mode, model and
 // reasoning level, and how much of its plan's 5-hour window and week is left), where tasks work, Tasks, and Projects (the repos found under the home folder and the folders the
 // user added, git or not); a task opens its thread (coding_thread.rs). All of it is in Filo's database on this Mac
@@ -594,7 +594,7 @@ fn command_pill(command: &str, cx: &App) -> gpui::Div {
 
 /// A coding tool's picture: its maker's mark on its own, no tile (36 in lists, 28
 /// beside a message, 20 in a badge), Claude's in its orange for Claude Code, OpenAI's for Codex, Meta's in its blue for
-/// Muse Code and OpenCode's for OpenCode.
+/// Muse Code, OpenCode's for OpenCode and pi's for pi.
 pub(crate) fn tool_tile(tool: &str, size: f32, cx: &App) -> gpui::Div {
     use crate::screens::chat::conversation::{engine_color, engine_logo};
     let engine = filo_local::coding::engine_of(tool).unwrap_or(filo_local::Engine::Claude);

@@ -198,16 +198,17 @@ pub(crate) fn engine_logo(engine: Engine) -> &'static str {
         Engine::Codex => "openai",
         Engine::Muse => "meta",
         Engine::OpenCode => "opencode",
+        Engine::Pi => "pi",
     }
 }
 
 /// The colour an engine's logo is drawn in where it stands for the tool (the Coding page's tiles, the Agents list's
-/// marks): Claude's orange, Meta's blue, OpenAI's and OpenCode's in the text colour.
+/// marks): Claude's orange, Meta's blue, OpenAI's, OpenCode's and pi's in the text colour.
 pub(crate) fn engine_color(engine: Engine, cx: &App) -> gpui::Hsla {
     match engine {
         Engine::Claude => gpui::rgb(0xD97757).into(),
         Engine::Muse => gpui::rgb(0x0081FB).into(),
-        Engine::Codex | Engine::OpenCode => cx.colors().text,
+        Engine::Codex | Engine::OpenCode | Engine::Pi => cx.colors().text,
     }
 }
 

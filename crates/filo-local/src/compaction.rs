@@ -271,7 +271,7 @@ fn record(engine: Engine, session: &str) -> Option<(PathBuf, fn(&Value) -> Optio
     match engine {
         Engine::Claude => Some((claude_file(&homes.claude, session)?, claude_call)),
         Engine::Codex => Some((codex_file(&homes.codex, session)?, codex_call)),
-        Engine::Muse | Engine::OpenCode => None,
+        Engine::Muse | Engine::OpenCode | Engine::Pi => None,
     }
 }
 
