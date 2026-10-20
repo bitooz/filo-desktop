@@ -13,6 +13,12 @@
 // handlers, and what agents do is kept for the user to watch, pause and take over (browser/activity.rs).
 
 mod activity;
+// Chromium (CEF) as the engine, a test: FILO_BROWSER_ENGINE=chromium (`dev` builds).
+#[cfg(feature = "dev")]
+mod chromium;
+// `FILO_OPEN=chromium-check`: memory, Google's sign-in and WebKit's cookies with Chromium as the engine (`dev` builds).
+#[cfg(feature = "dev")]
+mod chromium_check;
 // `FILO_OPEN=browser-check`: the browser end to end (`dev` builds).
 #[cfg(feature = "dev")]
 pub mod check;
@@ -101,9 +107,14 @@ pub struct Tab {
     pub id: String,
     /// A page's alert, confirm or prompt, waiting for its answer. Answered (dismissed) before the page goes.
     dialog: RefCell<Option<delegate::Dialog>>,
-    // Dropped before its window.
-    web: wry::WebView,
-    view: Retained<wry::WryWebView>,
+    // Dropped before its window. None for a page in Chromium (`chromium`).
+    web: Option<wry::WebView>,
+    /// Kept for its drop, which closes the page in Chromium.
+    #[cfg(feature = "dev")]
+    #[allow(dead_code)]
+    chromium: Option<chromium::Page>,
+    /// The page's view: WebKit's, or the one a page in Chromium shows in.
+    view: Retained<objc2::runtime::AnyObject>,
     park: native::Park,
     pub owner: Option<Owner>,
     /// The tab whose page opened this one (a pop-up, or a link to a new window).
@@ -141,7 +152,17 @@ impl Tab {
     }
 
     pub fn load(&self, url: &str) {
-        let _ = self.web.load_url(url);
+        match &self.web {
+            Some(web) => drop(web.load_url(url)),
+            #[cfg(feature = "dev")]
+            None => {
+                if let Some(page) = chromium::of(self.view()) {
+                    page.load(url);
+                }
+            }
+            #[cfg(not(feature = "dev"))]
+            None => {}
+        }
     }
 
     pub fn go(&self, how: &str) {
@@ -318,6 +339,10 @@ fn user_agent() -> String {
 
 /// A new tab loading `url` (none: a page WebKit loads itself, a pop-up's), in the browser's data store.
 fn new_tab(url: Option<&str>, owner: Option<Owner>) -> Result<Rc<Tab>, String> {
+    #[cfg(feature = "dev")]
+    if chromium::wanted() {
+        return chromium_tab(url.unwrap_or("about:blank"), owner);
+    }
     new_tab_with(url, owner, None, |builder| builder.with_data_store_identifier(store_id()))
 }
 
@@ -464,10 +489,92 @@ fn new_tab_with(
     park.take(&view, None);
     native::prepare(&view);
     delegate::adopt(&view);
+    // SAFETY: a WKWebView is an object.
+    let view = unsafe { Retained::cast_unchecked::<objc2::runtime::AnyObject>(view) };
     let tab = Rc::new(Tab {
         id,
         dialog: RefCell::new(None),
-        web,
+        web: Some(web),
+        #[cfg(feature = "dev")]
+        chromium: None,
+        view,
+        park,
+        owner,
+        opener,
+        created: Instant::now(),
+        help: RefCell::new(None),
+        upload: RefCell::new(None),
+        downloads: RefCell::new(Vec::new()),
+        news: RefCell::new(Vec::new()),
+        work: RefCell::new(activity::Work::default()),
+    });
+    BROWSER.with(|browser| {
+        let mut browser = browser.borrow_mut();
+        browser.tabs.push(tab.clone());
+        browser.generation += 1;
+    });
+    keep_awake();
+    Ok(tab)
+}
+
+/// A new tab in Chromium (FILO_BROWSER_ENGINE=chromium) loading `url`.
+#[cfg(feature = "dev")]
+fn chromium_tab(url: &str, owner: Option<Owner>) -> Result<Rc<Tab>, String> {
+    if tabs().len() >= MAX_TABS {
+        return Err(format!(
+            "The browser has {MAX_TABS} tabs open, its most: close some you're done with (browser_close)."
+        ));
+    }
+    let id = next_id();
+    let (page, view) = chromium::open(&id, url, PAGE_SIZE)?;
+    add_chromium_tab(id, owner, None, page, view)
+}
+
+/// The next tab's id ("t4").
+#[cfg(feature = "dev")]
+fn next_id() -> String {
+    BROWSER.with(|browser| {
+        let mut browser = browser.borrow_mut();
+        browser.next += 1;
+        format!("t{}", browser.next)
+    })
+}
+
+/// A pop-up Chromium opened from tab `opener`'s page: a tab of the same owner (`key`, the id Filo gave it).
+#[cfg(feature = "dev")]
+fn chromium_popup(
+    key: &str,
+    opener: &str,
+    page: chromium::Page,
+    view: Retained<objc2::runtime::AnyObject>,
+) -> Result<(), String> {
+    if tabs().len() >= MAX_TABS {
+        return Err(format!("the browser has {MAX_TABS} tabs open"));
+    }
+    let owner = tab(opener).and_then(|tab| tab.owner.clone());
+    let tab = add_chromium_tab(key.to_string(), owner, Some(opener.to_string()), page, view)?;
+    eprintln!("browser: {opener} opened {} as a pop-up", tab.id);
+    if let Some(opener) = self::tab(opener) {
+        opener.news.borrow_mut().push(format!("The page opened a new tab, {} (a pop-up or a link to a new window): browser_read it there by its id; it's yours like this one.", tab.id));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dev")]
+fn add_chromium_tab(
+    id: String,
+    owner: Option<Owner>,
+    opener: Option<String>,
+    page: chromium::Page,
+    view: Retained<objc2::runtime::AnyObject>,
+) -> Result<Rc<Tab>, String> {
+    let park = native::Park::new(PAGE_SIZE.0, PAGE_SIZE.1).ok_or("Couldn't make the page's window")?;
+    park.take(&view, None);
+    let tab = Rc::new(Tab {
+        id,
+        dialog: RefCell::new(None),
+        web: None,
+        chromium: Some(page),
         view,
         park,
         owner,
@@ -498,13 +605,20 @@ fn popup(opener: &str, owner: Option<Owner>, features: wry::NewWindowFeatures) -
             if let Some(opener) = self::tab(opener) {
                 opener.news.borrow_mut().push(format!("The page opened a new tab, {} (a pop-up or a link to a new window): browser_read it there by its id; it's yours like this one.", tab.id));
             }
-            wry::NewWindowResponse::Create { webview: Retained::into_super(tab.view.clone()) }
+            // SAFETY: a WebKit tab's view is its WKWebView.
+            wry::NewWindowResponse::Create { webview: unsafe { Retained::cast_unchecked(tab.view.clone()) } }
         }
         Err(error) => {
             eprintln!("browser: {opener}'s pop-up: {error}");
             wry::NewWindowResponse::Deny
         }
     }
+}
+
+/// A page in Chromium's picture for a window screenshot (window_shot.rs): RGBA, `width` × `height`.
+#[cfg(feature = "dev")]
+pub fn chromium_picture(view: *mut objc2::runtime::AnyObject, width: usize, height: usize) -> Option<Vec<u8>> {
+    chromium::picture(view, width, height)
 }
 
 /// Opens a tab for the user (the browser window's +).
@@ -576,6 +690,8 @@ pub fn address(typed: &str) -> String {
 /// request answered on the main thread.
 pub fn init(cx: &mut App) {
     window::init(cx);
+    #[cfg(feature = "dev")]
+    chromium::init(cx);
     if SERVING.with(|serving| serving.replace(true)) {
         return;
     }

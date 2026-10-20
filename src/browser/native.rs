@@ -432,6 +432,10 @@ fn string(object: *mut AnyObject) -> String {
 
 /// The page's title, address and whether it's loading.
 pub fn state(view: &AnyObject) -> (String, String, bool) {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.state();
+    }
     // SAFETY: WebKit on the main thread.
     unsafe {
         let title: *mut AnyObject = msg_send![view, title];
@@ -444,6 +448,10 @@ pub fn state(view: &AnyObject) -> (String, String, bool) {
 
 /// Whether it can go back and forward.
 pub fn history(view: &AnyObject) -> (bool, bool) {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.history();
+    }
     // SAFETY: WebKit on the main thread.
     unsafe {
         let back: bool = msg_send![view, canGoBack];
@@ -453,6 +461,10 @@ pub fn history(view: &AnyObject) -> (bool, bool) {
 }
 
 pub fn go(view: &AnyObject, how: &str) {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.go(how);
+    }
     // SAFETY: WebKit on the main thread; the WKNavigation returned is ignored.
     unsafe {
         let _: *mut AnyObject = match how {
@@ -471,6 +483,10 @@ pub fn go(view: &AnyObject, how: &str) {
 /// shares the page's DOM but not its scripts, so the page can't see or change what runs there. `arg` is its variable
 /// `a`. `done` gets what it returns, as a string.
 pub fn run_js(view: &AnyObject, body: &str, arg: &str, done: impl FnOnce(Result<String, String>) + 'static) {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.run_js(body, arg, done);
+    }
     let done = RefCell::new(Some(done));
     let handler = block2::RcBlock::new(move |value: *mut AnyObject, error: *mut AnyObject| {
         let Some(done) = done.borrow_mut().take() else { return };
@@ -512,6 +528,10 @@ pub fn viewport(view: &AnyObject) -> (f64, f64) {
 /// A picture of what the page shows, one pixel per CSS pixel (WebKit draws only what shows: a full-page picture is
 /// pieced from several).
 pub fn snapshot(view: &AnyObject, done: impl FnOnce(Result<image::RgbaImage, String>) + 'static) {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.snapshot(view, done);
+    }
     let (width, height) = viewport(view);
     let (width, height) = (width.round().max(1.) as usize, height.round().max(1.) as usize);
     let done = RefCell::new(Some(done));
@@ -643,6 +663,10 @@ pub enum Mouse {
 
 /// One mouse event at (x, y), points from the page's top left, handed to the web view.
 pub fn mouse(view: &AnyObject, kind: Mouse, x: f64, y: f64, clicks: isize) -> bool {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.mouse(kind, x, y, clicks);
+    }
     let Some((location, number)) = in_window(view, x, y) else { return false };
     let (event_type, selector): (usize, Sel) = match kind {
         // A move goes in as WebKit takes a drag's moves (`mouseDragged:`), with no button held: what it gets as
@@ -884,6 +908,10 @@ fn edit_command(key: &Key) -> Option<Sel> {
 
 /// One key pressed and let go in the web view, which has its window's keyboard (`prepare`).
 pub fn key(view: &AnyObject, key: &Key) -> bool {
+    #[cfg(feature = "dev")]
+    if let Some(page) = super::chromium::of(view) {
+        return page.key(key);
+    }
     let Some((location, number)) = in_window(view, 1., 1.) else { return false };
     // SAFETY: AppKit on the main thread; each event is autoreleased and handed straight to the view.
     unsafe {

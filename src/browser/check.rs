@@ -26,6 +26,7 @@ pub fn wanted() -> bool {
                 | "browser-keys-check"
                 | "browser-drag-check"
                 | "browser-tools-check"
+                | "chromium-check"
         )
     })
 }
@@ -209,6 +210,9 @@ pub fn open(cx: &mut App) {
     }
     if std::env::var("FILO_OPEN").is_ok_and(|open| open == "browser-tools-check") {
         return super::tools_check::open(cx);
+    }
+    if std::env::var("FILO_OPEN").is_ok_and(|open| open == "chromium-check") {
+        return super::chromium_check::open(cx);
     }
     let again = std::env::var("FILO_BROWSER_CHECK").is_ok_and(|value| value == "again");
     let shots = std::env::var("FILO_FIXTURE_SHOTS").ok().filter(|dir| !dir.is_empty());

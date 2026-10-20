@@ -936,6 +936,23 @@ user opens it from Window › Browser (⇧⌘B); agents work it in the backgroun
   gets the saved login offered and filled. A test run's logins go to `local/test-secrets` (or `FILO_SECRETS_DIR`), never
   the Keychain, and its WebKit data store is removed at the end. `FILO_FIXTURE_SHOTS=<dir>` saves the panel, the
   suggestions and the login bar.
+- **Chromium, a test engine** (`dev` builds only; browser/chromium.rs, chromium/): with `FILO_BROWSER_ENGINE=chromium`
+  new tabs open in Chromium through CEF in windowless mode instead of WebKit, and WebKit stays the default.
+  `chromium/build.sh` downloads CEF's minimal build (checked against its SHA-1) into `target/cef`, builds its C++
+  wrapper and `Filo Chromium.app` (an ObjC++ app, chromium/filo_chromium.mm, with Chromium's helper apps; ~325 MB,
+  `FILO_CHROMIUM_APP` names another). Filo starts it with the first such tab, its profile in `local/chromium`, and
+  talks to it over its standard input and output, a JSON line each way. A tab is a `Tab` as WebKit's are, with a view of
+  Filo's own (`FiloChromiumView`) where the web view would be: parked off the screen or moved into the browser window,
+  showing the frames Chromium draws into shared memory and handing the user's mouse and keys to the page. native.rs asks
+  `chromium::of` first: page.js runs in an isolated world through DevTools (`Page.createIsolatedWorld`,
+  `Runtime.evaluate`), clicks and keys are DevTools input (trusted in the page; keys carry the Mac editing commands
+  Chromium leaves to its own view, as Playwright sends them), and a screenshot is the last frame. Dialogs, file
+  choosers, downloads and pop-ups come back as events to the same places WebKit's do. `browser-check` and
+  `browser-tools-check` pass with it; HTML5 drag and drop isn't done. `FILO_OPEN=chromium-check`
+  (browser/chromium_check.rs) measures memory per tab in both engines, tries Google's sign-in in both
+  (`FILO_CHECK_GOOGLE_EMAIL`), and with `FILO_CHROMIUM_COOKIES=<a copy of a WebKit Cookies.binarycookies>` puts its
+  cookies into Chromium's profile and says which of `FILO_CHROMIUM_SITES` are signed in. `FILO_CHROMIUM_SCALE=1` draws
+  pages at 1× (less memory, soft on a Retina screen).
 
 ## Scheduled work: reminders, routines and check-ins
 

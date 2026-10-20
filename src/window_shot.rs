@@ -207,6 +207,8 @@ unsafe fn start(window: *mut AnyObject, path: &Path, done: Done) -> Result<(), (
         let bounds: NSRect = msg_send![view, bounds];
         let scale = picture.width as f64 / bounds.size.width.max(1.);
         let content: *mut AnyObject = msg_send![window, contentView];
+        #[cfg(feature = "dev")]
+        let picture = with_chromium(picture, content, view, bounds, scale);
         let mut webs = Vec::new();
         web_views(content, &mut webs);
         let webs: Vec<Web> = webs.into_iter().filter_map(|web| place(web, view, bounds, scale, &picture)).collect();
@@ -478,6 +480,49 @@ unsafe fn web_views(view: *mut AnyObject, out: &mut Vec<*mut AnyObject>) {
             web_views(subview, out);
         }
     }
+}
+
+/// The pages in Chromium the window shows (browser/chromium.rs, a test engine), laid over the picture from their last
+/// frames.
+#[cfg(feature = "dev")]
+unsafe fn with_chromium(
+    mut picture: Picture,
+    content: *mut AnyObject,
+    view: *mut AnyObject,
+    bounds: NSRect,
+    scale: f64,
+) -> Picture {
+    unsafe fn find(view: *mut AnyObject, class: &AnyClass, out: &mut Vec<*mut AnyObject>) {
+        unsafe {
+            if view.is_null() {
+                return;
+            }
+            let is: bool = msg_send![view, isKindOfClass: class];
+            if is {
+                out.push(view);
+                return;
+            }
+            let subviews: *mut AnyObject = msg_send![view, subviews];
+            let count: usize = msg_send![subviews, count];
+            for index in 0..count {
+                let subview: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+                find(subview, class, out);
+            }
+        }
+    }
+    let Some(class) = AnyClass::get(c"FiloChromiumView") else { return picture };
+    let mut pages = Vec::new();
+    unsafe {
+        find(content, class, &mut pages);
+        for page in pages {
+            if let Some(web) = place(page, view, bounds, scale, &picture)
+                && let Some(pixels) = crate::browser::chromium_picture(page, web.width, web.height)
+            {
+                lay_over(&mut picture, &pixels, &web);
+            }
+        }
+    }
+    picture
 }
 
 /// A web view in the picture: its pixels' rect there, and the holes cut in it for menus (web_holes.rs).
