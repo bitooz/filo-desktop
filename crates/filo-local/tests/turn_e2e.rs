@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use filo_local::db::{self, Db};
-use filo_local::store::RoutineRun;
+use filo_local::store::{CHECK_IN, RoutineRun};
 use filo_local::turn::{self, Report, Runtime};
 use filo_local::{Engine, Role, Store, chat_activity, engine, skills};
 
@@ -193,6 +193,40 @@ fn a_turn_with_a_stand_in_cli_and_the_real_mcp_server() {
         let report = turn::run(&store, &runtime, &chat.id, "turn-3", |_| {});
         assert!(report.error.unwrap().contains("isn't installed"));
     }
+    std::fs::remove_dir_all(store.root()).ok();
+}
+
+/// An agent's own check-in may end without a message when there's nothing new, run again with Retry too, and one saved
+/// before check-ins had their mark (only its words) the same; one with something to say still says it.
+#[test]
+fn a_check_in_may_end_quietly_and_one_that_sends_still_does() {
+    let store = Store::at(common::temp_root("check-in"));
+    let (runtime, _) = stand_in(&store);
+    let chat = store.create_chat(Engine::Claude).unwrap();
+    let quiet = Report { replies: 0, stopped: false, error: None, ..Report::default() };
+    let check_in = format!("{CHECK_IN}Anything new on the render? (stay silent if not)");
+    let saved = store.add_check_in_message(&chat.id, &check_in, "turn-quiet").unwrap();
+    assert!(saved.check_in && saved.from_app());
+    assert_eq!(turn::run(&store, &runtime, &chat.id, "turn-quiet", |_| {}), quiet);
+    // Retry runs the same turn again.
+    assert_eq!(turn::run(&store, &runtime, &chat.id, "turn-quiet", |_| {}), quiet);
+    store.add_user_message(&chat.id, &check_in, "turn-old").unwrap();
+    assert_eq!(turn::run(&store, &runtime, &chat.id, "turn-old", |_| {}), quiet);
+    store.add_check_in_message(&chat.id, &format!("{CHECK_IN}Did the export finish?"), "turn-sends").unwrap();
+    let report = turn::run(&store, &runtime, &chat.id, "turn-sends", |_| {});
+    assert_eq!(report, Report { replies: 1, stopped: false, error: None, ..Report::default() });
+
+    let messages = Store::at(store.root()).messages(&chat.id).unwrap();
+    assert!(messages.iter().all(|message| message.role != Role::Error), "{messages:?}");
+    let replies: Vec<(&str, Option<&str>)> = messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .map(|message| (message.text.as_str(), message.turn.as_deref()))
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0].1, Some("turn-sends"));
+    // The check-in keeps its mark on disk, and the chat still has its line.
+    assert!(messages[0].check_in && messages[0].text == check_in);
     std::fs::remove_dir_all(store.root()).ok();
 }
 

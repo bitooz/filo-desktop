@@ -1881,9 +1881,10 @@ pub fn work(db: &Db, store: &Store, members: &[Member], chats: &[(String, String
     }
     for (member, chat) in chats.iter().filter(|(member, _)| member != speaker) {
         let messages = store.messages(chat).unwrap_or_default();
-        let last = messages.iter().rev().find(|message| {
-            message.role == Role::User && !message.hidden && message.routine.is_none() && message.group_call.is_none()
-        });
+        let last = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User && !message.from_app() && message.group_call.is_none());
         if let Some(message) = last {
             let wrote = cut(message.own_text(), WORK_ASK_CHARS);
             work.entry(member.clone()).or_default().push(format!(

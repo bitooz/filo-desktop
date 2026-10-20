@@ -70,6 +70,10 @@ pub struct Message {
     /// says to stay quiet, and a one-line marker in the chat instead of the routine's instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routine: Option<RoutineRun>,
+    /// A check-in an agent planned for itself coming due (local_backend/scheduled.rs `run_wake`): shown in the chat
+    /// like the user's message, but Filo's, so its turn may end without a reply when there's nothing new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub check_in: bool,
     /// The message it answers: for the user's, the one picked with the chat's Reply, its text quoted at the top of this
     /// one's (`with_quote`); for an agent's, the message its turn answers (`Store::agent_message`), not quoted; for one
     /// from Filo's app (`hidden`), the message its turn's replies answer in its place.
@@ -117,6 +121,9 @@ pub struct Voice {
     pub duration_ms: u64,
 }
 
+/// How a check-in's message starts (local_backend/scheduled.rs `wake_message`).
+pub const CHECK_IN: &str = "⏰ Check-in you planned for yourself: ";
+
 /// Which routine a run's message is, for its line in the chat.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoutineRun {
@@ -138,6 +145,7 @@ impl Message {
             attachments: Vec::new(),
             hidden: false,
             routine: None,
+            check_in: false,
             reply_to: None,
             group_call: None,
             in_group: None,
@@ -146,9 +154,13 @@ impl Message {
         }
     }
 
-    /// A message Filo's app sent on its own (a coding task's news, a check-in: `hidden`; a routine's run), not the user.
+    /// A message Filo's app sent on its own (a coding task's news: `hidden`; a routine's run; a check-in, also one saved
+    /// before check-ins had their mark, read from the words `CHECK_IN` starts it with), not the user.
     pub fn from_app(&self) -> bool {
-        self.hidden || self.routine.is_some()
+        self.hidden
+            || self.routine.is_some()
+            || self.check_in
+            || (self.role == Role::User && self.text.starts_with(CHECK_IN))
     }
 
     /// Its own words: a reply's of the user's without the quote at its top.
@@ -747,6 +759,14 @@ impl Store {
                 .find(|asked| asked.role == Role::User && asked.turn.as_deref() == Some(turn.as_str()))
                 .map(|asked| asked.id.clone())
         })
+    }
+
+    /// A check-in an agent planned coming due (`Message::check_in`), starting turn `turn`.
+    pub fn add_check_in_message(&self, chat_id: &str, text: &str, turn: &str) -> io::Result<Message> {
+        let mut message = Message::new(Role::User, text, Some(turn.to_string()));
+        message.check_in = true;
+        self.append(chat_id, &message)?;
+        Ok(message)
     }
 
     /// A routine's run coming due (`Message::routine`), starting turn `turn`.

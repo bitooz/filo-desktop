@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filo_local::schedule::{self, Job, NewReminder, NewRoutine, NewWake, Routine, Run, Wake};
-use filo_local::store::RoutineRun;
+use filo_local::store::{CHECK_IN, RoutineRun};
 use filo_local::{Role, Store};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -70,7 +70,8 @@ If it says to stay quiet when there's nothing to report and there's nothing, end
 fn wake_message(wake: &Wake) -> String {
     let note = if wake.note.is_empty() { String::new() } else { format!("\n\n{}", wake.note) };
     format!(
-        "⏰ Check-in you planned for yourself: {}{note}\n\n(This is your own scheduled check-in, not a message from the user. Follow up as you planned and send the user what's useful with send_message.)",
+        "{CHECK_IN}{}{note}\n\n(This is your own scheduled check-in, not a message from the user. Follow up as you planned and send the user what's useful with send_message. \
+If there's nothing new for them, end without sending anything.)",
         wake.title
     )
 }
@@ -362,7 +363,7 @@ impl Local {
             .unwrap_or_else(|| "Filo".into());
         let turn_id = uuid::Uuid::new_v4().to_string();
         store
-            .add_user_message(&chat_id, &wake_message(wake), &turn_id)
+            .add_check_in_message(&chat_id, &wake_message(wake), &turn_id)
             .map_err(|error| format!("Couldn't save the check-in: {error}"))?;
         self.changed();
         let (local, reader, chat, turn) = (self.clone(), store.clone(), chat_id.clone(), turn_id.clone());
@@ -698,6 +699,10 @@ mod tests {
         let has = |chat: &str, said: &str| texts(chat).iter().any(|text| text.contains(said));
         run("Did the lesson stick?", Some(&tutor));
         assert!(has(&tutors, "Did the lesson stick?"), "{:?}", texts(&tutors));
+        // Marked as Filo's, so it may end quietly (turn.rs `quiet_allowed`), and told it may.
+        let check_in = local.agent_chats.messages(&tutors).unwrap().into_iter().find(|message| message.check_in);
+        let check_in = check_in.expect("the check-in has its mark");
+        assert!(check_in.from_app() && check_in.text.contains("end without sending anything"), "{}", check_in.text);
         run("Water the plants", None);
         assert!(has(&main, "Water the plants"), "{:?}", texts(&main));
         assert_eq!(local.agent_chats.list_chats().len(), chats_before);

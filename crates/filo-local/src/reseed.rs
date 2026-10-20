@@ -242,6 +242,7 @@ fn chat_who(message: &Message) -> String {
             message.routine.as_ref().map(|routine| routine.title.as_str()).unwrap_or_default()
         ),
         Role::User if message.hidden => "Filo's app (to you, not from the user)".into(),
+        Role::User if message.from_app() => "Filo's app: a check-in you planned coming due".into(),
         Role::User => "User".into(),
         Role::Error => "Filo's app: this error showed in the chat".into(),
         _ if message.in_group.is_some() => "You (posted in the group chat)".into(),
