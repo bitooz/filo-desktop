@@ -114,8 +114,7 @@ objc = "0.2"
 objc2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 objc2-avf-audio = { version = "0.3", default-features = false, features = [
-    "std", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioRecorder", "AVAudioSettings",
-    "AVAudioTime", "AVAudioTypes", "block2",
+    "std", "AVAudioRecorder", "AVAudioSettings", "AVAudioTypes",
 ] }
 # The framework crates' default features turn on every class they have (and pull in the frameworks those use): only the
 # ones used here are named, for these two above too.

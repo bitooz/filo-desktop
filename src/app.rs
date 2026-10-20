@@ -50,7 +50,7 @@ pub struct AppShell {
     logo_focus: FocusHandle,
     /// fn+⌃ is down.
     voice_chord: bool,
-    /// Starts recording once fn+⌃ has stayed down a moment.
+    /// Says why fn+⌃ can't record (text in the box, no microphone access) once it has stayed down a moment.
     _voice_hold: Option<Task<()>>,
     /// The open shortcut held (`talk`): recording in the open chat, or from another app for the chat picked after.
     talking: Option<Talking>,
@@ -84,7 +84,8 @@ enum Talking {
     },
 }
 
-/// How long fn+⌃ stays down before recording starts, so brushing the keys doesn't.
+/// How long fn+⌃ stays down before Filo says why it can't record, so brushing the keys doesn't. When it can, it starts
+/// at once: a press too short to be a message is dropped when it's let go (voice.rs `release_voice`).
 const VOICE_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How far two fingers travel sideways before going back (right) or forward (left), like Safari's swipe.
@@ -680,7 +681,9 @@ impl AppShell {
         }
         self.voice_chord = chord;
         let Some(conversation) = self.open_conversation(cx) else { return };
-        if chord {
+        if chord && conversation.read(cx).can_hold_voice(cx) {
+            conversation.update(cx, |conversation, cx| conversation.hold_voice(window, cx));
+        } else if chord {
             self._voice_hold = Some(cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(VOICE_HOLD_DELAY).await;
                 this.update_in(cx, |this, window, cx| {
@@ -696,13 +699,15 @@ impl AppShell {
         }
     }
 
-    /// Esc while holding fn+⌃ cancels the recording.
+    /// Esc while holding fn+⌃ cancels the recording. So does another key: fn+⌃ was part of another shortcut, which
+    /// goes ahead.
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if event.keystroke.key != "escape" {
+        let escape = event.keystroke.key == "escape";
+        if !escape && !self.voice_chord {
             return;
         }
         let Some(conversation) = self.open_conversation(cx) else { return };
-        if conversation.update(cx, |conversation, cx| conversation.cancel_held_voice(cx)) {
+        if conversation.update(cx, |conversation, cx| conversation.cancel_held_voice(cx)) && escape {
             cx.stop_propagation();
         }
     }

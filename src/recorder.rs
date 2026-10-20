@@ -1,10 +1,10 @@
 // Voice message recording with macOS's AVAudioRecorder: mono AAC in an .m4a
 // (`audio/mp4`, chat-protocol.ts VOICE_CONTENT_TYPE), 64 kbps like the phone's
 // expo-audio preset, to a temp file the chat uploads. Alongside it, `MicStream`
-// taps the same microphone through AVAudioEngine for live transcription.
+// reads the same microphone through an audio queue for live transcription.
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
@@ -13,8 +13,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool};
 use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
 use objc2_avf_audio::{
-    AVAudioEngine, AVAudioPCMBuffer, AVAudioQuality, AVAudioRecorder, AVAudioTime, AVEncoderAudioQualityKey,
-    AVEncoderBitRateKey, AVFormatIDKey, AVNumberOfChannelsKey, AVSampleRateKey,
+    AVAudioQuality, AVAudioRecorder, AVEncoderAudioQualityKey, AVEncoderBitRateKey, AVFormatIDKey,
+    AVNumberOfChannelsKey, AVSampleRateKey,
 };
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
@@ -158,55 +158,149 @@ impl Drop for Recorder {
     }
 }
 
-/// Raw microphone audio for live transcription, captured next to the
-/// recorder (macOS lets both read the input at once): an AVAudioEngine tap on
-/// the input, downmixed to mono and resampled to PCM16 little-endian.
+/// Raw microphone audio for live transcription, captured next to the recorder (macOS lets both read the input at
+/// once): an audio queue on the input, which macOS hands mono PCM16 little-endian at the rate asked for. Not
+/// AVAudioEngine: its input brings up a device that pairs the microphone with the speakers, which took ~0.5 s each
+/// time the microphone opened (with the window frozen), and it stops when the output changes mid-recording.
 pub struct MicStream {
-    engine: Retained<AVAudioEngine>,
+    queue: AudioQueueRef,
+    /// Where the queue's callback finds `on_pcm`; freed once the queue is gone.
+    tap: *mut Tap,
+}
+
+type AudioQueueRef = *mut c_void;
+
+struct Tap {
+    on_pcm: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+}
+
+/// `AudioStreamBasicDescription`
+#[repr(C)]
+struct StreamFormat {
+    sample_rate: f64,
+    format_id: u32,
+    format_flags: u32,
+    bytes_per_packet: u32,
+    frames_per_packet: u32,
+    bytes_per_frame: u32,
+    channels_per_frame: u32,
+    bits_per_channel: u32,
+    reserved: u32,
+}
+
+/// `AudioQueueBuffer`
+#[repr(C)]
+struct QueueBuffer {
+    capacity: u32,
+    data: *mut c_void,
+    byte_size: u32,
+    user_data: *mut c_void,
+    packet_description_capacity: u32,
+    packet_descriptions: *mut c_void,
+    packet_description_count: u32,
+}
+
+type InputCallback = extern "C" fn(*mut c_void, AudioQueueRef, *mut QueueBuffer, *const c_void, u32, *const c_void);
+
+#[link(name = "AudioToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn AudioQueueNewInput(
+        format: *const StreamFormat,
+        callback: InputCallback,
+        user_data: *mut c_void,
+        run_loop: *const c_void,
+        run_loop_mode: *const c_void,
+        flags: u32,
+        queue: *mut AudioQueueRef,
+    ) -> i32;
+    fn AudioQueueAllocateBuffer(queue: AudioQueueRef, bytes: u32, buffer: *mut *mut QueueBuffer) -> i32;
+    fn AudioQueueEnqueueBuffer(
+        queue: AudioQueueRef,
+        buffer: *mut QueueBuffer,
+        count: u32,
+        packets: *const c_void,
+    ) -> i32;
+    fn AudioQueueStart(queue: AudioQueueRef, start_time: *const c_void) -> i32;
+    fn AudioQueueStop(queue: AudioQueueRef, immediate: u8) -> i32;
+    fn AudioQueueDispose(queue: AudioQueueRef, immediate: u8) -> i32;
+}
+
+/// `kAudioFormatLinearPCM`, signed integer and packed.
+const LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
+const PCM_SIGNED_PACKED: u32 = (1 << 2) | (1 << 3);
+/// Buffers the queue fills in turn, and how much each holds.
+const BUFFERS: usize = 3;
+const BUFFER_MS: u32 = 100;
+
+/// Runs on the queue's own thread with each filled buffer, and hands the buffer back to be filled again.
+extern "C" fn on_input(
+    tap: *mut c_void,
+    queue: AudioQueueRef,
+    buffer: *mut QueueBuffer,
+    _start_time: *const c_void,
+    _packets: u32,
+    _descriptions: *const c_void,
+) {
+    // SAFETY: `tap` is the `Tap` MicStream made for this queue, which outlives it; `buffer` is one of its buffers.
+    unsafe {
+        let (data, size) = ((*buffer).data as *const u8, (*buffer).byte_size as usize);
+        if size > 0 {
+            ((*(tap as *const Tap)).on_pcm)(std::slice::from_raw_parts(data, size).to_vec());
+        }
+        // Fails once the queue is stopping, which is fine.
+        AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null());
+    }
 }
 
 impl MicStream {
-    /// `on_pcm` runs on an audio thread with each chunk of `sample_rate` PCM16.
+    /// `on_pcm` runs on the queue's thread with each chunk of `sample_rate` PCM16.
     pub fn start(sample_rate: u32, on_pcm: impl Fn(Vec<u8>) + Send + Sync + 'static) -> Result<MicStream> {
         if crate::test_run::refuse("microphone") {
             return Err(anyhow!("No microphone in test runs"));
         }
+        let format = StreamFormat {
+            sample_rate: sample_rate as f64,
+            format_id: LINEAR_PCM,
+            format_flags: PCM_SIGNED_PACKED,
+            bytes_per_packet: 2,
+            frames_per_packet: 1,
+            bytes_per_frame: 2,
+            channels_per_frame: 1,
+            bits_per_channel: 16,
+            reserved: 0,
+        };
+        let tap = Box::into_raw(Box::new(Tap { on_pcm: Box::new(on_pcm) }));
+        let mut queue: AudioQueueRef = std::ptr::null_mut();
+        // SAFETY: the format and the callback are as AudioToolbox declares them; with no run loop the callback runs
+        // on the queue's own thread. `tap` stays alive until the queue is disposed (`Drop`).
         unsafe {
-            let engine = AVAudioEngine::new();
-            let input = engine.inputNode();
-            let format = input.outputFormatForBus(0);
-            // No input device: tapping would throw an Objective-C exception.
-            if format.sampleRate() <= 0. || format.channelCount() == 0 {
-                return Err(anyhow!("No microphone input"));
+            let status = AudioQueueNewInput(
+                &format,
+                on_input,
+                tap as *mut c_void,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut queue,
+            );
+            if status != 0 || queue.is_null() {
+                drop(Box::from_raw(tap));
+                return Err(anyhow!("No microphone input ({status})"));
             }
-            let resampler = Mutex::new(Resampler::new(format.sampleRate(), sample_rate as f64));
-            let tap = block2::RcBlock::new(move |buffer: NonNull<AVAudioPCMBuffer>, _: NonNull<AVAudioTime>| {
-                let buffer = buffer.as_ref();
-                let channels = buffer.floatChannelData();
-                if channels.is_null() {
-                    return;
+            let stream = MicStream { queue, tap };
+            let bytes = sample_rate * 2 * BUFFER_MS / 1000;
+            for _ in 0..BUFFERS {
+                let mut buffer = std::ptr::null_mut();
+                let status = AudioQueueAllocateBuffer(queue, bytes, &mut buffer);
+                if status != 0 || AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null()) != 0 {
+                    return Err(anyhow!("The microphone stream could not start ({status})"));
                 }
-                let count = buffer.format().channelCount() as usize;
-                let (frames, stride) = (buffer.frameLength() as usize, buffer.stride());
-                let mono: Vec<f32> = (0..frames)
-                    .map(|frame| {
-                        (0..count).map(|channel| *(*channels.add(channel)).as_ptr().add(frame * stride)).sum::<f32>()
-                            / count as f32
-                    })
-                    .collect();
-                let pcm = resampler.lock().map(|mut resampler| resampler.push(&mono)).unwrap_or_default();
-                if !pcm.is_empty() {
-                    on_pcm(pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect());
-                }
-            });
-            // About 100 ms per chunk at 48 kHz; the engine copies the block.
-            input.installTapOnBus_bufferSize_format_block(0, 4800, Some(&format), block2::RcBlock::as_ptr(&tap));
-            engine.prepare();
-            if let Err(error) = engine.startAndReturnError() {
-                input.removeTapOnBus(0);
-                return Err(anyhow!("{}", error.localizedDescription()));
             }
-            Ok(MicStream { engine })
+            let status = AudioQueueStart(queue, std::ptr::null());
+            if status != 0 {
+                return Err(anyhow!("The microphone stream could not start ({status})"));
+            }
+            Ok(stream)
         }
     }
 
@@ -215,70 +309,15 @@ impl MicStream {
 
 impl Drop for MicStream {
     fn drop(&mut self) {
+        // SAFETY: the queue and the tap made in `start`, freed once; disposing waits for a callback in progress.
         unsafe {
-            self.engine.inputNode().removeTapOnBus(0);
-            self.engine.stop();
+            AudioQueueStop(self.queue, 1);
+            AudioQueueDispose(self.queue, 1);
+            drop(Box::from_raw(self.tap));
         }
-    }
-}
-
-/// Float samples at the microphone's rate to PCM16 at the target rate. Each
-/// output sample averages the input samples it covers, which keeps speech
-/// clear without a separate low-pass filter.
-struct Resampler {
-    /// Input samples per output sample.
-    step: f64,
-    /// Input samples still to take before the next output sample.
-    left: f64,
-    sum: f32,
-    count: u32,
-    last: f32,
-}
-
-impl Resampler {
-    fn new(from: f64, to: f64) -> Resampler {
-        let step = from / to;
-        Resampler { step, left: step, sum: 0., count: 0, last: 0. }
-    }
-
-    fn push(&mut self, samples: &[f32]) -> Vec<i16> {
-        let mut out = Vec::with_capacity((samples.len() as f64 / self.step) as usize + 1);
-        for &sample in samples {
-            self.sum += sample;
-            self.count += 1;
-            self.left -= 1.;
-            // Upsampling repeats a sample; downsampling averages several.
-            while self.left <= 0. {
-                if self.count > 0 {
-                    self.last = self.sum / self.count as f32;
-                    self.sum = 0.;
-                    self.count = 0;
-                }
-                out.push((self.last.clamp(-1., 1.) * i16::MAX as f32).round() as i16);
-                self.left += self.step;
-            }
-        }
-        out
     }
 }
 
 pub fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resampler_keeps_the_target_rate_and_level() {
-        for from in [48_000., 44_100., 8_000.] {
-            let mut resampler = Resampler::new(from, 16_000.);
-            let second = vec![0.5f32; from as usize];
-            // In chunks, like the tap delivers them.
-            let out: Vec<i16> = second.chunks(4800).flat_map(|chunk| resampler.push(chunk)).collect();
-            assert!((out.len() as i64 - 16_000).abs() <= 1, "{from} Hz gave {} samples", out.len());
-            assert!(out.iter().all(|&sample| (sample - 16_384).abs() <= 1));
-        }
-    }
 }

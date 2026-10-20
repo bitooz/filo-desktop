@@ -31,6 +31,8 @@ const MIC_OFF: &str = "Microphone access is off. Turn it on in System Settings �
 const NOT_AN_APP: &str = "macOS asks for the microphone only when Filo runs as an app. Start it with scripts/app.sh.";
 
 pub(super) enum VoiceState {
+    /// The recording row is up and the microphone opens once it's drawn (`open_microphone`).
+    Opening,
     Recording {
         recorder: Recorder,
         live: Option<Live>,
@@ -152,10 +154,16 @@ impl Conversation {
 
     /// A voice message is recording (the pet's "Listening").
     pub fn recording(&self) -> bool {
-        matches!(self.voice, Some(VoiceState::Recording { .. }))
+        matches!(self.voice, Some(VoiceState::Opening | VoiceState::Recording { .. }))
     }
 
-    /// fn+⌃ went down (and stayed down a moment): record until it's let go.
+    /// Whether holding fn+⌃ records straight away, with nothing to say first (no text in the box, microphone access
+    /// given).
+    pub fn can_hold_voice(&self, cx: &App) -> bool {
+        self.voice.is_none() && !self.voice_disabled(cx) && recorder::permission() == Permission::Granted
+    }
+
+    /// fn+⌃ went down (at once when `can_hold_voice`, else after a moment): record until it's let go.
     pub fn hold_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.voice.is_some() {
             return;
@@ -174,6 +182,7 @@ impl Conversation {
             return;
         }
         match &self.voice {
+            Some(VoiceState::Opening) => self.cancel_voice(cx),
             Some(VoiceState::Recording { recorder, .. }) if recorder.elapsed_ms() < MIN_VOICE_MS => {
                 self.cancel_voice(cx)
             }
@@ -185,7 +194,7 @@ impl Conversation {
 
     /// Esc while holding fn+⌃.
     pub fn cancel_held_voice(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.voice_held && matches!(self.voice, Some(VoiceState::Recording { .. })) {
+        if self.voice_held && self.recording() {
             self.cancel_voice(cx);
             return true;
         }
@@ -242,26 +251,50 @@ impl Conversation {
         }
     }
 
+    /// Shows the recording row at once; the microphone opens behind it, as macOS takes a moment (0.1–0.3 s) to open
+    /// it and the window doesn't draw meanwhile.
     fn begin_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.voice.is_some() || self.voice_disabled(cx) {
             return;
         }
+        self.voice = Some(VoiceState::Opening);
+        self.hint = None;
+        // The text field leaves the screen for the recording row; focus left on it
+        // would point nowhere, and key events (the fn+⌃ release, Esc) would be lost.
+        self.focus.focus(window);
+        cx.notify();
+        // Frame callbacks run before the frame draws: the next one is the first after the row is drawn.
+        let asked = Instant::now();
+        cx.on_next_frame(window, move |_, window, cx| {
+            cx.on_next_frame(window, move |this, window, cx| this.open_microphone(asked, window, cx))
+        });
+    }
+
+    fn open_microphone(&mut self, asked: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        // Let go, cancelled or sent before it opened.
+        if !matches!(self.voice, Some(VoiceState::Opening)) {
+            return;
+        }
         media::stop(cx);
+        // The stream first: the words it hears are the message.
+        let opening = Instant::now();
+        let live = start_live(&backend(cx));
         match Recorder::start() {
             Ok(recorder) => {
-                let live = start_live(&backend(cx));
+                eprintln!(
+                    "voice: recording {} ms after it was asked for (the microphone took {} ms to open)",
+                    asked.elapsed().as_millis(),
+                    opening.elapsed().as_millis()
+                );
                 self.voice = Some(VoiceState::Recording {
                     recorder,
                     live,
                     started: Instant::now(),
                     levels: VecDeque::with_capacity(LEVELS),
                 });
-                self.hint = None;
-                // The text field leaves the screen for the recording row; focus left on it
-                // would point nowhere, and key events (the fn+⌃ release, Esc) would be lost.
-                self.focus.focus(window);
             }
             Err(_) => {
+                self.voice = None;
                 self.voice_held = false;
                 self.hint = Some("Microphone could not start. Check permission and try again.".into());
             }
@@ -356,7 +389,7 @@ impl Conversation {
             }
             // Already on its way.
             sending @ Some(VoiceState::Sending { .. }) => self.voice = sending,
-            None => {}
+            Some(VoiceState::Opening) | None => {}
         }
         self.hint = None;
         cx.notify();
@@ -621,9 +654,15 @@ impl Conversation {
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send_voice(window, cx)));
         let row = div().flex().items_center().gap(px(space::XS)).px(px(space::XS)).h(px(self.text_row_height));
         let row = match voice {
-            VoiceState::Recording { recorder, live, levels, .. } => {
-                let elapsed = recorder.elapsed_ms();
-                let heard = live.as_ref().map(|live| live.transcription.heard()).unwrap_or_default();
+            VoiceState::Opening | VoiceState::Recording { .. } => {
+                let (elapsed, heard, levels) = match voice {
+                    VoiceState::Recording { recorder, live, levels, .. } => (
+                        recorder.elapsed_ms(),
+                        live.as_ref().map(|live| live.transcription.heard()).unwrap_or_default(),
+                        Some(levels),
+                    ),
+                    _ => (0., Heard::default(), None),
+                };
                 // The dot blinks each half second, like a recording light.
                 let lit = (elapsed / 500.) as i64 % 2 == 0;
                 row.child(
@@ -675,7 +714,7 @@ impl Conversation {
                         .items_center()
                         .justify_end()
                         .gap(px(2.))
-                        .children(levels.iter().map(|level| {
+                        .children(levels.into_iter().flatten().map(|level| {
                             div()
                                 .flex_none()
                                 .w(px(3.))

@@ -86,7 +86,7 @@ mod tests {
     use std::path::Path;
 
     /// What captures the screen or asks macOS for a permission (with a prompt, or by starting what brings one up).
-    const ASKS: [&str; 19] = [
+    const ASKS: [&str; 20] = [
         "CGRequestScreenCaptureAccess",
         "\"screencapture\"",
         "/usr/sbin/screencapture",
@@ -104,6 +104,7 @@ mod tests {
         "requestRecordPermission",
         "prepareToRecord",
         "startAndReturnError",
+        "AudioQueueStart",
         "requestAuthorizationWithOptions",
         "osascript",
     ];

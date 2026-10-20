@@ -6077,8 +6077,8 @@ fn run_feed_refresh(window: &mut Window, cx: &mut Context<AppShell>) {
 
 /// `FILO_OPEN=voice-keys-drive`: the voice message shortcuts in an agent's chat and in a chat, with fixture data
 /// (scripts/voice-keys-check.sh runs it offline in a sandbox). With the message box focused, fn+⌃ and Esc go in as
-/// real key events posted inside the app: held with text, fn+⌃ asks to clear the box; a tap does nothing; held on an
-/// empty box it reaches the recorder (a bare binary without microphone access says to start Filo as an app; one that
+/// real key events posted inside the app: held with text, fn+⌃ asks to clear the box; a tap leaves nothing recording
+/// or kept; held on an empty box it reaches the recorder (a bare binary without microphone access says to start Filo as an app; one that
 /// can record does, and Esc while holding throws the recording away); the other conversation hears none of it. The
 /// open shortcut held (the commands hotkeys.rs sends) records in the chat on screen, the agent's too, staying on its
 /// tab; with none on screen it opens the Chats tab as before. Each step starts from an empty box with no recording.
@@ -6218,9 +6218,15 @@ fn run_voice_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
                             native_input::flags(width, chord);
                             wait(100).await;
                             native_input::flags(width, 0);
-                            // Nothing, however long it's waited for.
+                            // Nothing left, however long it's waited for. It reaches the recorder at once (a build that
+                            // can't record says so), and one that can drops a press that short.
                             wait(1000).await;
-                            (hint(view, cx).is_none() && !recording(view, cx), format!("{name}: a fn+⌃ tap does nothing ({:?})", hint(view, cx)))
+                            let kept = view.read_with(cx, |view, cx| view.has_unsent_work(cx)).unwrap_or(true);
+                            let note = hint(view, cx);
+                            (
+                                (note.is_none() || reaches_recorder(note.as_deref())) && !recording(view, cx) && !kept,
+                                format!("{name}: a fn+⌃ tap leaves nothing recording or kept ({note:?}, kept {kept})"),
+                            )
                         }
                         _ => {
                             native_input::flags(width, chord);

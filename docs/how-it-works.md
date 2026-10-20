@@ -367,14 +367,21 @@ the group) and plays on the message's bubble and under an agent's Shared › Voi
 starts with an agent's or the group's name ("Milo, …") goes there (`voice_route.rs`), and the pet shows the words and
 who they go to while you hold.
 
-In Filo's window, fn+⌃ held in a chat records there (`AppShell::on_modifiers`, `screens/chat/voice.rs`). Like typing,
+In Filo's window, fn+⌃ held in a chat records there (`AppShell::on_modifiers`, `screens/chat/voice.rs`). It starts at
+once: the recording row shows on the next frame, and the microphone opens behind it (`VoiceState::Opening`). macOS takes
+0.1–0.3 s to open it, and the window doesn't draw meanwhile. A press under 0.3 s is dropped when it's let go. So is one
+with another key pressed while it's down, as that's part of another shortcut. When it can't record (text in the box, no
+microphone access), it says why only after the keys have stayed down 0.25 s, so brushing them shows nothing. Each
+recording logs how long it took to start ("voice: recording … ms after it was asked for"). Like typing,
 it needs GPUI's view to have the window's keyboard. A web view over it (a glance, an artifact page, the note editor)
 takes the keyboard when it's clicked. A click on Filo's own content takes it back, and so does the next frame once the
 page that had it is hidden or closed (vendor/gpui/FILO.md). `FILO_OPEN=page-keys-drive`, in a test window, clicks a page,
 then hides it or takes it out, and checks that typing and fn+⌃ still reach the main agent's message box.
 
 The words come from Filo's relay at dev.filo.im (`src/live_transcription.rs`; the relay itself isn't part of this
-repository). While you talk, the microphone's audio streams to it as 16 kHz PCM and
+repository). While you talk, the microphone's audio streams to it as 16 kHz PCM (`recorder::MicStream`: an audio queue
+on the input, next to the recorder's own; AVAudioEngine's input set up a device pairing the microphone with the
+speakers, which took ~0.5 s each time and stopped when the output changed) and
 on to Microsoft's MAI-Transcribe-2-Streaming, and the text comes back. It's the one part of a conversation that leaves
 the Mac, and it needs no account: the relay is told only that this is Filo for Mac and which build. It has a daily
 allowance per network and one for every Mac together, both back at 00:00 UTC. When they're used up or you're offline,
