@@ -3525,8 +3525,9 @@ fn run_agent_back_drive(window: &mut Window, cx: &mut Context<AppShell>) {
 /// `FILO_OPEN=agent-model-drive`: a new agent's form and its model menu (every tool's models, OpenCode's hundreds
 /// among them), used like a person would with in-app AppKit events: opens it and logs where its list sits in the
 /// window, scrolls the list to its end and checks the last model is shown, types `FILO_DRIVE_SEARCH` (default "muse")
-/// and logs how many models match, then Return (or a click on the first, with `FILO_DRIVE_CLICK`), and logs the form's
-/// model. Run it on a config of its own
+/// and logs how many models match, then Down `FILO_DRIVE_DOWNS` times (default 2), Up and Return (or a click on the
+/// first, with `FILO_DRIVE_CLICK`), and logs the form's model. `FILO_DRIVE_HOVER=<line>` first rests the pointer on that
+/// line of the matches, which moves the highlight there. Run it on a config of its own
 /// (`FILO_CONFIG_DIR`).
 fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
     let backend = backend(cx);
@@ -3587,6 +3588,7 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
                 break;
             }
         }
+        shot("agent-model-1-opened");
         let Some(list) = on_screen(LIST) else { return eprintln!("agent-model-drive: FAIL the menu didn't open") };
         let inside = f32::from(list.top()) >= 0. && f32::from(list.bottom()) <= height;
         eprintln!(
@@ -3623,6 +3625,11 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             "agent-model-drive: list after scrolling {} (window {height:.0} tall)",
             place(LIST).unwrap_or_default()
         );
+        // A wheel that lands off the menu closes it: open it again for the search.
+        if on_screen(LIST).is_none() {
+            eprintln!("agent-model-drive: the menu closed; clicked the model ({})", click(&this, cx, "agent-model"));
+            wait(1000).await;
+        }
         let search = std::env::var("FILO_DRIVE_SEARCH").unwrap_or_else(|_| "muse".into());
         type_keys(&this, cx, &search, false);
         wait(1000).await;
@@ -3641,15 +3648,41 @@ fn run_agent_model_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             matches.len(),
             matches.join(", ")
         );
+        shot("agent-model-2-searched");
         // `FILO_DRIVE_CLICK`: the first that matches clicked rather than Return.
         if std::env::var_os("FILO_DRIVE_CLICK").is_some() {
             eprintln!("agent-model-drive: clicked the first match ({})", click(&this, cx, "agent-model-menu-row-0"));
         } else {
+            // The highlight stops at the list's ends, so Up from the last match is on the one before it.
+            let downs: usize = std::env::var("FILO_DRIVE_DOWNS").ok().and_then(|n| n.parse().ok()).unwrap_or(2);
+            let start: usize = std::env::var("FILO_DRIVE_HOVER").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+            if let Some(line) =
+                std::env::var_os("FILO_DRIVE_HOVER").and(on_screen(&format!("agent-model-menu-row-{start}")))
+            {
+                let center = line.center();
+                let hovered = native_input::hover(width, f32::from(center.x).into(), f32::from(center.y).into());
+                eprintln!("agent-model-drive: pointer rests on match {start} ({hovered})");
+                wait(500).await;
+            }
+            for _ in 0..downs {
+                native_input::key(width, "\u{f701}", 125, 0);
+                wait(150).await;
+            }
+            native_input::key(width, "\u{f700}", 126, 0);
+            wait(300).await;
+            shot("agent-model-3-arrows");
+            wait(500).await;
+            let expected = matches.get((start + downs).min(matches.len().saturating_sub(1)).saturating_sub(1)).cloned();
+            eprintln!(
+                "agent-model-drive: pressed Down {downs} times, then Up; Return should pick {}",
+                expected.unwrap_or_default()
+            );
             type_keys(&this, cx, "", true);
         }
         wait(1500).await;
         let model =
             screen(cx).and_then(|agents| agents.read_with(cx, |agents, _| agents.drive_form_model()).ok().flatten());
+        shot("agent-model-4-picked");
         eprintln!(
             "agent-model-drive: after Return: list {}, form's model {model:?}",
             place(LIST).unwrap_or_else(|| "closed".into())

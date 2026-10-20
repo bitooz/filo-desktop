@@ -1,14 +1,16 @@
 // A menu that is searched: a field above a list that scrolls, in a popover by the button that opens it. For lists too
 // long for a plain menu, as the models are once OpenCode's hundreds are among them: the Coding page's model pickers, an
-// agent's page and the chat composer. Typing narrows the list to what holds every word typed; Return picks the first.
+// agent's page and the chat composer. Typing narrows the list to what holds every word typed; Up and Down move a
+// highlight over it (the pointer moves it too) while the field keeps the keyboard, and Return picks the highlighted line.
 
 use std::rc::Rc;
 
 use gpui::{
     App, AppContext as _, Corner, ElementId, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle, Window, div,
+    prelude::FluentBuilder as _, px,
 };
-use gpui_component::input::{Enter, Input, InputState};
+use gpui_component::input::{Enter, Input, InputState, MoveDown, MoveUp};
 use gpui_component::popover::Popover;
 use gpui_component::{Icon, IconName, Selectable, Sizable as _, StyledExt as _};
 
@@ -54,11 +56,28 @@ pub fn matching(choices: &[Choice], query: &str) -> Vec<usize> {
     choices.iter().enumerate().filter(|(_, choice)| choice.holds(&words)).map(|(index, _)| index).collect()
 }
 
-/// What the menu keeps while it's open: its search field, which has the keyboard once it opens. It goes when the menu
-/// closes, so each opening starts with an empty search.
+/// What the menu keeps while it's open: its search field, which has the keyboard once it opens, and the highlighted
+/// line. It goes when the menu closes, so each opening starts with an empty search.
 struct Search {
     input: Entity<InputState>,
     focused: bool,
+    /// The highlighted line, of those shown, and the search it was set for: a new search puts it back on the first
+    /// match, or on the ticked line when the search is emptied (as when the menu opens).
+    highlight: usize,
+    searched: Option<String>,
+    scroll: UniformListScrollHandle,
+}
+
+impl Search {
+    /// The highlight `step` lines on, stopping at the list's ends, scrolled into view.
+    fn move_by(&mut self, step: isize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.highlight = (self.highlight as isize + step).clamp(0, count as isize - 1) as usize;
+        let strategy = if step < 0 { ScrollStrategy::Top } else { ScrollStrategy::Bottom };
+        self.scroll.scroll_to_item(self.highlight, strategy);
+    }
 }
 
 /// `trigger` opening the menu of `choices` (made only while it's open), anchored at `anchor`, `width` points wide;
@@ -80,6 +99,9 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
             let search = window.use_keyed_state(SharedString::from(format!("{id}-search")), cx, |window, cx| Search {
                 input: cx.new(|cx| InputState::new(window, cx).placeholder(placeholder)),
                 focused: false,
+                highlight: 0,
+                searched: None,
+                scroll: UniformListScrollHandle::new(),
             });
             let input = search.read(cx).input.clone();
             if !search.read(cx).focused {
@@ -90,6 +112,16 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
             let choices = choices();
             let found = Rc::new(matching(&choices, &query));
             let searching = !query.trim().is_empty();
+            let (highlight, scroll) = search.update(cx, |search, _| {
+                if search.searched.as_deref() != Some(query.as_str()) {
+                    let ticked = (!searching).then(|| found.iter().position(|&index| choices[index].checked)).flatten();
+                    search.highlight = ticked.unwrap_or(0);
+                    search.scroll.scroll_to_item(search.highlight, ScrollStrategy::Center);
+                    search.searched = Some(query.clone());
+                }
+                search.highlight = search.highlight.min(found.len().saturating_sub(1));
+                (search.highlight, search.scroll.clone())
+            });
             let theme = gpui_component::ActiveTheme::theme(&**cx);
             let (hover_bg, hover_fg, border, radius, text) = (
                 theme.accent,
@@ -119,7 +151,8 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                 let room = f32::from(window.viewport_size().height) - 2. * WINDOW_MARGIN - SEARCH_HEIGHT;
                 let height =
                     (found.len() as f32 * ROW_HEIGHT).min(ROWS_SHOWN * ROW_HEIGHT).min(room.max(4. * ROW_HEIGHT));
-                let (choices, found, choose, row_id) = (choices.clone(), found.clone(), choose.clone(), id.clone());
+                let (choices, found, choose, row_id, state) =
+                    (choices.clone(), found.clone(), choose.clone(), id.clone(), search.clone());
                 let list =
                     gpui::uniform_list(SharedString::from(format!("{id}-list")), found.len(), move |range, _, cx| {
                         let colors = *cx.colors();
@@ -128,7 +161,7 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                                 let index = found[row];
                                 let choice = &choices[index];
                                 let ruled = !searching && row > 0 && choices[found[row - 1]].group != choice.group;
-                                let choose = choose.clone();
+                                let (choose, state) = (choose.clone(), state.clone());
                                 let line =
                                     div()
                                         .id(row)
@@ -140,7 +173,7 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                                         .rounded(radius)
                                         .text_sm()
                                         .when(ruled, |this| this.border_t_1().border_color(border).rounded_none())
-                                        .hover(|this| this.bg(hover_bg).text_color(hover_fg))
+                                        .when(row == highlight, |this| this.bg(hover_bg).text_color(hover_fg))
                                         .child(div().flex_none().w(px(12.)).when(choice.checked, |this| {
                                             this.child(Icon::new(IconName::Check).xsmall())
                                         }))
@@ -153,15 +186,28 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                                         .children(choice.note.clone().map(|note| {
                                             div().flex_none().caption().text_color(colors.text_secondary).child(note)
                                         }))
+                                        // The pointer moves the highlight, so it and the keys show one line.
+                                        .on_hover(move |hovered, _, cx| {
+                                            if *hovered {
+                                                state.update(cx, |search, cx| {
+                                                    if search.highlight != row {
+                                                        search.highlight = row;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            }
+                                        })
                                         .on_click(move |_, window, cx| choose(index, window, cx));
                                 crate::smoke::tracked(format!("{row_id}-row-{row}"), line)
                             })
                             .collect()
                     })
+                    .track_scroll(scroll)
                     .h(px(height));
                 crate::smoke::tracked(format!("{id}-list"), list)
             };
-            let first = found.first().copied();
+            let count = found.len();
+            let (up, down) = (search.clone(), search.clone());
             div()
                 .w(px(width))
                 .p(px(space::XS))
@@ -173,9 +219,23 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                 // The scroll wheel over it scrolls its list, not closing it (gpui-component's one_menu.rs).
                 .relative()
                 .child(gpui_component::one_menu::surface())
-                // Return in the search field picks the first that matches.
+                // Up and Down in the search field move the highlight rather than its caret; Return picks it.
+                .capture_action(move |_: &MoveUp, _, cx| {
+                    up.update(cx, |search, cx| {
+                        search.move_by(-1, count);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
+                .capture_action(move |_: &MoveDown, _, cx| {
+                    down.update(cx, |search, cx| {
+                        search.move_by(1, count);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
                 .on_action(move |_: &Enter, window, cx| {
-                    if let Some(index) = first {
+                    if let Some(&index) = found.get(search.read(cx).highlight) {
                         choose(index, window, cx);
                     }
                 })
