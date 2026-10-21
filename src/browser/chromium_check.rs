@@ -111,7 +111,7 @@ pub fn open(cx: &mut App) {
 /// Opens `MEMORY_SITES` one at a time in one engine, measuring after each; then closes them.
 async fn memory_of(cx: &mut AsyncApp, chromium: bool) {
     let engine = if chromium { "Chromium" } else { "WebKit" };
-    super::chromium::force(Some(chromium));
+    super::engine::force(Some(if chromium { super::engine::Kind::Chromium } else { super::engine::Kind::WebKit }));
     let before: Vec<u32> = webkit_processes().into_iter().map(|(pid, _)| pid).collect();
     let mut opened_tabs = Vec::new();
     let mut last = 0.;
@@ -156,7 +156,7 @@ async fn memory_of(cx: &mut AsyncApp, chromium: bool) {
     for tab in opened_tabs {
         ask(cx, json!({ "op": "close", "tab": tab })).await.ok();
     }
-    super::chromium::force(None);
+    super::engine::force(None);
     sleep(cx, 2000).await;
 }
 
@@ -171,7 +171,7 @@ async fn google(cx: &mut AsyncApp) {
     let email_field = Regex::new(r#"\[(e\d+)\] textbox "[^"]*(?:[Ee]mail|phone)"#).expect("pattern");
     for chromium in [true, false] {
         let engine = if chromium { "Chromium" } else { "WebKit" };
-        super::chromium::force(Some(chromium));
+        super::engine::force(Some(if chromium { super::engine::Kind::Chromium } else { super::engine::Kind::WebKit }));
         let answer = text(
             &ask(
                 cx,
@@ -179,7 +179,7 @@ async fn google(cx: &mut AsyncApp) {
             )
             .await,
         );
-        super::chromium::force(None);
+        super::engine::force(None);
         let tab = opened(&answer);
         let field = email_field.captures(&answer).map(|found| found[1].to_string());
         let Some(field) = field else {
@@ -237,10 +237,10 @@ async fn cookies(cx: &mut AsyncApp, path: &str) {
         Ok(cookies) => cookies,
         Err(error) => return say(format!("cookies: couldn't read {path}: {error}")),
     };
-    super::chromium::force(Some(true));
+    super::engine::force(Some(super::engine::Kind::Chromium));
     let answer = text(&ask(cx, json!({ "op": "open", "url": "about:blank", "agent": "Check" })).await);
     let tab = opened(&answer);
-    let taken = super::chromium::set_cookies(&tab, &cookies).await.unwrap_or(0);
+    let taken = super::chromium::set_cookies(cookies.clone(), false).await.map_or(0, |(set, _)| set);
     let lasting = cookies.iter().filter(|cookie| cookie.get("expires").is_some()).count();
     say(format!("cookies: {} in the copy ({lasting} with an expiry), Chromium took {taken}", cookies.len()));
     let sites = std::env::var("FILO_CHROMIUM_SITES").unwrap_or_default();
@@ -280,17 +280,17 @@ async fn cookies(cx: &mut AsyncApp, path: &str) {
         ));
     }
     ask(cx, json!({ "op": "close", "tab": tab })).await.ok();
-    super::chromium::force(None);
+    super::engine::force(None);
 }
 
 /// A Chromium tab in the browser window, clicked and typed in as the user, and its picture.
 async fn window(cx: &mut AsyncApp, shots: Option<&str>) {
-    super::chromium::force(Some(true));
+    super::engine::force(Some(super::engine::Kind::Chromium));
     let answer = text(
         &ask(cx, json!({ "op": "open", "url": "https://en.wikipedia.org/wiki/Special:Search", "agent": "Check" }))
             .await,
     );
-    super::chromium::force(None);
+    super::engine::force(None);
     let tab = opened(&answer);
     if tab.is_empty() {
         return say(format!("window: no tab: {}", answer.lines().next().unwrap_or_default()));

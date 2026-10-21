@@ -13,9 +13,11 @@
 // handlers, and what agents do is kept for the user to watch, pause and take over (browser/activity.rs).
 
 mod activity;
-// Chromium (CEF) as the engine, a test: FILO_BROWSER_ENGINE=chromium (`dev` builds).
-#[cfg(feature = "dev")]
+// Chromium (CEF) as the page's engine, the one Settings › Browser can pick instead of WebKit (browser/engine.rs).
 mod chromium;
+// `FILO_OPEN=browser-engine-check`: Settings › Browser's switch between the engines from a local feed (`dev` builds).
+#[cfg(feature = "dev")]
+mod engine_check;
 // `FILO_OPEN=chromium-check`: memory, Google's sign-in and WebKit's cookies with Chromium as the engine (`dev` builds).
 #[cfg(feature = "dev")]
 mod chromium_check;
@@ -24,6 +26,8 @@ mod chromium_check;
 pub mod check;
 mod delegate;
 mod drag;
+// Which engine new pages open in, and the Chromium engine's download, checks and updates (Settings › Browser).
+pub mod engine;
 // `FILO_OPEN=browser-drag-check`: dragging in a page, mouse-only and drag and drop (`dev` builds).
 #[cfg(feature = "dev")]
 mod drag_check;
@@ -103,16 +107,20 @@ pub struct Download {
     told: (bool, bool),
 }
 
+/// What runs a tab's page: everything else about a tab is the same in both engines (native.rs asks browser/chromium.rs
+/// first for what it would ask WebKit).
+enum Page {
+    WebKit(wry::WebView),
+    /// Kept for its drop, which closes the page in Chromium.
+    Chromium(#[allow(dead_code)] chromium::Page),
+}
+
 pub struct Tab {
     pub id: String,
     /// A page's alert, confirm or prompt, waiting for its answer. Answered (dismissed) before the page goes.
     dialog: RefCell<Option<delegate::Dialog>>,
-    // Dropped before its window. None for a page in Chromium (`chromium`).
-    web: Option<wry::WebView>,
-    /// Kept for its drop, which closes the page in Chromium.
-    #[cfg(feature = "dev")]
-    #[allow(dead_code)]
-    chromium: Option<chromium::Page>,
+    // Dropped before its window.
+    page: Page,
     /// The page's view: WebKit's, or the one a page in Chromium shows in.
     view: Retained<objc2::runtime::AnyObject>,
     park: native::Park,
@@ -152,16 +160,21 @@ impl Tab {
     }
 
     pub fn load(&self, url: &str) {
-        match &self.web {
-            Some(web) => drop(web.load_url(url)),
-            #[cfg(feature = "dev")]
-            None => {
+        match &self.page {
+            Page::WebKit(web) => drop(web.load_url(url)),
+            Page::Chromium(_) => {
                 if let Some(page) = chromium::of(self.view()) {
                     page.load(url);
                 }
             }
-            #[cfg(not(feature = "dev"))]
-            None => {}
+        }
+    }
+
+    /// The engine the page runs in.
+    pub fn engine(&self) -> engine::Kind {
+        match self.page {
+            Page::WebKit(_) => engine::Kind::WebKit,
+            Page::Chromium(_) => engine::Kind::Chromium,
         }
     }
 
@@ -232,6 +245,17 @@ impl Tab {
             native::focus_page(self.view());
         }
         changed();
+    }
+}
+
+impl Drop for Tab {
+    /// Its page leaves the browser window with it (a page in Chromium is a view of Filo's own, which the window would
+    /// keep).
+    fn drop(&mut self) {
+        // SAFETY: AppKit on the main thread; the tab holds the view.
+        unsafe {
+            let _: () = objc2::msg_send![&*self.view, removeFromSuperview];
+        }
     }
 }
 
@@ -306,17 +330,30 @@ fn local_dir() -> PathBuf {
     crate::config::config_dir().join("local")
 }
 
+/// `local/browser.json`: the WebKit data store's id (`store_id`) and the engine Settings › Browser picked
+/// (browser/engine.rs).
+fn browser_json() -> Value {
+    let saved = std::fs::read(local_dir().join("browser.json")).ok();
+    saved.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).filter(Value::is_object).unwrap_or(json!({}))
+}
+
+/// Sets one key of `local/browser.json`, the others kept.
+fn set_browser_json(key: &str, value: Value) -> Result<(), String> {
+    let mut saved = browser_json();
+    saved[key] = value;
+    std::fs::create_dir_all(local_dir()).map_err(|error| error.to_string())?;
+    crate::config::write_atomic(&local_dir().join("browser.json"), saved.to_string().as_bytes())
+        .map_err(|error| error.to_string())
+}
+
 /// The id of the browser's WebKit data store, made once and kept in `local/browser.json`: a test run's data folder
 /// has its own, so its logins never mix with the user's.
 fn store_id() -> [u8; 16] {
-    let path = local_dir().join("browser.json");
-    let saved = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    if let Some(id) = saved.as_ref().and_then(|saved| saved.get("store")?.as_str()?.parse::<uuid::Uuid>().ok()) {
+    if let Some(id) = browser_json().get("store").and_then(|id| id.as_str()?.parse::<uuid::Uuid>().ok()) {
         return *id.as_bytes();
     }
     let id = uuid::Uuid::new_v4();
-    let _ = std::fs::create_dir_all(local_dir());
-    let _ = crate::config::write_atomic(&path, json!({ "store": id.to_string() }).to_string().as_bytes());
+    let _ = set_browser_json("store", json!(id.to_string()));
     *id.as_bytes()
 }
 
@@ -339,11 +376,70 @@ fn user_agent() -> String {
 
 /// A new tab loading `url` (none: a page WebKit loads itself, a pop-up's), in the browser's data store.
 fn new_tab(url: Option<&str>, owner: Option<Owner>) -> Result<Rc<Tab>, String> {
-    #[cfg(feature = "dev")]
-    if chromium::wanted() {
-        return chromium_tab(url.unwrap_or("about:blank"), owner);
+    new_tab_as(next_id(), url, owner, None)
+}
+
+/// `new_tab` with id `id` (and the tab that opened it), in the engine new pages open in (Settings › Browser).
+fn new_tab_as(id: String, url: Option<&str>, owner: Option<Owner>, opener: Option<String>) -> Result<Rc<Tab>, String> {
+    if engine::current() == engine::Kind::Chromium {
+        if tabs().len() >= MAX_TABS {
+            return Err(format!(
+                "The browser has {MAX_TABS} tabs open, its most: close some you're done with (browser_close)."
+            ));
+        }
+        let (page, view) = chromium::open(&id, url.unwrap_or("about:blank"), PAGE_SIZE)?;
+        return add_chromium_tab(id, owner, opener, page, view);
     }
-    new_tab_with(url, owner, None, |builder| builder.with_data_store_identifier(store_id()))
+    new_tab_with(id, url, owner, opener, |builder| builder.with_data_store_identifier(store_id()))
+}
+
+/// Opens tabs again in the engine new pages open in now: those in the other one (Settings › Browser switched it), and
+/// with `chromium`, every tab in Chromium too (the engine stopped under them). Each opens at its address with its id,
+/// owner, opener and agent's work; the browser window shows the same tab, and the agent hears of it with its next
+/// answer. How many opened again.
+pub fn reopen_tabs(chromium: bool) -> usize {
+    let now = engine::current();
+    let mut reopened = 0;
+    for old in tabs() {
+        if old.engine() == now && !(chromium && old.engine() == engine::Kind::Chromium) {
+            continue;
+        }
+        let (_, url, _) = old.state();
+        let url = if url.is_empty() { "about:blank".to_string() } else { url };
+        let Some(index) = BROWSER.with(|browser| browser.borrow().tabs.iter().position(|tab| tab.id == old.id)) else {
+            continue;
+        };
+        // Out of the window and the list first: the new one takes its place.
+        old.park.take(old.view(), None);
+        BROWSER.with(|browser| browser.borrow_mut().tabs.remove(index));
+        match new_tab_as(old.id.clone(), Some(&url), old.owner.clone(), old.opener.clone()) {
+            Ok(tab) => {
+                *tab.help.borrow_mut() = old.help.borrow_mut().take();
+                *tab.upload.borrow_mut() = old.upload.borrow_mut().take();
+                *tab.downloads.borrow_mut() = std::mem::take(&mut *old.downloads.borrow_mut());
+                *tab.news.borrow_mut() = std::mem::take(&mut *old.news.borrow_mut());
+                *tab.work.borrow_mut() = std::mem::take(&mut *old.work.borrow_mut());
+                tab.news.borrow_mut().push(format!(
+                    "Filo's browser restarted on {} (the user's choice in Settings, or the engine stopped): this tab opened again at {url}. Read the page again (browser_read) before using refs you had.",
+                    tab.engine().label()
+                ));
+                BROWSER.with(|browser| {
+                    let mut browser = browser.borrow_mut();
+                    let at = browser.tabs.iter().position(|other| other.id == tab.id);
+                    if let Some(at) = at {
+                        let tab = browser.tabs.remove(at);
+                        let index = index.min(browser.tabs.len());
+                        browser.tabs.insert(index, tab);
+                    }
+                });
+                reopened += 1;
+            }
+            Err(error) => eprintln!("browser: couldn't open {} again: {error}", old.id),
+        }
+    }
+    changed();
+    keep_awake();
+    reopened
 }
 
 /// The folder an agent's downloads go to: the local data folder's `downloads` (the user's own go to Downloads, as in
@@ -447,6 +543,7 @@ fn on_page_closed(view: *mut objc2::runtime::AnyObject) {
 /// `new_tab` with the builder's data store, or a pop-up's configuration, set by `configure`; `opener` is the tab a
 /// pop-up's page came from.
 fn new_tab_with(
+    id: String,
     url: Option<&str>,
     owner: Option<Owner>,
     opener: Option<String>,
@@ -458,11 +555,6 @@ fn new_tab_with(
         ));
     }
     let park = native::Park::new(PAGE_SIZE.0, PAGE_SIZE.1).ok_or("Couldn't make the page's window")?;
-    let id = BROWSER.with(|browser| {
-        let mut browser = browser.borrow_mut();
-        browser.next += 1;
-        format!("t{}", browser.next)
-    });
     let (opened_by, opener_owner) = (id.clone(), owner.clone());
     let (started, finished) = (id.clone(), id.clone());
     let mut builder = wry::WebViewBuilder::new()
@@ -494,9 +586,7 @@ fn new_tab_with(
     let tab = Rc::new(Tab {
         id,
         dialog: RefCell::new(None),
-        web: Some(web),
-        #[cfg(feature = "dev")]
-        chromium: None,
+        page: Page::WebKit(web),
         view,
         park,
         owner,
@@ -517,21 +607,7 @@ fn new_tab_with(
     Ok(tab)
 }
 
-/// A new tab in Chromium (FILO_BROWSER_ENGINE=chromium) loading `url`.
-#[cfg(feature = "dev")]
-fn chromium_tab(url: &str, owner: Option<Owner>) -> Result<Rc<Tab>, String> {
-    if tabs().len() >= MAX_TABS {
-        return Err(format!(
-            "The browser has {MAX_TABS} tabs open, its most: close some you're done with (browser_close)."
-        ));
-    }
-    let id = next_id();
-    let (page, view) = chromium::open(&id, url, PAGE_SIZE)?;
-    add_chromium_tab(id, owner, None, page, view)
-}
-
 /// The next tab's id ("t4").
-#[cfg(feature = "dev")]
 fn next_id() -> String {
     BROWSER.with(|browser| {
         let mut browser = browser.borrow_mut();
@@ -541,7 +617,6 @@ fn next_id() -> String {
 }
 
 /// A pop-up Chromium opened from tab `opener`'s page: a tab of the same owner (`key`, the id Filo gave it).
-#[cfg(feature = "dev")]
 fn chromium_popup(
     key: &str,
     opener: &str,
@@ -560,7 +635,6 @@ fn chromium_popup(
     Ok(())
 }
 
-#[cfg(feature = "dev")]
 fn add_chromium_tab(
     id: String,
     owner: Option<Owner>,
@@ -573,8 +647,7 @@ fn add_chromium_tab(
     let tab = Rc::new(Tab {
         id,
         dialog: RefCell::new(None),
-        web: None,
-        chromium: Some(page),
+        page: Page::Chromium(page),
         view,
         park,
         owner,
@@ -597,7 +670,7 @@ fn add_chromium_tab(
 
 fn popup(opener: &str, owner: Option<Owner>, features: wry::NewWindowFeatures) -> wry::NewWindowResponse {
     let configuration = features.opener.target_configuration;
-    match new_tab_with(None, owner, Some(opener.to_string()), move |builder| {
+    match new_tab_with(next_id(), None, owner, Some(opener.to_string()), move |builder| {
         builder.with_webview_configuration(configuration)
     }) {
         Ok(tab) => {
@@ -613,6 +686,12 @@ fn popup(opener: &str, owner: Option<Owner>, features: wry::NewWindowFeatures) -
             wry::NewWindowResponse::Deny
         }
     }
+}
+
+/// Tab `id`'s page in Chromium: its width in points, its scale, and its last frame's width (`dev` builds).
+#[cfg(feature = "dev")]
+pub fn chromium_drawn(id: &str) -> Option<(f64, f64, usize)> {
+    chromium::drawn(tab(id)?.view())
 }
 
 /// A page in Chromium's picture for a window screenshot (window_shot.rs): RGBA, `width` × `height`.
@@ -690,8 +769,8 @@ pub fn address(typed: &str) -> String {
 /// request answered on the main thread.
 pub fn init(cx: &mut App) {
     window::init(cx);
-    #[cfg(feature = "dev")]
     chromium::init(cx);
+    engine::init(cx);
     if SERVING.with(|serving| serving.replace(true)) {
         return;
     }

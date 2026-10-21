@@ -207,7 +207,6 @@ unsafe fn start(window: *mut AnyObject, path: &Path, done: Done) -> Result<(), (
         let bounds: NSRect = msg_send![view, bounds];
         let scale = picture.width as f64 / bounds.size.width.max(1.);
         let content: *mut AnyObject = msg_send![window, contentView];
-        #[cfg(feature = "dev")]
         let picture = with_chromium(picture, content, view, bounds, scale);
         let mut webs = Vec::new();
         web_views(content, &mut webs);
@@ -482,9 +481,7 @@ unsafe fn web_views(view: *mut AnyObject, out: &mut Vec<*mut AnyObject>) {
     }
 }
 
-/// The pages in Chromium the window shows (browser/chromium.rs, a test engine), laid over the picture from their last
-/// frames.
-#[cfg(feature = "dev")]
+/// The pages in Chromium the window shows (browser/chromium.rs), laid over the picture from their last frames.
 unsafe fn with_chromium(
     mut picture: Picture,
     content: *mut AnyObject,

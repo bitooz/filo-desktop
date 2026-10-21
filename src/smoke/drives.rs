@@ -6785,6 +6785,7 @@ pub fn open_from_env(window: &mut Window, cx: &mut Context<AppShell>) {
         }),
         ("app-icon", _) => Some(Route::AppIcon),
         ("desktop-pet", _) => Some(Route::DesktopPet),
+        ("browser-settings", _) => Some(Route::BrowserSettings),
         _ => None,
     };
     // `agent-new`: the new-agent form; `agent-picker`: with its picture picker open.

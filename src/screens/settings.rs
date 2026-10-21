@@ -1,6 +1,6 @@
 // Settings, the sidebar's bottom entry (also ⌘,): the user's name; Memories and Scheduled; Pages, Feed and Notes
-// switched on or off (pages.rs, the welcome's same section); the app icon,
-// desktop pet, appearance, shortcuts, and notifications; and Help: the welcome tour and Report a problem
+// switched on or off (pages.rs, the welcome's same section); the app icon, desktop pet, appearance, shortcuts, the
+// browser's engine (browser_settings.rs), and notifications; and Help: the welcome tour and Report a problem
 // (screens/report.rs). There's no account; the name row shows a letter avatar. Notifications says whether macOS lets
 // Filo show banners (with sound) and opens System Settings to switch them on. Builds that update (updater.rs) have an
 // Updates switch: new builds download on their own, or wait for the sidebar's Update button.
@@ -178,6 +178,15 @@ impl Render for SettingsScreen {
             .chevron()
             .on_click(|_, window, cx| nav::push(Route::Shortcuts, window, cx));
 
+        let browser_row = ListRow::new("settings-browser", "Browser")
+            .icon("globe")
+            .subtitle(match crate::browser::engine::current() {
+                crate::browser::engine::Kind::WebKit => "Runs on WebKit",
+                crate::browser::engine::Kind::Chromium => "Runs on Chromium (Beta)",
+            })
+            .chevron()
+            .on_click(|_, window, cx| nav::push(Route::BrowserSettings, window, cx));
+
         let welcome_row = ListRow::new("settings-welcome", "Welcome tour")
             .icon("lightbulb")
             .subtitle("Take the first-run tour again")
@@ -240,6 +249,7 @@ impl Render for SettingsScreen {
             pet_row.into_any_element(),
             appearance_row.into_any_element(),
             shortcuts_row.into_any_element(),
+            browser_row.into_any_element(),
         ]
         .into_iter()
         .chain(notifications_row)

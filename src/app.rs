@@ -336,6 +336,9 @@ impl AppShell {
             Route::Name => cx.new(|cx| name::NameScreen::new(window, cx)).into(),
             Route::AppIcon => cx.new(|cx| screens::app_icon::AppIconScreen::new(window, cx)).into(),
             Route::DesktopPet => cx.new(|cx| screens::desktop_pet::DesktopPetScreen::new(window, cx)).into(),
+            Route::BrowserSettings => {
+                cx.new(|cx| screens::browser_settings::BrowserSettingsScreen::new(window, cx)).into()
+            }
             Route::Shortcuts => cx.new(|cx| shortcuts::ShortcutsScreen::new(window, cx)).into(),
             Route::CodingTask(id) => cx.new(|cx| coding_thread::CodingThreadScreen::new(id.clone(), window, cx)).into(),
             Route::CodingResult(id, round) => {

@@ -1,8 +1,9 @@
-// Chromium as the browser's engine, a test (`dev` builds): with FILO_BROWSER_ENGINE=chromium, new tabs open in
-// Chromium (through CEF, windowless) instead of WebKit. The engine is an app of its own, Filo Chromium
-// (chromium/filo_chromium.mm, built into target/cef by chromium/build.sh; FILO_CHROMIUM_APP names another), started
-// with the first such tab and spoken to over its standard input and output, a JSON line each way. Its profile (cookies,
-// site storage) is the local data folder's `chromium`.
+// Chromium as the browser's engine, picked in Settings › Browser (browser/engine.rs, which downloads it): new tabs
+// open in Chromium (through CEF, windowless) instead of WebKit. The engine is an app of its own, Filo Chromium
+// (chromium/filo_chromium.mm), started with the first such tab and spoken to over its standard input and output, a JSON
+// line each way; it runs only when it speaks this Filo's protocol (`engine::PROTOCOL`), and stops when Filo closes its
+// input. Its profile (cookies, site storage) is the local data folder's `chromium`. Should it stop on its own (a
+// crash), its tabs open again in a new one (browser.rs `reopen_tabs`).
 //
 // A tab here is a `Tab` like WebKit's, with a view of Filo's own (`FiloChromiumView`) in its place: parked off the
 // screen, or moved into the browser window, showing the frames Chromium draws into shared memory, and handing the
@@ -11,7 +12,9 @@
 // input (DevTools' Input domain, which pages get as trusted events).
 //
 // A page's dialogs, file choosers and downloads come back as events and go to the same places WebKit's do (the tab's
-// dialog, browser_upload's files, the downloads folder). Not here yet: HTML5 drag and drop.
+// dialog, browser_upload's files, the downloads folder). A page draws at the screen's scale while it shows in the
+// browser window, and at 1x while it's parked off the screen, which takes far less memory (an agent's screenshots are
+// one pixel per CSS pixel either way).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,34 +35,30 @@ use serde_json::{Value, json};
 
 use super::native::{self, COMMAND, CONTROL, Key, Mouse, OPTION, SHIFT};
 
-/// Whether new tabs open in Chromium (FILO_BROWSER_ENGINE=chromium, or what a check chose: `force`).
-pub fn wanted() -> bool {
-    FORCED
-        .with(std::cell::Cell::get)
-        .unwrap_or_else(|| std::env::var("FILO_BROWSER_ENGINE").is_ok_and(|engine| engine == "chromium"))
-}
-
-/// New tabs in Chromium (true) or WebKit (false) whatever FILO_BROWSER_ENGINE says, or as it says again (None).
-pub fn force(chromium: Option<bool>) {
-    FORCED.with(|forced| forced.set(chromium));
-}
-
-fn app_path() -> PathBuf {
-    std::env::var_os("FILO_CHROMIUM_APP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/cef/Filo Chromium.app"))
-}
-
 /// The engine's process: its input, and the number of the last request.
 struct Helper {
-    input: std::process::ChildStdin,
-    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    child: Option<std::process::Child>,
     next: u64,
+    /// Which start this is: its output's end says so (`gone`).
+    start: u64,
 }
 
 impl Drop for Helper {
+    /// The engine quits once its input closes, its cookies written out; one that hasn't in 5 s is stopped.
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        drop(self.input.take());
+        let Some(mut child) = self.child.take() else { return };
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 
@@ -105,7 +104,8 @@ thread_local! {
         RefCell::new(HashMap::new());
     static PAGES: RefCell<HashMap<String, Rc<RefCell<Shared>>>> = RefCell::new(HashMap::new());
     static CX: RefCell<Option<AsyncApp>> = const { RefCell::new(None) };
-    static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The engine's starts so far.
+    static STARTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Pop-ups the engine named ("p1") and the tab ids Filo gave them, for events sent before the engine renamed them.
     static RENAMED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
@@ -146,10 +146,10 @@ fn start() -> Result<(), String> {
     if HELPER.with(|helper| helper.borrow().is_some()) {
         return Ok(());
     }
-    let app = app_path();
+    let app = super::engine::app_path().ok_or("Chromium isn't installed: pick it in Settings › Browser.")?;
     let executable = app.join("Contents/MacOS/Filo Chromium");
     if !executable.exists() {
-        return Err(format!("Chromium isn't built at {}: run chromium/build.sh.", app.display()));
+        return Err(format!("There's no Chromium engine at {}.", app.display()));
     }
     let profile = super::local_dir().join("chromium");
     let _ = std::fs::create_dir_all(&profile);
@@ -163,6 +163,10 @@ fn start() -> Result<(), String> {
     let output = child.stdout.take().ok_or("Chromium has no output")?;
     let input = child.stdin.take().ok_or("Chromium has no input")?;
     let events = EVENTS.get().cloned().ok_or("The browser isn't set up yet.")?;
+    let start = STARTS.with(|starts| {
+        starts.set(starts.get() + 1);
+        starts.get()
+    });
     std::thread::Builder::new()
         .name("chromium".into())
         .spawn(move || {
@@ -172,12 +176,37 @@ fn start() -> Result<(), String> {
                     let _ = events.unbounded_send(message);
                 }
             }
-            let _ = events.unbounded_send(json!({ "ev": "gone" }));
+            let _ = events.unbounded_send(json!({ "ev": "gone", "start": start }));
         })
         .map_err(|error| error.to_string())?;
-    eprintln!("browser: started Chromium (pid {})", child.id());
-    HELPER.with(|helper| *helper.borrow_mut() = Some(Helper { input, child, next: 0 }));
+    eprintln!("browser: started Chromium (pid {}) from {}", child.id(), app.display());
+    HELPER.with(|helper| {
+        *helper.borrow_mut() = Some(Helper { input: Some(input), child: Some(child), next: 0, start });
+    });
     Ok(())
+}
+
+/// Stops the engine (Settings › Browser picked WebKit, or a newer engine waits to start): it closes its pages and
+/// quits. Its tabs go first (browser.rs `reopen_tabs`).
+pub fn stop() {
+    let helper = HELPER.with(|helper| helper.borrow_mut().take());
+    if helper.is_some() {
+        eprintln!("browser: stopping Chromium");
+    }
+    WAITING.with(|waiting| waiting.borrow_mut().clear());
+    drop(helper);
+}
+
+/// Every cookie in the engine's profile.
+pub async fn cookies() -> Result<Vec<Value>, String> {
+    let answer = ask(json!({ "op": "cookies" })).await?;
+    Ok(answer["cookies"].as_array().cloned().unwrap_or_default())
+}
+
+/// Puts `cookies` in the engine's profile, only those it hasn't when `missing`: how many it set, and passed over.
+pub async fn set_cookies(cookies: Vec<Value>, missing: bool) -> Result<(usize, usize), String> {
+    let answer = ask(json!({ "op": "set_cookies", "cookies": cookies, "missing": missing })).await?;
+    Ok((answer["set"].as_u64().unwrap_or(0) as usize, answer["skipped"].as_u64().unwrap_or(0) as usize))
 }
 
 /// Sends a request; with `answer`, it gets a number and its answer is waited for.
@@ -196,7 +225,8 @@ fn send(
             WAITING.with(|waiting| waiting.borrow_mut().insert(helper.next, tx));
             rx
         });
-        writeln!(helper.input, "{request}").map_err(|error| format!("Chromium stopped: {error}"))?;
+        let input = helper.input.as_mut().ok_or("Chromium is stopping.")?;
+        writeln!(input, "{request}").map_err(|error| format!("Chromium stopped: {error}"))?;
         Ok(waiting)
     })
 }
@@ -249,13 +279,22 @@ fn shared(key: &str) -> Option<Rc<RefCell<Shared>>> {
 /// A tab's page in Chromium: owned by its `Tab`, closed with it.
 pub struct Page {
     key: String,
+    shared: Rc<RefCell<Shared>>,
+    /// The engine's start it's in: a tab opened again in a new engine has the same key.
+    start: u64,
 }
 
 impl Drop for Page {
     fn drop(&mut self) {
         // As Filo quits, the thread's other values may be gone already (the engine goes with its input then).
-        let _ = PAGES.try_with(|pages| pages.borrow_mut().remove(&self.key));
-        if HELPER.try_with(|helper| helper.borrow().is_some()).unwrap_or(false) {
+        let _ = PAGES.try_with(|pages| {
+            let mut pages = pages.borrow_mut();
+            if pages.get(&self.key).is_some_and(|page| Rc::ptr_eq(page, &self.shared)) {
+                pages.remove(&self.key);
+            }
+        });
+        let running = HELPER.try_with(|helper| helper.borrow().as_ref().map(|helper| helper.start)).ok().flatten();
+        if running == Some(self.start) {
             tell(json!({ "op": "close", "tab": self.key }));
         }
     }
@@ -264,7 +303,8 @@ impl Drop for Page {
 /// Opens a page in Chromium for tab `key`, `width` × `height` points: the page, and the view that shows it.
 pub fn open(key: &str, url: &str, (width, height): (f64, f64)) -> Result<(Page, Retained<AnyObject>), String> {
     start()?;
-    let scale = backing_scale();
+    // Parked to begin with.
+    let scale = scale_for(None);
     let (page, view) = adopt(key, (width, height, scale))?;
     let answer = send(
         json!({ "op": "create", "tab": key, "url": url, "width": width, "height": height, "scale": scale }),
@@ -302,19 +342,24 @@ fn adopt(key: &str, size: (f64, f64, f64)) -> Result<(Page, Retained<AnyObject>)
         world: None,
         size,
     };
-    PAGES.with(|pages| pages.borrow_mut().insert(key.to_string(), Rc::new(RefCell::new(shared))));
-    Ok((Page { key: key.to_string() }, view))
+    let shared = Rc::new(RefCell::new(shared));
+    PAGES.with(|pages| pages.borrow_mut().insert(key.to_string(), shared.clone()));
+    Ok((Page { key: key.to_string(), shared, start: STARTS.with(std::cell::Cell::get) }, view))
 }
 
-fn backing_scale() -> f64 {
-    // FILO_CHROMIUM_SCALE: pages drawn at another scale (1 takes less memory, and looks soft on a Retina screen).
-    if let Some(scale) = std::env::var("FILO_CHROMIUM_SCALE").ok().and_then(|scale| scale.parse::<f64>().ok()) {
+/// The pixels per point a page in `view` draws at: its window's (the browser window's), or 1 parked off the screen
+/// (no view yet: parked). `dev` builds: FILO_CHROMIUM_SCALE draws at that scale wherever the page is.
+fn scale_for(view: Option<&AnyObject>) -> f64 {
+    if let Some(scale) =
+        crate::test_run::dev_override("FILO_CHROMIUM_SCALE").and_then(|scale| scale.parse::<f64>().ok())
+    {
         return scale.clamp(1., 3.);
     }
+    let Some(view) = view.filter(|view| !native::parked(view)) else { return 1. };
     // SAFETY: AppKit read-only queries on the main thread.
     unsafe {
-        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        if screen.is_null() { 2. } else { msg_send![screen, backingScaleFactor] }
+        let window: *mut AnyObject = msg_send![view, window];
+        if window.is_null() { 1. } else { msg_send![window, backingScaleFactor] }
     }
 }
 
@@ -324,7 +369,18 @@ fn event(cx: &mut AsyncApp, message: &Value) {
     let renamed = RENAMED.with(|renamed| renamed.borrow().get(key).cloned());
     let key = renamed.as_deref().unwrap_or(key);
     match message["ev"].as_str().unwrap_or_default() {
-        "ready" => eprintln!("browser: Chromium {} is ready", message["version"].as_str().unwrap_or("?")),
+        "ready" => {
+            let protocol = message["protocol"].as_u64().unwrap_or(0);
+            eprintln!(
+                "browser: Chromium {} (CEF {}, protocol {protocol}) is ready",
+                message["version"].as_str().unwrap_or("?"),
+                message["cef"].as_str().unwrap_or("?")
+            );
+            if protocol != super::engine::PROTOCOL {
+                eprintln!("browser: that engine doesn't speak this Filo's protocol ({})", super::engine::PROTOCOL);
+                stop();
+            }
+        }
         "state" => {
             if let Some(page) = shared(key) {
                 let mut page = page.borrow_mut();
@@ -362,11 +418,13 @@ fn event(cx: &mut AsyncApp, message: &Value) {
         }
         "popup" => {
             let opener = message["opener"].as_str().unwrap_or_default();
-            let size = super::tab(opener).and_then(|tab| of(tab.view())).map(|page| page.0.borrow().size).unwrap_or((
-                super::PAGE_SIZE.0,
-                super::PAGE_SIZE.1,
-                backing_scale(),
-            ));
+            // Parked, at its opener's size.
+            let size = super::tab(opener)
+                .and_then(|tab| of(tab.view()))
+                .map(|page| page.0.borrow().size)
+                .map_or((super::PAGE_SIZE.0, super::PAGE_SIZE.1, 1.), |(width, height, _)| {
+                    (width, height, scale_for(None))
+                });
             // Numbered as Filo's tabs are, and renamed so in the engine.
             let id = super::next_id();
             RENAMED.with(|renamed| renamed.borrow_mut().insert(key.to_string(), id.clone()));
@@ -434,9 +492,19 @@ fn event(cx: &mut AsyncApp, message: &Value) {
         }
         "crashed" => eprintln!("browser: Chromium's page {key} crashed: {}", message["error"]),
         "gone" => {
-            eprintln!("browser: Chromium stopped");
+            // The engine that's running, not one stopped before it: it stopped on its own.
+            let running = HELPER.with(|helper| helper.borrow().as_ref().map(|helper| helper.start));
+            if running.is_none() || running != message["start"].as_u64() {
+                return;
+            }
+            eprintln!("browser: Chromium stopped on its own");
             HELPER.with(|helper| helper.borrow_mut().take());
             WAITING.with(|waiting| waiting.borrow_mut().clear());
+            let reopened = super::reopen_tabs(true);
+            if reopened > 0 {
+                eprintln!("browser: opened {reopened} tabs again in a new Chromium");
+            }
+            cx.update(|cx| cx.refresh_windows()).ok();
         }
         _ => {}
     }
@@ -645,6 +713,7 @@ fn pixels(page: &Rc<RefCell<Shared>>) -> Option<(Vec<u8>, usize, usize)> {
 }
 
 /// The view's picture for a screenshot of its window (window_shot.rs): RGBA, premultiplied, `width` × `height`.
+#[cfg(feature = "dev")]
 pub fn picture(view: *mut AnyObject, width: usize, height: usize) -> Option<Vec<u8>> {
     // SAFETY: a view of the window being shot, alive on the main thread.
     let page = of(unsafe { &*view })?;
@@ -753,6 +822,10 @@ fn view_class() -> Option<&'static AnyClass> {
             resized(this, size);
         }
         extern "C-unwind" fn moved_to_window(this: &AnyObject, _: Sel) {
+            // Into the browser window or back to its own: drawn at that window's scale.
+            // SAFETY: NSView's frame, on the main thread.
+            let frame: NSRect = unsafe { msg_send![this, frame] };
+            resized(this, frame.size);
             show_frame(this);
         }
         extern "C-unwind" fn cursor_update(this: &AnyObject, _: Sel, _: *mut AnyObject) {
@@ -821,7 +894,7 @@ fn new_view(width: f64, height: f64) -> Option<Retained<AnyObject>> {
 /// The view's size changed (moved into the browser window, or back): the page follows it.
 fn resized(view: &AnyObject, size: NSSize) {
     let Some(page) = of(view) else { return };
-    let scale = backing_scale();
+    let scale = scale_for(Some(view));
     let (width, height) = (size.width.round().max(1.), size.height.round().max(1.));
     let changed = {
         let mut shared = page.0.borrow_mut();
@@ -1129,9 +1202,10 @@ fn key_events(key: &Key, down: bool) -> Vec<Value> {
     vec![params]
 }
 
-/// Cookies from a WebKit cookie file (`Cookies.binarycookies`, read from a copy), as DevTools' Network.setCookies takes
-/// them. WebKit's format: "cook", the number of pages and their sizes (big-endian), then pages of cookies, each with its
+/// Cookies from a WebKit cookie file (`Cookies.binarycookies`, read from a copy; FILO_OPEN=chromium-check), as the
+/// engine takes them (`set_cookies`). WebKit's format: "cook", the number of pages and their sizes (big-endian), then pages of cookies, each with its
 /// flags (1 secure, 4 HTTP only), the offsets of its domain, name, path and value, and its expiry (seconds since 2001).
+#[cfg(feature = "dev")]
 pub fn webkit_cookies(data: &[u8]) -> Result<Vec<Value>, String> {
     let be = |at: usize| -> Option<u32> { Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?)) };
     if data.get(..4) != Some(b"cook") {
@@ -1190,20 +1264,20 @@ pub fn webkit_cookies(data: &[u8]) -> Result<Vec<Value>, String> {
     Ok(cookies)
 }
 
-/// Puts `cookies` (from `webkit_cookies`) in Chromium's profile, through tab `key`: how many it took.
-pub async fn set_cookies(key: &str, cookies: &[Value]) -> Result<usize, String> {
-    let mut taken = 0;
-    for cookie in cookies {
-        if devtools(key, "Network.setCookie", cookie.clone()).await.is_ok_and(|answer| answer["success"] != false) {
-            taken += 1;
-        }
-    }
-    Ok(taken)
+/// A page's size in points, the scale it draws at, and its last frame's width in pixels (a check's, `dev` builds).
+#[cfg(feature = "dev")]
+pub fn drawn(view: &AnyObject) -> Option<(f64, f64, usize)> {
+    let page = of(view)?;
+    let page = page.0.borrow();
+    Some((page.size.0, page.size.2, page.frame.as_ref().map_or(0, |frame| frame.1)))
 }
 
 /// The engine's processes, for the memory a check measures: pid and kind (main, renderer, gpu, utility).
+#[cfg(feature = "dev")]
 pub fn processes() -> Vec<(u32, String)> {
-    let Some(root) = HELPER.with(|helper| helper.borrow().as_ref().map(|helper| helper.child.id())) else {
+    let Some(root) =
+        HELPER.with(|helper| helper.borrow().as_ref().and_then(|helper| Some(helper.child.as_ref()?.id())))
+    else {
         return Vec::new();
     };
     let listing = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,command="]).output();
@@ -1255,6 +1329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dev")]
     fn reads_a_webkit_cookie_file() {
         // One page with one cookie: secure and HTTP only, expiring in 2100.
         let mut cookie = vec![0u8; 56];

@@ -10,6 +10,7 @@ pub mod artifact;
 pub mod artifact_media;
 pub mod artifact_settings;
 pub mod artifacts;
+pub mod browser_settings;
 pub mod chat;
 pub mod coding;
 pub mod coding_result;

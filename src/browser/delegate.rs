@@ -50,7 +50,6 @@ enum Reply {
     Confirm(RcBlock<dyn Fn(Bool)>),
     Prompt(RcBlock<dyn Fn(*mut AnyObject)>),
     /// A page in Chromium's (browser/chromium.rs): OK or Cancel, and a prompt's text.
-    #[cfg(feature = "dev")]
     Chromium(Box<dyn FnOnce(bool, String)>),
     Done,
 }
@@ -83,14 +82,12 @@ impl Dialog {
                     done.call((std::ptr::null_mut(),));
                 }
             }
-            #[cfg(feature = "dev")]
             Reply::Chromium(done) => done(accept, text.unwrap_or(&self.default).to_string()),
             Reply::Done => {}
         }
     }
 
     /// A dialog of a page in Chromium, answered through `done`.
-    #[cfg(feature = "dev")]
     pub fn chromium(kind: Kind, message: String, default: String, done: impl FnOnce(bool, String) + 'static) -> Dialog {
         Dialog { kind, message, default, reply: Reply::Chromium(Box::new(done)) }
     }

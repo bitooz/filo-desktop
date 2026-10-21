@@ -185,8 +185,22 @@ pub async fn download(
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("Filo can’t write to {}", staging.parent().unwrap_or(&staging).display()))?;
     let path = staging.join(release.zip_name());
-    let mut file = std::fs::File::create(&path)?;
-    let mut response = http.get(release.zip_url(&feed)).send().await?.error_for_status()?;
+    fetch_checked(http, &release.zip_url(&feed), release.size, &release.sha256, &path, progress).await?;
+    Ok(path)
+}
+
+/// Downloads `url` into `path`, checking its size and SHA-256 as it arrives; `progress` is the bytes so far. Filo's
+/// updates and the Chromium engine's (browser/engine.rs).
+pub async fn fetch_checked(
+    http: reqwest::Client,
+    url: &str,
+    size: u64,
+    sha256: &str,
+    path: &Path,
+    progress: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    let mut response = http.get(url).send().await?.error_for_status()?;
     let mut hash = Sha256::new();
     let mut received = 0u64;
     while let Some(chunk) = response.chunk().await? {
@@ -196,17 +210,17 @@ pub async fn download(
         progress.store(received, Ordering::Relaxed);
     }
     file.flush()?;
-    if received != release.size {
-        bail!("the download was cut short ({received} of {} bytes)", release.size);
+    if received != size {
+        bail!("the download was cut short ({received} of {size} bytes)");
     }
-    let sha256 = hex::encode(hash.finalize());
-    if !sha256.eq_ignore_ascii_case(&release.sha256) {
-        bail!("the download doesn’t match the release (SHA-256 {sha256})");
+    let got = hex::encode(hash.finalize());
+    if !got.eq_ignore_ascii_case(sha256) {
+        bail!("the download doesn’t match the release (SHA-256 {got})");
     }
-    Ok(path)
+    Ok(())
 }
 
-fn run(command: &mut Command) -> Result<String> {
+pub(crate) fn run(command: &mut Command) -> Result<String> {
     let output = command.output().with_context(|| format!("couldn’t run {command:?}"))?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());

@@ -105,6 +105,8 @@ pub enum Route {
     AppIcon,
     /// Settings › Desktop pet: the pet's character, shown or hidden (desktop_pet.rs).
     DesktopPet,
+    /// Settings › Browser: WebKit or Chromium as the browser's engine (browser_settings.rs).
+    BrowserSettings,
     /// Keyboard shortcuts, the menu bar item and the pet (desktop only).
     Shortcuts,
     /// A coding task's page.
