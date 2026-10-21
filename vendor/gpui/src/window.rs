@@ -3689,6 +3689,19 @@ impl Window {
         }
     }
 
+    /// Filo: the text input typing goes to (the focused element's handler, as the last frame drew it), given to `f`
+    /// to read its text and change it as typing would. None when nothing that takes text has the keyboard.
+    pub fn with_focused_input<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut dyn InputHandler, &mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        let mut input_handler = self.platform_window.take_input_handler()?;
+        let result = f(input_handler.handler_mut(), self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        Some(result)
+    }
+
     /// Register a mouse event listener on the window for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.

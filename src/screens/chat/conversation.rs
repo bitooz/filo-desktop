@@ -534,8 +534,11 @@ pub struct Conversation {
     /// A picture open to draw on, over the whole window (image_editor.rs).
     image_editor: Option<(Entity<ImageEditor>, Subscription)>,
     voice: Option<VoiceState>,
-    /// Recording while fn+⌃ is held: letting go sends it.
+    /// Recording while a key is held: letting go sends it, or with `dictating` writes it into the message box.
     voice_held: bool,
+    /// The held recording is fn+⌃'s: its words go into the message box at the caret, nothing is sent (voice.rs
+    /// `dictate`).
+    dictating: bool,
     /// Measured height of the composer's text row; the voice rows take it, so
     /// recording doesn't change the composer's height. The mic only shows with
     /// the field empty, so this is its one-line height.
@@ -816,6 +819,7 @@ impl Conversation {
             image_editor: None,
             voice: None,
             voice_held: false,
+            dictating: false,
             text_row_height: 37.,
             voice_receipt: None,
             voice_screenshot: None,
@@ -3130,9 +3134,10 @@ impl Conversation {
         let id = message.id.clone();
         // Its elements' ids: a sent message keeps the ones it had while it was sent.
         let key = self.handed_over.get(&id).cloned().unwrap_or_else(|| id.clone());
-        // The user's pictures keep their chips in the text, where they were in the composer.
+        // The user's pictures keep their chips in the text, where they were in the composer. A voice message's text is
+        // what was said, shown under its recording.
         let (text, chips) = if message.voice_recording.is_some() {
-            (String::new(), Vec::new())
+            (message.own_content().trim().to_string(), Vec::new())
         } else if user {
             attachments::with_chips(message.own_content(), &message.attachments)
         } else {
@@ -3200,7 +3205,18 @@ impl Conversation {
             let url = voice.url.clone().or_else(|| voice::uploading_voice_url(&id));
             bubble = bubble.child(render_voice(&id, url, voice.duration_ms, "Voice message", user, cx));
         }
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() && message.voice_recording.is_some() {
+            // Divided from the recording above it, in the bubble's own text colour.
+            let fg = if user { colors.on_user_bubble } else { colors.on_assistant_bubble };
+            bubble = bubble.child(
+                div()
+                    .pt(px(space::SM))
+                    .border_t_1()
+                    .border_color(fg.opacity(0.2))
+                    .child(user_text(&key, &text, &[], &message.attachments, &self.mention_words(cx), None, cx))
+                    .when(self.fixture(), |this| this.relative().children(probe(&self.drawn, format!("transcript-{key}")))),
+            );
+        } else if !text.trim().is_empty() {
             bubble = if user {
                 let editor = self.group.is_none().then(|| cx.entity().downgrade());
                 bubble.child(user_text(&key, &text, &chips, &message.attachments, &self.mention_words(cx), editor, cx))

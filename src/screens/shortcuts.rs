@@ -27,7 +27,7 @@ const IN_FILO: [(&str, &str); 10] = [
     ("Search agents and messages", "⌘P"),
     ("Go to a tab, in the sidebar's order", "⌘1 – ⌘7"),
     ("Back, Forward", "⌘[  ⌘]"),
-    ("Hold to talk in the open chat", "fn ⌃"),
+    ("Hold to talk into the text box with the cursor", "fn ⌃"),
     ("Cancel the recording", "⎋"),
     ("Send, new line", "↩  ⇧↩"),
     ("Zoom an open picture in, out, to fit", "⌘+  ⌘-  ⌘0"),

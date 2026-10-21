@@ -17,6 +17,7 @@ mod commit_links;
 mod companion;
 mod computer_use;
 mod config;
+mod dictation;
 mod escape;
 mod file_preview;
 mod format;

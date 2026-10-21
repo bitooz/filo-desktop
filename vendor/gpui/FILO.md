@@ -28,6 +28,9 @@ Changes, all marked `Filo:` in the source:
   back on a click (no `acceptsFirstResponder`), so nothing did. Now a mouse down this view hears makes it the first
   responder, and a frame drawn while the window itself (or its content view) is the first responder hands it back on
   the next pass of the run loop. `FILO_OPEN=page-keys-drive` checks both in the app.
+- `src/window.rs` (`Window::with_focused_input`), `src/platform.rs` (`PlatformInputHandler::handler_mut`): the text
+  input typing goes to (the focused element's handler as the last frame drew it), to read its text and change it as
+  typing would. Filo's fn+⌃ writes what was said into whichever of its fields has the cursor (dictation.rs).
 - `src/window.rs` (`FocusHandle::is_drawn`): whether a focus handle's element is in the last frame. A sound's row in
   Filo hands letters typed on it back to the message box only while that box is drawn (audio_row.rs); a box on a page
   that's no longer shown keeps its handle, and the window would focus it and lose the keys.

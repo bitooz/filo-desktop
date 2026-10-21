@@ -363,20 +363,38 @@ agent leads it, listed first.
 Hold the mic in a chat (or click it), or hold the voice shortcut in any app, and talk: the words show as they're heard,
 and letting go sends them as your message. The turn reads them like typed words, and a new chat is titled by them. The
 recording stays on this Mac (`local/attachments/<id>.m4a`, named by the message's `voice`, or `group_messages.voice` in
-the group) and plays on the message's bubble and under an agent's Shared › Voice. From another app, a message that
+the group) and plays on the message's bubble and under an agent's Shared › Voice. The bubble shows what was said (the
+message's text) under the recording's row, divided from it by a thin line, in agents' chats and the group alike, for
+older voice messages too. From another app, a message that
 starts with an agent's or the group's name ("Milo, …") goes there (`voice_route.rs`), and the pet shows the words and
 who they go to while you hold.
 
-In Filo's window, fn+⌃ held in a chat records there (`AppShell::on_modifiers`, `screens/chat/voice.rs`). It starts at
-once: the recording row shows on the next frame, and the microphone opens behind it (`VoiceState::Opening`). macOS takes
-0.1–0.3 s to open it, and the window doesn't draw meanwhile. A press under 0.3 s is dropped when it's let go. So is one
-with another key pressed while it's down, as that's part of another shortcut. When it can't record (text in the box, no
-microphone access), it says why only after the keys have stayed down 0.25 s, so brushing them shows nothing. Each
-recording logs how long it took to start ("voice: recording … ms after it was asked for"). Like typing,
+In Filo's window, fn+⌃ is for writing, not for voice messages: held, it records, and let go, what was said goes into the
+text field that has the cursor as if typed (`AppShell::on_modifiers`, `src/dictation.rs`). It goes in at the caret, over
+what's selected, with a space between it and the words beside it, and the caret after it; nothing is sent and no
+recording is kept. Where it goes is picked as the keys go down (`dictation::target`): a web view with the keyboard (the
+note editor, an artifact page) takes it in its focused field by script (`execCommand('insertText')`, so the page's
+editor hears it as typing); the open chat's message box records in its own recording row and takes the words there
+(`screens/chat/voice.rs` `dictate`); any other of Filo's fields (an agent's name or instructions, search, Settings) gets
+them through GPUI's input for it (`Window::with_focused_input`, vendor/gpui/FILO.md), while a pill at the window's foot
+shows the recording's clock and words. With no field holding the cursor, or a page's field that lost it by the time the
+words are back, they go into the open chat's message box. The words are a voice message's: the live transcript, else
+the recording sent through the relay (`AwayVoice::words`).
+
+The open chat's recording starts at once: the recording row shows on the next frame, and the microphone opens behind it
+(`VoiceState::Opening`; the pill does the same). macOS takes 0.1–0.3 s to open it, and the window doesn't draw
+meanwhile. A press under 0.3 s is dropped when it's let go. So is one with another key pressed while it's down, as
+that's part of another shortcut, and Esc while holding throws it away. When it can't record (no microphone access), it
+says why only after the keys have stayed down 0.25 s, so brushing them shows nothing. Each recording logs how long it
+took to start ("voice: recording … ms after it was asked for"). The voice shortcut held in Filo's window records a voice
+message in the open chat, sent when it's let go, as before. Like typing,
 it needs GPUI's view to have the window's keyboard. A web view over it (a glance, an artifact page, the note editor)
 takes the keyboard when it's clicked. A click on Filo's own content takes it back, and so does the next frame once the
 page that had it is hidden or closed (vendor/gpui/FILO.md). `FILO_OPEN=page-keys-drive`, in a test window, clicks a page,
-then hides it or takes it out, and checks that typing and fn+⌃ still reach the main agent's message box.
+then hides it or takes it out, and checks that typing and fn+⌃ still reach the main agent's message box; then that
+words written in go into a Filo field at its caret, into a page's field, and into the box when the page's field has lost
+the cursor. `FILO_OPEN=voice-keys-drive` (scripts/voice-keys-check.sh) checks fn+⌃ held with text in the box keeps it,
+and words written in land at the caret with nothing sent.
 
 The words come from Filo's relay at dev.filo.im (`src/live_transcription.rs`; the relay itself isn't part of this
 repository). While you talk, the microphone's audio streams to it as 16 kHz PCM (`recorder::MicStream`: an audio queue

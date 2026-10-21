@@ -1,6 +1,8 @@
 // Voice messages from the composer. The mic shows while the composer is empty; a click records, then Send sends it,
-// Stop keeps it to listen to first, and Delete throws it away. Holding fn+⌃ records too: letting go sends, Esc cancels
-// (the shell watches the keys, app.rs). While recording,
+// Stop keeps it to listen to first, and Delete throws it away. Holding fn+⌃ records too, for the message box: letting go
+// writes what was said in at the caret, as if typed, and sends nothing (`dictate`); Esc cancels (the shell watches the
+// keys, app.rs). The voice shortcut held in Filo's window records a voice message here, sent when it's let go. While
+// recording,
 // the microphone also streams to Filo's relay (live_transcription.rs), and the words it hears show in the recording's
 // row; with its transcript voiceRecordings:sendLive sends the message at once and the recording is kept behind it
 // (local_backend/voice.rs). Without one: createUpload, the recording kept (`Backend::upload_voice`, the old upload
@@ -144,7 +146,7 @@ impl Conversation {
     }
 
     pub(super) fn start_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_voice(false, window, cx);
+        self.request_voice(false, false, window, cx);
     }
 
     /// The screenshot the next voice message goes with (None for none).
@@ -157,26 +159,22 @@ impl Conversation {
         matches!(self.voice, Some(VoiceState::Opening | VoiceState::Recording { .. }))
     }
 
-    /// Whether holding fn+⌃ records straight away, with nothing to say first (no text in the box, microphone access
-    /// given).
-    pub fn can_hold_voice(&self, cx: &App) -> bool {
-        self.voice.is_none() && !self.voice_disabled(cx) && recorder::permission() == Permission::Granted
-    }
-
-    /// fn+⌃ went down (at once when `can_hold_voice`, else after a moment): record until it's let go.
-    pub fn hold_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// A key went down to record until it's let go: fn+⌃ (`dictate`: at once with microphone access, else after a
+    /// moment, app.rs) for the message box, or the voice shortcut for a voice message.
+    pub fn hold_voice(&mut self, dictate: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.voice.is_some() {
             return;
         }
-        if self.show_send_action(cx) {
+        if !dictate && self.show_send_action(cx) {
             self.hint = Some("Clear the message box to record a voice message.".into());
             cx.notify();
             return;
         }
-        self.request_voice(true, window, cx);
+        self.request_voice(true, dictate, window, cx);
     }
 
-    /// fn+⌃ let go: send what was recorded, or drop a press too short to be one.
+    /// The held key let go: fn+⌃'s words go into the message box, a voice message is sent, and a press too short to
+    /// be either is dropped.
     pub fn release_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.voice_held) {
             return;
@@ -186,13 +184,63 @@ impl Conversation {
             Some(VoiceState::Recording { recorder, .. }) if recorder.elapsed_ms() < MIN_VOICE_MS => {
                 self.cancel_voice(cx)
             }
+            Some(VoiceState::Recording { .. }) if self.dictating => self.dictate(window, cx),
             Some(VoiceState::Recording { .. }) => self.send_voice(window, cx),
             _ => {}
         }
         self.focus_composer(window, cx);
     }
 
-    /// Esc while holding fn+⌃.
+    /// fn+⌃ let go: what was said goes into the message box at the caret once it's transcribed (`type_dictated`), and
+    /// the recording goes. Nothing is sent. Without words, the composer says why.
+    fn dictate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.voice_held = false;
+        self.dictating = false;
+        let Some(VoiceState::Recording { recorder, live, .. }) = self.voice.take() else { return };
+        self.voice_screenshot = None;
+        cx.notify();
+        // Transcribed as one held from another app is: the live transcript, else the file through the relay.
+        let voice = match (AwayRecording { recorder, live }).finish() {
+            Ok(voice) => voice,
+            Err(problem) => {
+                self.hint = Some(problem);
+                return;
+            }
+        };
+        let backend = backend(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let words = voice.words(&backend).await;
+            voice.discard();
+            this.update_in(cx, |this, window, cx| {
+                match words {
+                    Ok(words) => this.type_dictated(&words, window, cx),
+                    Err(problem) => this.hint = Some(problem),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `words` in the message box at the caret (over what's selected), as if typed, with a space between them and the
+    /// words beside them; the caret after them.
+    pub fn type_dictated(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            let units: Vec<u16> = input.value().encode_utf16().collect();
+            let end = units.len();
+            let range = input.selected_text_range(false, window, cx).map_or(end..end, |selection| selection.range);
+            let before = String::from_utf16_lossy(&units[..range.start.min(end)]).chars().next_back();
+            let after = String::from_utf16_lossy(&units[range.end.min(end)..]).chars().next();
+            // As typed (so the composer hears of the change and keeps the draft).
+            input.replace_text_in_range(None, &crate::dictation::spaced(words, before, after), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Esc while holding the key.
     pub fn cancel_held_voice(&mut self, cx: &mut Context<Self>) -> bool {
         if self.voice_held && self.recording() {
             self.cancel_voice(cx);
@@ -201,16 +249,22 @@ impl Conversation {
         false
     }
 
-    /// The window lost focus mid-hold, so the release won't arrive: keep the
-    /// recording to send or delete.
-    pub fn pause_held_voice(&mut self, cx: &mut Context<Self>) {
+    /// The window lost focus mid-hold, so the release won't arrive: fn+⌃'s words go into the message box, and a voice
+    /// message's recording is kept to send or delete.
+    pub fn pause_held_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.voice_held {
-            self.stop_voice(cx);
+            self.stop_voice(window, cx);
         }
     }
 
-    fn request_voice(&mut self, hold: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.voice.is_some() || self.voice_disabled(cx) {
+    /// Whether a recording can start: one for the message box needs only the microphone free, a voice message an
+    /// empty composer with nothing on its way.
+    fn may_record(&self, dictate: bool, cx: &App) -> bool {
+        self.voice.is_none() && (dictate || !self.voice_disabled(cx))
+    }
+
+    fn request_voice(&mut self, hold: bool, dictate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may_record(dictate, cx) {
             return;
         }
         if !recorder::in_app_bundle() && recorder::permission() != Permission::Granted {
@@ -221,7 +275,8 @@ impl Conversation {
         match recorder::permission() {
             Permission::Granted => {
                 self.voice_held = hold;
-                self.begin_recording(window, cx);
+                self.dictating = hold && dictate;
+                self.begin_recording(dictate, window, cx);
             }
             Permission::Undetermined => {
                 let answer = recorder::request_permission();
@@ -233,7 +288,7 @@ impl Conversation {
                             this.hint = Some("Microphone ready. Hold fn ⌃ again to record.".into());
                             cx.notify();
                         } else if granted {
-                            this.begin_recording(window, cx);
+                            this.begin_recording(false, window, cx);
                         } else {
                             this.hint = Some(MIC_OFF.into());
                             cx.notify();
@@ -253,8 +308,8 @@ impl Conversation {
 
     /// Shows the recording row at once; the microphone opens behind it, as macOS takes a moment (0.1–0.3 s) to open
     /// it and the window doesn't draw meanwhile.
-    fn begin_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.voice.is_some() || self.voice_disabled(cx) {
+    fn begin_recording(&mut self, dictate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may_record(dictate, cx) {
             return;
         }
         self.voice = Some(VoiceState::Opening);
@@ -296,6 +351,7 @@ impl Conversation {
             Err(_) => {
                 self.voice = None;
                 self.voice_held = false;
+                self.dictating = false;
                 self.hint = Some("Microphone could not start. Check permission and try again.".into());
             }
         }
@@ -304,7 +360,7 @@ impl Conversation {
             loop {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
                 let recording = this
-                    .update(cx, |this, cx| {
+                    .update_in(cx, |this, window, cx| {
                         let Some(VoiceState::Recording { recorder, live, started, levels }) = &mut this.voice else {
                             return false;
                         };
@@ -318,12 +374,17 @@ impl Conversation {
                         if elapsed >= MAX_VOICE_MS
                             || (!recorder.is_recording() && started.elapsed() > Duration::from_secs(1))
                         {
-                            this.stop_voice(cx);
+                            this.stop_voice(window, cx);
                         } else if let Some(problem) = heard.stopped {
-                            // The relay's allowance ran out midway: what it heard until then is ready to send.
-                            this.stop_voice(cx);
-                            this.hint =
-                                Some(format!("{} What you said until now is ready to send.", problem.message()));
+                            // The relay's allowance ran out midway: what it heard until then is ready to send (or
+                            // in the message box).
+                            let dictating = this.dictating;
+                            this.stop_voice(window, cx);
+                            this.hint = Some(if dictating {
+                                format!("{} What you said until now is in the message box.", problem.message())
+                            } else {
+                                format!("{} What you said until now is ready to send.", problem.message())
+                            });
                         } else if let Some(problem) = heard.problem.as_ref().filter(|problem| problem.lasting()) {
                             // Refused (voice messages used up, or switched off): nothing could send it before then.
                             this.cancel_voice(cx);
@@ -347,9 +408,14 @@ impl Conversation {
         cx.notify();
     }
 
-    /// Recording → Preview, if what was recorded can be sent.
-    pub(super) fn stop_voice(&mut self, cx: &mut Context<Self>) {
+    /// Recording → Preview, if what was recorded can be sent; fn+⌃'s goes into the message box instead.
+    pub(super) fn stop_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dictating && matches!(self.voice, Some(VoiceState::Recording { .. })) {
+            self.dictate(window, cx);
+            return;
+        }
         self.voice_held = false;
+        self.dictating = false;
         let Some(VoiceState::Recording { recorder, live, .. }) = self.voice.take() else { return };
         let (path, duration_ms) = recorder.finish();
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -376,6 +442,7 @@ impl Conversation {
 
     pub(crate) fn cancel_voice(&mut self, cx: &mut Context<Self>) {
         self.voice_held = false;
+        self.dictating = false;
         match self.voice.take() {
             Some(VoiceState::Recording { recorder, .. }) => {
                 recorder.cancel();
@@ -398,7 +465,7 @@ impl Conversation {
     /// Send from recording or preview.
     pub(super) fn send_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.voice, Some(VoiceState::Recording { .. })) {
-            self.stop_voice(cx);
+            self.stop_voice(window, cx);
         }
         let Some(VoiceState::Preview { path, duration_ms, transcript }) = self.voice.take() else { return };
         if self.sending || self.pending.is_some() {
@@ -680,13 +747,13 @@ impl Conversation {
                         .child(div().callout().medium().child(elapsed_clock(elapsed))),
                 )
                 .when(self.voice_held && heard.words.trim().is_empty(), |this| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .footnote()
-                            .text_color(colors.text_secondary)
-                            .child("Release to send · Esc to cancel"),
-                    )
+                    this.child(div().flex_none().footnote().text_color(colors.text_secondary).child(
+                        if self.dictating {
+                            "Release to write it in the message box · Esc to cancel"
+                        } else {
+                            "Release to send · Esc to cancel"
+                        },
+                    ))
                 })
                 .child(match heard.words.trim().is_empty() {
                     // The words so far: the newest stay in view, the oldest go off the left.
@@ -728,7 +795,7 @@ impl Conversation {
                     IconButton::new("voice-stop", "square")
                         .small()
                         .tooltip("Stop and listen")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop_voice(cx))),
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.stop_voice(window, cx))),
                 )
             }
             VoiceState::Preview { path, duration_ms, .. } | VoiceState::Sending { path, duration_ms } => {
@@ -784,6 +851,16 @@ impl AwayRecording {
 
     pub fn cancel(self) {
         self.recorder.cancel();
+    }
+
+    /// How long it's been recording.
+    pub fn elapsed_ms(&self) -> f64 {
+        self.recorder.elapsed_ms()
+    }
+
+    /// Whether the microphone still records (it stops when the input goes away, a headset unplugged).
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_recording()
     }
 
     /// What the relay has heard so far, as it changes; none without live transcription.

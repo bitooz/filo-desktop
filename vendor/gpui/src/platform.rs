@@ -954,6 +954,11 @@ impl PlatformInputHandler {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
+    /// Filo: the element's own handler, for `Window::with_focused_input`.
+    pub(crate) fn handler_mut(&mut self) -> &mut dyn InputHandler {
+        self.handler.as_mut()
+    }
+
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let selection = self.handler.selected_text_range(true, window, cx)?;
         self.handler.bounds_for_range(

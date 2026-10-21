@@ -50,7 +50,9 @@ pub struct AppShell {
     logo_focus: FocusHandle,
     /// fn+⌃ is down.
     voice_chord: bool,
-    /// Says why fn+⌃ can't record (text in the box, no microphone access) once it has stayed down a moment.
+    /// fn+⌃ held for a text field other than the open chat's message box: its recording and pill (dictation.rs).
+    dictation: Entity<crate::dictation::Dictation>,
+    /// Says why fn+⌃ can't record (no microphone access) once it has stayed down a moment.
     _voice_hold: Option<Task<()>>,
     /// The open shortcut held (`talk`): recording in the open chat, or from another app for the chat picked after.
     talking: Option<Talking>,
@@ -73,7 +75,7 @@ struct SearchOpen {
 
 /// Where the open shortcut's recording is going.
 enum Talking {
-    /// Held in Filo's window: the open chat records it, as its own fn+⌃ does.
+    /// Held in Filo's window: the open chat records it as a voice message.
     InChat(Entity<screens::chat::conversation::Conversation>),
     /// Held from another app: recorded here, then sent where Settings says or the message names (voice_route.rs),
     /// with the screenshot taken for it and the chat that was open in Filo's window.
@@ -105,8 +107,11 @@ impl AppShell {
             this.check_attention(window, cx);
             if !window.is_window_active() && std::mem::take(&mut this.voice_chord) {
                 this._voice_hold = None;
-                if let Some(conversation) = this.open_conversation(cx) {
-                    conversation.update(cx, |conversation, cx| conversation.pause_held_voice(cx));
+                let conversation = this.open_conversation(cx);
+                if this.dictation.read(cx).holding() {
+                    this.dictation.update(cx, |dictation, cx| dictation.release(conversation, window, cx));
+                } else if let Some(conversation) = conversation {
+                    conversation.update(cx, |conversation, cx| conversation.pause_held_voice(window, cx));
                 }
             }
         })
@@ -189,6 +194,7 @@ impl AppShell {
             focus: cx.focus_handle(),
             logo_focus: cx.focus_handle().tab_stop(true),
             voice_chord: false,
+            dictation: crate::dictation::view(cx),
             _voice_hold: None,
             talking: None,
             _unseen_sub: None,
@@ -426,7 +432,7 @@ impl AppShell {
         {
             let recording = conversation.update(cx, |conversation, cx| {
                 conversation.set_voice_screenshot(screenshot);
-                conversation.hold_voice(window, cx);
+                conversation.hold_voice(false, window, cx);
                 conversation.recording()
             });
             self.talking = Some(Talking::InChat(conversation));
@@ -675,7 +681,8 @@ impl AppShell {
         self.open_conversation(cx).is_some_and(|conversation| conversation.read(cx).showing(session_id))
     }
 
-    /// Hold fn+⌃ to record a voice message in the open chat; let go to send.
+    /// Hold fn+⌃ to talk into the text field that has the cursor, or the open chat's message box; let go and the
+    /// words are there, as if typed (dictation.rs).
     pub fn on_modifiers(&mut self, modifiers: &Modifiers, window: &mut Window, cx: &mut Context<Self>) {
         let chord =
             modifiers.function && modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift;
@@ -683,23 +690,41 @@ impl AppShell {
             return;
         }
         self.voice_chord = chord;
-        let Some(conversation) = self.open_conversation(cx) else { return };
-        if chord && conversation.read(cx).can_hold_voice(cx) {
-            conversation.update(cx, |conversation, cx| conversation.hold_voice(window, cx));
-        } else if chord {
-            self._voice_hold = Some(cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor().timer(VOICE_HOLD_DELAY).await;
-                this.update_in(cx, |this, window, cx| {
-                    if this.voice_chord {
-                        conversation.update(cx, |conversation, cx| conversation.hold_voice(window, cx));
-                    }
-                })
-                .ok();
-            }));
-        } else {
+        let open = self.open_conversation(cx);
+        if !chord {
             self._voice_hold = None;
-            conversation.update(cx, |conversation, cx| conversation.release_voice(window, cx));
+            if self.dictation.read(cx).holding() {
+                self.dictation.update(cx, |dictation, cx| dictation.release(open, window, cx));
+            } else if let Some(conversation) = open {
+                conversation.update(cx, |conversation, cx| conversation.release_voice(window, cx));
+            }
+            return;
         }
+        // Where the words go is picked now: the field with the cursor, else the open chat's box.
+        let hold: Box<dyn Fn(&mut Window, &mut App)> = match crate::dictation::target(open, window, cx) {
+            Some(crate::dictation::Target::Field(field)) => {
+                let dictation = self.dictation.clone();
+                Box::new(move |window, cx| dictation.update(cx, |dictation, cx| dictation.hold(field.clone(), window, cx)))
+            }
+            Some(crate::dictation::Target::Chat(conversation)) => {
+                Box::new(move |window, cx| conversation.update(cx, |conversation, cx| conversation.hold_voice(true, window, cx)))
+            }
+            None => return,
+        };
+        // It records at once; what can't says why only once the keys have stayed down a moment.
+        if crate::recorder::permission() == crate::recorder::Permission::Granted {
+            hold(window, cx);
+            return;
+        }
+        self._voice_hold = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(VOICE_HOLD_DELAY).await;
+            this.update_in(cx, |this, window, cx| {
+                if this.voice_chord {
+                    hold(window, cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Esc while holding fn+⌃ cancels the recording. So does another key: fn+⌃ was part of another shortcut, which
@@ -707,6 +732,12 @@ impl AppShell {
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let escape = event.keystroke.key == "escape";
         if !escape && !self.voice_chord {
+            return;
+        }
+        if self.dictation.update(cx, |dictation, cx| dictation.cancel(cx)) {
+            if escape {
+                cx.stop_propagation();
+            }
             return;
         }
         let Some(conversation) = self.open_conversation(cx) else { return };
@@ -1101,6 +1132,7 @@ impl Render for AppShell {
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
             .children(crate::smoke::overlay(window, cx))
+            .child(self.dictation.clone())
             // Last: hides the glance pages this frame didn't lay out (screens/chat/glance.rs).
             .child(screens::chat::conversation::glance::sweep())
     }

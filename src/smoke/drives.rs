@@ -1898,6 +1898,15 @@ pub(crate) mod native_input {
         }
     }
 
+    /// Shows `html` in the page.
+    pub fn load_page(page: usize, html: &str) {
+        let html = objc2_foundation::NSString::from_str(html);
+        unsafe {
+            let html = objc2::rc::Retained::as_ptr(&html) as *mut Object;
+            let _: *mut Object = msg_send![page as *mut Object, loadHTMLString: html baseURL: std::ptr::null_mut::<Object>()];
+        }
+    }
+
     /// The page hidden, as a glance's is when it's scrolled out of the chat.
     pub fn hide_page(page: usize) {
         unsafe {
@@ -4123,6 +4132,8 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             Some(page)
         };
         let chord = native_input::FUNCTION | native_input::CONTROL;
+        let recording = |cx: &mut gpui::AsyncWindowContext| view.read_with(cx, |view, _| view.recording()).unwrap_or(false);
+        let reaches_recorder = |hint: &str| hint.contains("runs as an app") || hint.contains("Microphone");
 
         check(
             &format!("the box is empty and focused to start (keyboard: {})", native_input::keyboard(width)),
@@ -4157,11 +4168,12 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
                 typed,
             );
             native_input::flags(width, chord);
-            wait(700).await;
+            let heard = until(cx, &|cx| recording(cx) || reaches_recorder(&hint(cx))).await;
+            native_input::key(width, "\u{1b}", 53, chord);
             native_input::flags(width, 0);
-            let heard = until(cx, &|cx| hint(cx).starts_with("Clear the message box")).await;
+            until(cx, &|cx| !recording(cx)).await;
             check(
-                &format!("{case}: fn+⌃ held with text reaches the chat, which asks to clear it ({:?})", hint(cx)),
+                &format!("{case}: fn+⌃ held with text reaches the chat's recorder ({:?})", hint(cx)),
                 typed && heard,
             );
             if case == "page hidden" {
@@ -4191,6 +4203,62 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
         } else {
             check("a page goes over the chat", false);
         }
+
+        // fn+⌃'s words (dictation.rs) as the relay's come back, into the field with the cursor: one of Filo's (the
+        // box itself, here as any GPUI field), then a page's, and the box when the page's field has lost it.
+        use crate::dictation::{Field, Target};
+        reset(cx).await;
+        type_keys(&this, cx, "hi", false);
+        until(cx, &|cx| text(cx) == "hi").await;
+        let filo_field = this
+            .update_in(cx, |_, window, cx| {
+                matches!(crate::dictation::target(None, window, cx), Some(Target::Field(Field::Filo)))
+                    && crate::dictation::type_into_filo("there", window, cx)
+            })
+            .unwrap_or(false);
+        let written = until(cx, &|cx| text(cx) == "hi there").await;
+        this.update_in(cx, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.composer().update(cx, |input, cx| {
+                    input.set_cursor_position(gpui_component::input::Position::new(0, 0), window, cx)
+                })
+            })
+        })
+        .ok();
+        wait(200).await;
+        this.update_in(cx, |_, window, cx| crate::dictation::type_into_filo("Oh,", window, cx)).ok();
+        let before = until(cx, &|cx| text(cx) == "Oh, hi there").await;
+        check(&format!("words go into a Filo field at its caret, spaced ({:?})", text(cx)), filo_field && written && before);
+
+        reset(cx).await;
+        let in_page = match clicked_page(cx).await {
+            Some(page) => {
+                let web = this.update_in(cx, |_, window, cx| match crate::dictation::target(Some(view.clone()), window, cx) {
+                    Some(Target::Field(Field::Web(web))) => Some(web),
+                    _ => None,
+                });
+                let web = web.ok().flatten();
+                let mut ok = web.is_some();
+                if let Some(web) = &web {
+                    native_input::load_page(page, "<input id=f value='hello world' style='width:260px'>");
+                    wait(1200).await;
+                    crate::dictation::evaluate_bool(web, "var f=document.getElementById('f'); f.focus(); f.setSelectionRange(5,5); true").await;
+                    let typed = crate::dictation::type_into_web(web, "there").await;
+                    let value = crate::dictation::evaluate_bool(web, "document.getElementById('f').value === 'hello there world'").await;
+                    eprintln!("page-keys-drive: page's field typed {typed}, value right {value}");
+                    crate::dictation::evaluate_bool(web, "document.activeElement.blur(); true").await;
+                    let field = Field::Web(web.clone());
+                    let fell_back = crate::dictation::type_words(field, "for the box".into(), Some(view.clone()), cx).await;
+                    let boxed = until(cx, &|cx| text(cx) == "for the box").await;
+                    eprintln!("page-keys-drive: with no field in the page, the box took them ({fell_back}, {:?})", text(cx));
+                    ok = typed && value && fell_back && boxed;
+                }
+                native_input::remove_page(page);
+                ok
+            }
+            None => false,
+        };
+        check("words go into a page's field at its caret, and to the box when it has none", in_page);
         reset(cx).await;
 
         eprintln!("page-keys-drive: {}", if failed.get() { "FAIL" } else { "PASS" });
@@ -6195,7 +6263,8 @@ fn run_feed_refresh(window: &mut Window, cx: &mut Context<AppShell>) {
 
 /// `FILO_OPEN=voice-keys-drive`: the voice message shortcuts in an agent's chat and in a chat, with fixture data
 /// (scripts/voice-keys-check.sh runs it offline in a sandbox). With the message box focused, fn+⌃ and Esc go in as
-/// real key events posted inside the app: held with text, fn+⌃ asks to clear the box; a tap leaves nothing recording
+/// real key events posted inside the app: held with text, fn+⌃ records for the box and Esc leaves the text as it was;
+/// words written in (as the relay's come back) go at the caret with nothing sent; a tap leaves nothing recording
 /// or kept; held on an empty box it reaches the recorder (a bare binary without microphone access says to start Filo as an app; one that
 /// can record does, and Esc while holding throws the recording away); the other conversation hears none of it. The
 /// open shortcut held (the commands hotkeys.rs sends) records in the chat on screen, the agent's too, staying on its
@@ -6310,7 +6379,7 @@ fn run_voice_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             wait(800).await;
             check(shown_conversation(&this, cx).1.is_some_and(|shown| shown.entity_id() == view.entity_id()), format!("{name}: on screen"));
             let other_before = (hint(other, cx), text(other, cx));
-            for step in ["held with text", "tap", "held, then Esc"] {
+            for step in ["held with text", "dictated", "tap", "held, then Esc"] {
                 for attempt in 1..=3 {
                     // From an empty box with no recording and no note (typing clears the note), the box focused.
                     view.update(cx, |view, cx| view.cancel_voice(cx)).ok();
@@ -6327,10 +6396,31 @@ fn run_voice_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
                             type_keys(&this, cx, "hi", false);
                             let typed = until(cx, &|cx| text(view, cx) == "hi").await;
                             native_input::flags(width, chord);
-                            wait(700).await;
+                            let reached = until(cx, &|cx| recording(view, cx) || reaches_recorder(hint(view, cx).as_deref())).await;
+                            // Esc: what a build that can record heard isn't checked here (`dictated` below is).
+                            native_input::key(width, "\u{1b}", 53, chord);
                             native_input::flags(width, 0);
-                            let asked = until(cx, &|cx| hint(view, cx).is_some_and(|h| h.starts_with("Clear the message box"))).await;
-                            (typed && asked, format!("{name}: fn+⌃ held with text asks to clear it (typed {typed}, {:?})", hint(view, cx)))
+                            let stopped = until(cx, &|cx| !recording(view, cx)).await;
+                            let kept = text(view, cx);
+                            (
+                                typed && reached && stopped && kept == "hi",
+                                format!("{name}: fn+⌃ held with text records for the box, the text kept (typed {typed}, {:?}, {kept:?})", hint(view, cx)),
+                            )
+                        }
+                        "dictated" => {
+                            // The words as they come back from the relay (voice.rs `dictate`): at the caret, spaced,
+                            // the caret after them, nothing sent.
+                            type_keys(&this, cx, "hi", false);
+                            let typed = until(cx, &|cx| text(view, cx) == "hi").await;
+                            let loaded = view.read_with(cx, |view, _| view.history_loaded().0).unwrap_or(0);
+                            this.update_in(cx, |_, window, cx| view.update(cx, |view, cx| view.type_dictated(" there ", window, cx))).ok();
+                            let written = until(cx, &|cx| text(view, cx) == "hi there").await;
+                            let caret = view.read_with(cx, |view, cx| view.composer().read(cx).cursor()).unwrap_or(0);
+                            let sent = view.read_with(cx, |view, _| view.history_loaded().0).unwrap_or(0) != loaded;
+                            (
+                                typed && written && caret == "hi there".len() && !sent && !recording(view, cx),
+                                format!("{name}: words written in go at the caret, nothing sent ({:?}, caret {caret}, sent {sent})", text(view, cx)),
+                            )
                         }
                         "tap" => {
                             native_input::flags(width, chord);
