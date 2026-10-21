@@ -28,13 +28,15 @@ pub fn wanted() -> bool {
                 | "browser-tools-check"
                 | "chromium-check"
                 | "browser-engine-check"
+                | "browser-input-check"
         )
     })
 }
 
 /// The test site: `/form` (fields, a button, a key and click log, a frame counter), `/frame` (a frame from another
 /// host, localhost, with a button), `/inner` (that frame), `/login` (sets a lasting cookie and a session one) and
-/// `/whoami` (the cookies it was sent), `/login-again` (another lasting cookie), and `/signin` (a login form that says what was filled into it, for
+/// `/whoami` (the cookies it was sent), `/login-again` (another lasting cookie), `/input` (browser/input_check.rs), and
+/// `/signin` (a login form that says what was filled into it, for
 /// browser/import_check.rs), `/chat` (a form, a chat box and a button of the page's own that say what Return did, for
 /// browser/keys_check.rs), `/drag` (lists to reorder by dragging and a slider, for browser/drag_check.rs), and `/tools`
 /// (file fields, a download, menus, hover, dialogs, a pop-up, `/popup`, that closes itself, for browser/tools_check.rs),
@@ -82,6 +84,7 @@ pub(super) fn serve() -> u16 {
                     "/tools" => super::tools_check::PAGE.into(),
                     "/popup" => super::tools_check::POPUP.into(),
                     "/report.csv" => REPORT_CSV.into(),
+                    "/input" => super::input_check::PAGE.into(),
                     "/whoami" => format!("<!doctype html><title>Who am I</title><p id=cookies>cookies: [{cookie}]</p>"),
                     _ => "<!doctype html><title>Nothing</title>".into(),
                 };
@@ -222,6 +225,9 @@ pub fn open(cx: &mut App) {
     }
     if std::env::var("FILO_OPEN").is_ok_and(|open| open == "browser-engine-check") {
         return super::engine_check::open(cx);
+    }
+    if std::env::var("FILO_OPEN").is_ok_and(|open| open == "browser-input-check") {
+        return super::input_check::open(cx);
     }
     let again = std::env::var("FILO_BROWSER_CHECK").is_ok_and(|value| value == "again");
     let shots = std::env::var("FILO_FIXTURE_SHOTS").ok().filter(|dir| !dir.is_empty());

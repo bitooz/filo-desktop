@@ -10,6 +10,10 @@
 //        {"op":"dialog","tab":"t1","accept":true,"text":"…"}  {"op":"files","tab":"t1","paths":[…]}  (none: cancel)
 //        {"op":"download","tab":"t1","item":3,"path":"…"}  ("": cancel)  {"op":"rename","tab":"p1","to":"t7"}
 //        {"id":3,"op":"cookies"}  (every cookie)  {"id":4,"op":"set_cookies","cookies":[…],"missing":true}
+//        {"op":"ime","tab":"t1","action":"set"|"commit"|"finish"|"cancel","text":"…","from":0,"to":1}  (an input method)
+//        {"op":"menu","tab":"t1","command":131}  (-1: none)  {"op":"drop","tab":"t1","action":"enter"|"over"|"leave"|
+//        "drop","x":…,"y":…,"ops":1,"files":[…],"text":"…","url":"…"}  (a drag from another app, answered with its
+//        operation)
 //   out: {"ev":"ready","version":"154.0.34.1","cef":"…","protocol":1}
 //        {"id":1,"ok":true}  {"id":2,"ok":true,"result":{…}}  {"id":2,"ok":false,"error":"…"}
 //        {"ev":"state","tab":"t1","title":"…","url":"…","loading":false,"back":true,"forward":false}
@@ -17,8 +21,13 @@
 //        {"ev":"popup","tab":"p1","opener":"t1","url":"…"}  {"ev":"closed","tab":"p1"}  {"ev":"cursor","tab":"t1","type":2}
 //        {"ev":"dialog","tab":"t1","kind":"confirm","message":"…","default":""}  {"ev":"files","tab":"t1","multiple":false}
 //        {"ev":"download","tab":"t1","item":3,"url":"…","name":"…"}  {"ev":"downloaded","tab":"t1","item":3,"url":"…","ok":true}
+//        {"ev":"menu","tab":"t1","x":…,"y":…,"items":[{"id":100,"label":"Back","enabled":true},{"separator":true}],
+//         "link":"…","image":"…"}  (a right-click: Filo shows it and answers with `menu`)
+//        {"ev":"ime","tab":"t1","rect":[x,y,width,height]}  (where the input method's text is)
+//        {"ev":"cdp","tab":"t1","method":"Runtime.bindingCalled","params":{…}}  (a binding of Filo's, window.print())
 //
 // Agents' clicks and keys are DevTools input (Input.dispatchMouseEvent and the like), so pages get trusted events.
+// The page's own drag and drop, started by that input, Chromium carries in the page itself.
 // A cookie is {"name","value","domain","path","secure","httpOnly","sameSite":"Lax"|"Strict"|"None","expires"} (seconds
 // since 1970; none for a session cookie), its domain starting with a dot unless it's the host's own. The app quits
 // when Filo closes its standard input. Built by chromium/build.sh; its helper processes run in Chromium's sandbox.
@@ -44,6 +53,7 @@
 #include "include/cef_application_mac.h"
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
+#include "include/cef_context_menu_handler.h"
 #include "include/cef_cookie.h"
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_dialog_handler.h"
@@ -137,6 +147,7 @@ class Tab : public CefClient,
             public CefJSDialogHandler,
             public CefDialogHandler,
             public CefDownloadHandler,
+            public CefContextMenuHandler,
             public CefDevToolsMessageObserver {
  public:
   Tab(std::string key, int width, int height, float scale, std::string opener)
@@ -152,6 +163,7 @@ class Tab : public CefClient,
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
   CefRefPtr<CefDialogHandler> GetDialogHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
 
   const std::string& key() const { return key_; }
   void Rename(const std::string& key) { key_ = key; }
@@ -386,6 +398,142 @@ class Tab : public CefClient,
     callback->Continue(path.empty() ? std::string("/dev/null") : path, false);
   }
 
+  void UpdateDragCursor(CefRefPtr<CefBrowser>, DragOperation operation) override { operation_ = operation; }
+
+  // A drag from another app (Finder's files, text, a link) over the page in Filo's window.
+  void Drop(CefRefPtr<CefDictionaryValue> request, int id) {
+    if (!browser_) return Answer(id, false, "The page isn't open.");
+    std::string action = request->HasKey("action") ? request->GetString("action").ToString() : std::string();
+    CefMouseEvent event = MouseOf(request);
+    CefRefPtr<CefBrowserHost> host = browser_->GetHost();
+    DragOperationsMask ops = static_cast<DragOperationsMask>(
+        request->HasKey("ops") ? request->GetInt("ops") : static_cast<int>(DRAG_OPERATION_COPY));
+    if (action == "enter") {
+      operation_ = DRAG_OPERATION_NONE;
+      CefRefPtr<CefDragData> data = CefDragData::Create();
+      if (request->HasKey("files")) {
+        CefRefPtr<CefListValue> files = request->GetList("files");
+        for (size_t index = 0; index < files->GetSize(); index++) {
+          std::string path = files->GetString(index).ToString();
+          data->AddFile(path, path.substr(path.find_last_of('/') + 1));
+        }
+      }
+      if (request->HasKey("text")) data->SetFragmentText(request->GetString("text"));
+      if (request->HasKey("url")) {
+        data->SetLinkURL(request->GetString("url"));
+        if (!request->HasKey("text")) data->SetFragmentText(request->GetString("url"));
+      }
+      host->DragTargetDragEnter(data, event, ops);
+      host->DragTargetDragOver(event, ops);
+    } else if (action == "over") {
+      host->DragTargetDragOver(event, ops);
+    } else if (action == "leave") {
+      host->DragTargetDragLeave();
+    } else if (action == "drop") {
+      host->DragTargetDrop(event);
+    }
+    AnswerWith(id, "{\"operation\":" + std::to_string(static_cast<int>(operation_)) + "}");
+  }
+
+  // An input method's text (marked while it's composed, then committed), and where it is for its candidate window.
+  void Ime(const std::string& action, const std::string& text, int from, int to) {
+    if (!browser_) return;
+    CefRefPtr<CefBrowserHost> host = browser_->GetHost();
+    if (action == "set") {
+      CefCompositionUnderline line = {};
+      line.size = sizeof(line);
+      line.range = CefRange(0, static_cast<uint32_t>(CefString(text).length()));
+      line.color = CefColorSetARGB(255, 0, 0, 0);
+      line.background_color = CefColorSetARGB(0, 0, 0, 0);
+      line.style = CEF_CUS_SOLID;
+      host->ImeSetComposition(text, {line}, CefRange::InvalidRange(),
+                              CefRange(static_cast<uint32_t>(from), static_cast<uint32_t>(to)));
+    } else if (action == "commit") {
+      host->ImeCommitText(text, CefRange::InvalidRange(), 0);
+    } else if (action == "finish") {
+      host->ImeFinishComposingText(false);
+    } else {
+      host->ImeCancelComposition();
+    }
+  }
+
+  void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>, const CefRange&, const RectList& bounds) override {
+    if (bounds.empty()) return;
+    const CefRect& last = bounds.back();
+    Send("{\"ev\":\"ime\",\"tab\":" + Quote(key_) + ",\"rect\":[" + std::to_string(last.x) + "," +
+         std::to_string(last.y) + "," + std::to_string(last.width) + "," + std::to_string(last.height) + "]}");
+  }
+
+  // CefContextMenuHandler: a right-click's menu, shown by Filo (a windowless browser shows none). Links and pictures
+  // get what a browser has for them, done by Filo; the page's source isn't offered.
+  void OnBeforeContextMenu(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefContextMenuParams> params,
+                           CefRefPtr<CefMenuModel> model) override {
+    model->Remove(MENU_ID_VIEW_SOURCE);
+    size_t at = 0;
+    if (params->GetMediaType() == CM_MEDIATYPE_IMAGE && !params->GetSourceUrl().empty()) {
+      model->InsertItemAt(at++, kOpenImage, "Open Image in New Tab");
+      model->InsertItemAt(at++, kCopyImage, "Copy Image Address");
+      model->InsertSeparatorAt(at++);
+    }
+    if (!params->GetLinkUrl().empty()) {
+      model->InsertItemAt(0, kOpenLink, "Open Link in New Tab");
+      model->InsertItemAt(1, kCopyLink, "Copy Link Address");
+      if (at == 0) model->InsertSeparatorAt(2);
+    }
+    // No separator left at either end.
+    while (model->GetCount() > 0 && model->GetTypeAt(model->GetCount() - 1) == MENUITEMTYPE_SEPARATOR) {
+      model->RemoveAt(model->GetCount() - 1);
+    }
+    while (model->GetCount() > 0 && model->GetTypeAt(0) == MENUITEMTYPE_SEPARATOR) model->RemoveAt(0);
+  }
+
+  bool RunContextMenu(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefContextMenuParams> params,
+                      CefRefPtr<CefMenuModel> model, CefRefPtr<CefRunContextMenuCallback> callback) override {
+    if (menu_) menu_->Cancel();
+    menu_ = callback;
+    std::string items;
+    for (size_t index = 0; index < model->GetCount(); index++) {
+      if (!items.empty()) items += ",";
+      cef_menu_item_type_t type = model->GetTypeAt(index);
+      if (type == MENUITEMTYPE_SEPARATOR) {
+        items += "{\"separator\":true}";
+      } else if (type == MENUITEMTYPE_COMMAND || type == MENUITEMTYPE_CHECK || type == MENUITEMTYPE_RADIO) {
+        items += "{\"id\":" + std::to_string(model->GetCommandIdAt(index)) +
+                 ",\"label\":" + Quote(model->GetLabelAt(index).ToString()) +
+                 ",\"enabled\":" + (model->IsEnabledAt(index) ? "true" : "false") +
+                 ",\"checked\":" + (model->IsCheckedAt(index) ? "true" : "false") + "}";
+      } else {
+        items.pop_back();
+      }
+    }
+    if (!items.empty() && items.back() == ',') items.pop_back();
+    Send("{\"ev\":\"menu\",\"tab\":" + Quote(key_) + ",\"x\":" + std::to_string(params->GetXCoord()) +
+         ",\"y\":" + std::to_string(params->GetYCoord()) + ",\"items\":[" + items + "],\"link\":" +
+         Quote(params->GetLinkUrl().ToString()) + ",\"image\":" +
+         Quote(params->GetMediaType() == CM_MEDIATYPE_IMAGE ? params->GetSourceUrl().ToString() : std::string()) +
+         "}");
+    return true;
+  }
+
+  // Filo's pick: one of Chromium's commands, or none (Filo's own commands are done by Filo).
+  void AnswerMenu(int command) {
+    if (!menu_) return;
+    CefRefPtr<CefRunContextMenuCallback> callback = menu_;
+    menu_ = nullptr;
+    if (command < 0 || command >= MENU_ID_USER_FIRST || command == MENU_ID_PRINT) {
+      callback->Cancel();
+    } else {
+      callback->Continue(command, EVENTFLAG_NONE);
+    }
+  }
+
+  // CefDevToolsMessageObserver: the events Filo listens for (its bindings, as window.print()'s).
+  void OnDevToolsEvent(CefRefPtr<CefBrowser>, const CefString& method, const void* params, size_t size) override {
+    if (method != "Runtime.bindingCalled") return;
+    Send("{\"ev\":\"cdp\",\"tab\":" + Quote(key_) + ",\"method\":" + Quote(method.ToString()) + ",\"params\":" +
+         std::string(static_cast<const char*>(params), size) + "}");
+  }
+
   // CefDevToolsMessageObserver
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser>, int message, bool success, const void* result,
                               size_t size) override {
@@ -402,6 +550,24 @@ class Tab : public CefClient,
   }
 
  private:
+  static constexpr int kOpenLink = MENU_ID_USER_FIRST + 1, kCopyLink = MENU_ID_USER_FIRST + 2,
+                       kOpenImage = MENU_ID_USER_FIRST + 3, kCopyImage = MENU_ID_USER_FIRST + 4;
+
+  // DevTools' mouse event as CEF's: points and modifiers (DevTools: 1 Option, 2 Control, 4 Command, 8 Shift).
+  static CefMouseEvent MouseOf(CefRefPtr<CefDictionaryValue> params) {
+    auto number = [&](const char* key) {
+      if (!params->HasKey(key)) return 0.0;
+      return params->GetType(key) == VTYPE_INT ? static_cast<double>(params->GetInt(key)) : params->GetDouble(key);
+    };
+    CefMouseEvent event;
+    event.x = static_cast<int>(number("x"));
+    event.y = static_cast<int>(number("y"));
+    int modifiers = static_cast<int>(number("modifiers"));
+    event.modifiers = (modifiers & 1 ? EVENTFLAG_ALT_DOWN : 0) | (modifiers & 2 ? EVENTFLAG_CONTROL_DOWN : 0) |
+                      (modifiers & 4 ? EVENTFLAG_COMMAND_DOWN : 0) | (modifiers & 8 ? EVENTFLAG_SHIFT_DOWN : 0);
+    return event;
+  }
+
   void SendState() {
     Send("{\"ev\":\"state\",\"tab\":" + Quote(key_) + ",\"title\":" + Quote(title_) + ",\"url\":" + Quote(url_) +
          ",\"loading\":" + (loading_ ? "true" : "false") + ",\"back\":" + (back_ ? "true" : "false") +
@@ -463,6 +629,8 @@ class Tab : public CefClient,
   CefRefPtr<CefFileDialogCallback> files_;
   std::map<uint32_t, CefRefPtr<CefBeforeDownloadCallback>> downloads_;
   std::set<uint32_t> ended_;
+  CefRefPtr<CefRunContextMenuCallback> menu_;
+  DragOperation operation_ = DRAG_OPERATION_NONE;
 
   IMPLEMENT_REFCOUNTING(Tab);
 };
@@ -732,6 +900,15 @@ void Handle(const std::string& line) {
   } else if (op == "download") {
     tab->AnswerDownload(static_cast<uint32_t>(Number(request, "item", 0)), Text(request, "path"));
     Answer(id, true);
+  } else if (op == "ime") {
+    tab->Ime(Text(request, "action"), Text(request, "text"), static_cast<int>(Number(request, "from", 0)),
+             static_cast<int>(Number(request, "to", 0)));
+    Answer(id, true);
+  } else if (op == "menu") {
+    tab->AnswerMenu(static_cast<int>(Number(request, "command", -1)));
+    Answer(id, true);
+  } else if (op == "drop") {
+    tab->Drop(request, id);
   } else if (op == "focus") {
     browser->GetHost()->SetFocus(true);
     Answer(id, true);

@@ -1128,3 +1128,83 @@ mod tests {
         assert!(Key::named("Banana").is_none());
     }
 }
+
+thread_local! {
+    /// Where a check's prints go, as PDF files with no panel (`dev` builds).
+    static PRINT_TO: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Prints go to `path` as a PDF, with no print panel, until None (`dev` builds).
+#[cfg(feature = "dev")]
+pub fn print_to(path: Option<std::path::PathBuf>) {
+    PRINT_TO.with(|to| *to.borrow_mut() = path);
+}
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    static NSPrintJobDisposition: &'static NSString;
+    static NSPrintSaveJob: &'static NSString;
+    static NSPrintJobSavingURL: &'static NSString;
+}
+
+/// Runs a print operation: macOS's print panel as a sheet on `view`'s window (a check's: saved where `print_to` said,
+/// with no panel). Never run to its end at once: WebKit draws the pages while the main thread goes on.
+fn run_print(operation: &AnyObject, view: &AnyObject) {
+    // SAFETY: AppKit on the main thread; the operation is retained by its caller while it runs.
+    unsafe {
+        if let Some(path) = PRINT_TO.with(|to| to.borrow().clone()) {
+            let info: *mut AnyObject = msg_send![operation, printInfo];
+            let settings: *mut AnyObject = msg_send![info, dictionary];
+            let path = NSString::from_str(&path.display().to_string());
+            let url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: &*path];
+            let _: () = msg_send![settings, setObject: NSPrintSaveJob, forKey: NSPrintJobDisposition];
+            let _: () = msg_send![settings, setObject: url, forKey: NSPrintJobSavingURL];
+            let _: () = msg_send![operation, setShowsPrintPanel: false];
+            let _: () = msg_send![operation, setShowsProgressPanel: false];
+        }
+        let window: *mut AnyObject = msg_send![view, window];
+        let _: () = msg_send![operation, runOperationModalForWindow: window, delegate: std::ptr::null_mut::<AnyObject>(), didRunSelector: std::ptr::null::<c_void>(), contextInfo: std::ptr::null_mut::<c_void>()];
+    }
+}
+
+/// Prints a WebKit page in its window.
+pub fn print(view: &AnyObject) -> Result<(), String> {
+    // SAFETY: AppKit and WebKit on the main thread; the operation is retained while it's set up and run.
+    unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSPrintInfo), sharedPrintInfo];
+        let operation: Option<Retained<AnyObject>> = msg_send![view, printOperationWithPrintInfo: info];
+        let operation = operation.ok_or("WebKit didn't print the page.")?;
+        // WebKit's printing view is drawn at its frame: the page's own size.
+        let printing: *mut AnyObject = msg_send![&*operation, view];
+        let bounds: NSRect = msg_send![view, bounds];
+        if !printing.is_null() {
+            let _: () = msg_send![printing, setFrame: bounds];
+        }
+        run_print(&operation, view);
+    }
+    Ok(())
+}
+
+/// Prints `pdf` (a page in Chromium, as a PDF of it) over `view`'s window, through PDFKit.
+pub fn print_pdf(view: *mut AnyObject, pdf: &[u8]) -> Result<(), String> {
+    // SAFETY: AppKit, Foundation and PDFKit on the main thread; the document and the operation are retained while
+    // they're used, and the view is alive (its tab holds it).
+    unsafe {
+        let path = NSString::from_str("/System/Library/Frameworks/PDFKit.framework");
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), bundleWithPath: &*path];
+        let loaded: bool = !bundle.is_null() && msg_send![bundle, load];
+        let document_class = AnyClass::get(c"PDFDocument").filter(|_| loaded).ok_or("PDFKit didn't load.")?;
+        let data: *mut AnyObject =
+            msg_send![class!(NSData), dataWithBytes: pdf.as_ptr() as *const c_void, length: pdf.len()];
+        let allocated: Allocated<AnyObject> = msg_send![document_class, alloc];
+        let document: Option<Retained<AnyObject>> = msg_send![allocated, initWithData: data];
+        let document = document.ok_or("The page's PDF didn't read.")?;
+        let info: *mut AnyObject = msg_send![class!(NSPrintInfo), sharedPrintInfo];
+        // kPDFPrintPageScaleDownToFit: a page bigger than the paper fits it.
+        let operation: Option<Retained<AnyObject>> =
+            msg_send![&*document, printOperationForPrintInfo: info, scalingMode: 2isize, autoRotate: true];
+        let operation = operation.ok_or("PDFKit didn't print the page.")?;
+        run_print(&operation, &*view);
+    }
+    Ok(())
+}

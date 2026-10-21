@@ -11,7 +11,7 @@
 // What's brought in from Helium or Chrome (browser/import.rs): the address bar suggests its bookmarks and history as
 // the user types, in a band under the toolbar (the page is a native view over the window, so nothing of GPUI's can
 // cover it), a page with a login form on a site that has a saved login gets a bar offering to fill it, and the import
-// panel shows in the page's place.
+// panel shows in the page's place. ⌘P prints the page shown.
 
 use std::time::Duration;
 
@@ -962,6 +962,14 @@ impl Render for BrowserWindow {
                     super::give_keys_to(view);
                 }
             })
+            // ⌘P, Filo's search elsewhere, prints the page here (both engines: browser.rs `print`).
+            .on_action(cx.listener(|this, _: &crate::chrome::Search, _, _| {
+                if let Some(id) = super::shown().filter(|_| this.import.is_none())
+                    && let Err(error) = super::print(&id)
+                {
+                    eprintln!("browser: couldn't print {id}: {error}");
+                }
+            }))
             .child(self.toolbar(cx))
             .children(self.suggestion_list(cx))
             .child(self.tab_strip(cx))

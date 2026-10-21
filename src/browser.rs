@@ -18,6 +18,10 @@ mod chromium;
 // `FILO_OPEN=browser-engine-check`: Settings › Browser's switch between the engines from a local feed (`dev` builds).
 #[cfg(feature = "dev")]
 mod engine_check;
+// `FILO_OPEN=browser-input-check`: an input method, the right-click menu, a drop from another app and printing, as the
+// user does them in the browser window (`dev` builds).
+#[cfg(feature = "dev")]
+mod input_check;
 // `FILO_OPEN=chromium-check`: memory, Google's sign-in and WebKit's cookies with Chromium as the engine (`dev` builds).
 #[cfg(feature = "dev")]
 mod chromium_check;
@@ -700,6 +704,51 @@ pub fn chromium_picture(view: *mut objc2::runtime::AnyObject, width: usize, heig
     chromium::picture(view, width, height)
 }
 
+/// Prints tab `id`'s page with macOS's print panel, over the browser window (⌘P there, the page's menu or its
+/// window.print()): WebKit prints its view, Chromium a PDF it makes of the page.
+pub fn print(id: &str) -> Result<(), String> {
+    let tab = tab_or_error(id)?;
+    if native::parked(tab.view()) {
+        return Err("Only a page in the browser window prints.".into());
+    }
+    let view = Retained::as_ptr(&tab.view) as *mut objc2::runtime::AnyObject;
+    match &tab.page {
+        Page::WebKit(_) => native::print(tab.view()),
+        Page::Chromium(_) => {
+            if let Some(page) = chromium::of(tab.view()) {
+                page.print(view);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A page asked to print (window.print(), its menu's Print): it prints when it's the user's to see, in the browser
+/// window with no agent at work there; an agent's hears that it didn't.
+fn page_asks_to_print(view: *mut objc2::runtime::AnyObject) {
+    let Some(tab) = tab_of_view(view) else { return };
+    if native::parked(tab.view()) || tab.working() {
+        tab.news
+            .borrow_mut()
+            .push("The page asked to print: Filo prints only for the user, in the browser window.".into());
+        return;
+    }
+    if let Err(error) = print(&tab.id) {
+        eprintln!("browser: couldn't print {}: {error}", tab.id);
+    }
+}
+
+/// A link or picture the user opened in a new tab from a page's menu: a tab of the user's, shown.
+fn open_from_page(url: &str) {
+    if url.is_empty() {
+        return;
+    }
+    match open_for_user(url) {
+        Ok(tab) => set_shown(Some(tab.id.clone())),
+        Err(error) => eprintln!("browser: couldn't open {url}: {error}"),
+    }
+}
+
 /// Opens a tab for the user (the browser window's +).
 pub fn open_for_user(url: &str) -> Result<Rc<Tab>, String> {
     new_tab(Some(&address(url)), None)
@@ -1140,6 +1189,11 @@ async fn drag(cx: &AsyncApp, tab: &Tab, from: (f64, f64), to: (f64, f64)) -> Res
         }
     }
     let mut drag = drag::Drag::begin(tab.view())?;
+    // Chromium carries the page's own drag and drop in the page: Filo's world watches it start and end.
+    let chromium = chromium::of(tab.view()).is_some();
+    if chromium {
+        run_quietly(cx, tab, DRAG_WATCH).await;
+    }
     native::mouse(tab.view(), native::Mouse::Move, from.0, from.1, 0);
     flash(cx, tab, from.0, from.1, 14.);
     sleep(cx, Duration::from_millis(40)).await;
@@ -1167,6 +1221,17 @@ async fn drag(cx: &AsyncApp, tab: &Tab, from: (f64, f64), to: (f64, f64)) -> Res
     }
     let moves = path.len();
     flash(cx, tab, to.0, to.1, 18.);
+    if chromium {
+        drop(drag);
+        native::mouse(tab.view(), native::Mouse::Up, to.0, to.1, 1);
+        sleep(cx, Duration::from_millis(150)).await;
+        let watched: Value = serde_json::from_str(&run_quietly(cx, tab, DRAG_WATCHED).await).unwrap_or(Value::Null);
+        return Ok(if watched["started"] == true {
+            Dragged::Dropped { moves, taken: watched["effect"].as_str().is_some_and(|effect| effect != "none") }
+        } else {
+            Dragged::Mouse { moves }
+        });
+    }
     if drag.dropping() {
         let taken = drag.let_go(operation);
         drop(drag);
@@ -1179,6 +1244,24 @@ async fn drag(cx: &AsyncApp, tab: &Tab, from: (f64, f64), to: (f64, f64)) -> Res
         native::mouse(tab.view(), native::Mouse::Up, to.0, to.1, 1);
         Ok(Dragged::Mouse { moves })
     }
+}
+
+/// Watches the page's drag and drop from Filo's world: whether one started, and its drop effect at its end ("none":
+/// the drop wasn't taken).
+const DRAG_WATCH: &str = "window.__filoDrag = { started: false, effect: '' };
+if (!window.__filoDragWatched) {
+  window.__filoDragWatched = true;
+  document.addEventListener('dragstart', () => { window.__filoDrag.started = true; }, true);
+  document.addEventListener('dragend', (e) => { window.__filoDrag.effect = e.dataTransfer ? e.dataTransfer.dropEffect : 'none'; }, true);
+}
+return '';";
+const DRAG_WATCHED: &str = "return JSON.stringify(window.__filoDrag || {});";
+
+/// A script of Filo's own in the page's world (`native::run_js`): its answer, or nothing.
+async fn run_quietly(cx: &AsyncApp, tab: &Tab, body: &str) -> String {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    cx.update(|_| native::run_js(tab.view(), body, "", move |result| drop(tx.send(result)))).ok();
+    rx.await.ok().and_then(Result::ok).unwrap_or_default()
 }
 
 /// Real key presses typing `text`.

@@ -15,6 +15,13 @@
 // dialog, browser_upload's files, the downloads folder). A page draws at the screen's scale while it shows in the
 // browser window, and at 1x while it's parked off the screen, which takes far less memory (an agent's screenshots are
 // one pixel per CSS pixel either way).
+//
+// The view takes what the user does there as a Mac app's view does: keys go through the input method
+// (NSTextInputClient: composing Chinese or Japanese, accented letters, the emoji picker), a right-click shows the
+// page's menu as a native one (Filo opens and copies links and pictures itself), files, text and links dragged in from
+// another app drop into the page; the page's own drag and drop Chromium carries in the page.
+// window.print(), the menu's Print and ⌘P print the page as a PDF Chromium makes, with macOS's print panel
+// (browser.rs `print`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -80,6 +87,11 @@ struct Shared {
     world: Option<i64>,
     /// The page's size in points and the pixels per point, as the engine was last told.
     size: (f64, f64, f64),
+    /// An input method's text being composed (its length, in UTF-16), and where it shows (points in the view).
+    marked: Option<usize>,
+    ime_rect: Option<(f64, f64, f64, f64)>,
+    /// What the page said it would do with a drag from another app over it (NSDragOperation's bits).
+    drop_operation: usize,
 }
 
 /// A frame's shared memory, mapped to read.
@@ -315,13 +327,33 @@ pub fn open(key: &str, url: &str, (width, height): (f64, f64)) -> Result<(Page, 
         cx.spawn(async move |_| {
             let made = answer.await.ok().and_then(Result::ok).is_some();
             match shared(&key) {
-                Some(page) if made => page.borrow_mut().made = true,
+                Some(page) if made => {
+                    page.borrow_mut().made = true;
+                    prepare(&key).await;
+                }
                 _ => eprintln!("browser: Chromium didn't make {key}'s page"),
             }
         })
         .detach();
     }
     Ok((page, view))
+}
+
+/// The binding the page's window.print() calls (`PRINT_SCRIPT`), heard as a DevTools event.
+const PRINT_BINDING: &str = "__filoPrint";
+const PRINT_SCRIPT: &str = "window.print = function print() { window.__filoPrint(''); };";
+
+/// Sets up a page the engine made: its window.print() comes to Filo, in this document and every one after.
+async fn prepare(key: &str) {
+    for (method, params) in [
+        ("Runtime.enable", json!({})),
+        ("Runtime.addBinding", json!({ "name": PRINT_BINDING })),
+        ("Page.addScriptToEvaluateOnNewDocument", json!({ "source": PRINT_SCRIPT, "runImmediately": true })),
+    ] {
+        if let Err(error) = devtools(key, method, params).await {
+            eprintln!("browser: {key}'s page didn't take {method}: {error}");
+        }
+    }
 }
 
 /// A page the engine made itself (a pop-up), with the view that shows it.
@@ -341,6 +373,9 @@ fn adopt(key: &str, size: (f64, f64, f64)) -> Result<(Page, Retained<AnyObject>)
         cursor: 0,
         world: None,
         size,
+        marked: None,
+        ime_rect: None,
+        drop_operation: 1,
     };
     let shared = Rc::new(RefCell::new(shared));
     PAGES.with(|pages| pages.borrow_mut().insert(key.to_string(), shared.clone()));
@@ -434,6 +469,8 @@ fn event(cx: &mut AsyncApp, message: &Value) {
                     if let Some(shared) = shared(&id) {
                         shared.borrow_mut().made = true;
                     }
+                    let prepared = id.clone();
+                    cx.spawn(async move |_| prepare(&prepared).await).detach();
                     if let Err(error) = super::chromium_popup(&id, opener, page, view) {
                         eprintln!("browser: {opener}'s pop-up: {error}");
                         tell(json!({ "op": "close", "tab": id }));
@@ -489,6 +526,34 @@ fn event(cx: &mut AsyncApp, message: &Value) {
         }
         "downloaded" => {
             super::download_finished(key, message["url"].as_str().unwrap_or_default(), message["ok"] == true);
+        }
+        "menu" => {
+            let Some(page) = shared(key) else { return };
+            let view = page.borrow().view as *mut AnyObject;
+            let picked = context_menu(view, message);
+            tell(json!({ "op": "menu", "tab": key, "command": picked.unwrap_or(-1) }));
+            match picked {
+                Some(OPEN_LINK) => super::open_from_page(message["link"].as_str().unwrap_or_default()),
+                Some(OPEN_IMAGE) => super::open_from_page(message["image"].as_str().unwrap_or_default()),
+                Some(COPY_LINK) => copy_text(message["link"].as_str().unwrap_or_default()),
+                Some(COPY_IMAGE) => copy_text(message["image"].as_str().unwrap_or_default()),
+                Some(PRINT) => super::page_asks_to_print(view),
+                _ => {}
+            }
+            cx.update(|cx| cx.refresh_windows()).ok();
+        }
+        "ime" => {
+            if let (Some(page), Some(rect)) = (shared(key), message["rect"].as_array()) {
+                let at = |index: usize| rect.get(index).and_then(Value::as_f64).unwrap_or(0.);
+                page.borrow_mut().ime_rect = Some((at(0), at(1), at(2), at(3)));
+            }
+        }
+        "cdp" => {
+            let printing = message["method"] == "Runtime.bindingCalled" && message["params"]["name"] == PRINT_BINDING;
+            if let (true, Some(page)) = (printing, shared(key)) {
+                let view = page.borrow().view as *mut AnyObject;
+                super::page_asks_to_print(view);
+            }
         }
         "crashed" => eprintln!("browser: Chromium's page {key} crashed: {}", message["error"]),
         "gone" => {
@@ -616,6 +681,34 @@ impl Handle {
             json!({ "type": kind, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": clicks.max(0) }),
         );
         true
+    }
+
+    /// Prints the page, as a PDF Chromium makes of it, with macOS's print panel over `window`'s.
+    pub fn print(&self, view: *mut AnyObject) {
+        let (Some(cx), key) = (cx(), self.1.clone()) else { return };
+        cx.spawn(async move |_| {
+            let made = devtools(
+                &key,
+                "Page.printToPDF",
+                json!({ "printBackground": true, "preferCSSPageSize": true, "generateDocumentOutline": true }),
+            )
+            .await;
+            let pdf = made.and_then(|made| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(made["data"].as_str().unwrap_or_default())
+                    .map_err(|error| error.to_string())
+            });
+            match pdf {
+                Ok(pdf) => {
+                    if let Err(error) = native::print_pdf(view, &pdf) {
+                        eprintln!("browser: couldn't print {key}: {error}");
+                    }
+                }
+                Err(error) => eprintln!("browser: Chromium didn't make {key}'s PDF: {error}"),
+            }
+        })
+        .detach();
     }
 
     /// One key pressed and let go.
@@ -808,8 +901,14 @@ fn view_class() -> Option<&'static AnyClass> {
         extern "C-unwind" fn mouse(this: &AnyObject, selector: Sel, event: *mut AnyObject) {
             user_mouse(this, selector, event);
         }
-        extern "C-unwind" fn key(this: &AnyObject, selector: Sel, event: *mut AnyObject) {
-            user_key(this, selector, event);
+        extern "C-unwind" fn key_down(this: &AnyObject, _: Sel, event: *mut AnyObject) {
+            key_through_input_method(this, event);
+        }
+        extern "C-unwind" fn key_up(this: &AnyObject, selector: Sel, event: *mut AnyObject) {
+            // A key the input method took went no further.
+            if of(this).is_some_and(|page| page.0.borrow().marked.is_none()) {
+                user_key(this, selector, event);
+            }
         }
         extern "C-unwind" fn command(this: &AnyObject, selector: Sel, _: *mut AnyObject) {
             user_command(this, selector);
@@ -848,8 +947,10 @@ fn view_class() -> Option<&'static AnyClass> {
             ] {
                 builder.add_method(selector, mouse as extern "C-unwind" fn(_, _, _));
             }
-            builder.add_method(sel!(keyDown:), key as extern "C-unwind" fn(_, _, _));
-            builder.add_method(sel!(keyUp:), key as extern "C-unwind" fn(_, _, _));
+            builder.add_method(sel!(keyDown:), key_down as extern "C-unwind" fn(_, _, _));
+            builder.add_method(sel!(keyUp:), key_up as extern "C-unwind" fn(_, _, _));
+            input_method::add(&mut builder);
+            dropping::add(&mut builder);
             for selector in [sel!(copy:), sel!(cut:), sel!(paste:), sel!(selectAll:), sel!(undo:), sel!(redo:)] {
                 builder.add_method(selector, command as extern "C-unwind" fn(_, _, _));
             }
@@ -861,6 +962,439 @@ fn view_class() -> Option<&'static AnyClass> {
     });
     // SAFETY: a registered class lives as long as the process.
     class.map(|class| unsafe { &*(class as *const AnyClass) })
+}
+
+/// The keys being handed through the input method (`interpretKeyEvents:`): the event, and whether it went to the page.
+struct Keying {
+    event: *mut AnyObject,
+    handled: bool,
+}
+
+thread_local! {
+    static KEYING: RefCell<Option<Keying>> = const { RefCell::new(None) };
+}
+
+/// A key down, through the input method: it composes text (`input_method`), or hands the key back as text or a
+/// command, which go to the page as the key. A key it says nothing about goes to the page as it is.
+fn key_through_input_method(view: &AnyObject, event: *mut AnyObject) {
+    let Some(page) = of(view) else { return };
+    KEYING.with(|keying| *keying.borrow_mut() = Some(Keying { event, handled: false }));
+    // SAFETY: AppKit on the main thread; the array holds the event AppKit is handing the view.
+    unsafe {
+        let events: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: event];
+        let _: () = msg_send![view, interpretKeyEvents: events];
+    }
+    let keying = KEYING.with(|keying| keying.borrow_mut().take());
+    if !keying.is_some_and(|keying| keying.handled) && page.0.borrow().marked.is_none() {
+        user_key(view, sel!(keyDown:), event);
+    }
+}
+
+/// The key being handed through the input method goes to the page as it is (once).
+fn key_as_it_is(view: &AnyObject) -> bool {
+    let event = KEYING.with(|keying| {
+        let mut keying = keying.borrow_mut();
+        let keying = keying.as_mut().filter(|keying| !keying.handled)?;
+        keying.handled = true;
+        Some(keying.event)
+    });
+    if let Some(event) = event {
+        user_key(view, sel!(keyDown:), event);
+    }
+    event.is_some()
+}
+
+/// NSRange, as AppKit's text input passes it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Range {
+    location: usize,
+    length: usize,
+}
+
+// SAFETY: the same layout and encoding as NSRange.
+unsafe impl objc2::Encode for Range {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("_NSRange", &[objc2::Encoding::ULong, objc2::Encoding::ULong]);
+}
+
+// SAFETY: as NSRange's.
+unsafe impl objc2::RefEncode for Range {
+    const ENCODING_REF: objc2::Encoding = objc2::Encoding::Pointer(&<Range as objc2::Encode>::ENCODING);
+}
+
+const NOT_FOUND: usize = isize::MAX as usize;
+
+/// The view as AppKit's text input client (NSTextInputClient): an input method's text, marked while it's composed
+/// (`ime` set), then committed, goes to the page as composition (Chromium's IME calls), and its candidate window shows
+/// at the text (`firstRectForCharacterRange:`, from the engine's `ime` event).
+mod input_method {
+    use super::*;
+
+    /// An NSString, or an NSAttributedString's string.
+    fn text_of(object: *mut AnyObject) -> String {
+        if object.is_null() {
+            return String::new();
+        }
+        // SAFETY: AppKit's text input hands an NSString or an NSAttributedString, read on the main thread.
+        unsafe {
+            let attributed: bool = msg_send![object, isKindOfClass: class!(NSAttributedString)];
+            let string: *mut AnyObject = if attributed { msg_send![object, string] } else { object };
+            let text: *const std::ffi::c_char = msg_send![string, UTF8String];
+            if text.is_null() { String::new() } else { std::ffi::CStr::from_ptr(text).to_string_lossy().into_owned() }
+        }
+    }
+
+    extern "C-unwind" fn insert_text(this: &AnyObject, _: Sel, text: *mut AnyObject, _: Range) {
+        let Some(page) = of(this) else { return };
+        let text = text_of(text);
+        let composing = page.0.borrow().marked.is_some();
+        let in_key = KEYING.with(|keying| keying.borrow().is_some());
+        if !composing && in_key {
+            // A plain key's own text: the key itself, as before.
+            key_as_it_is(this);
+            return;
+        }
+        // The input method's text, or text from no key (the emoji picker, dictation).
+        KEYING.with(|keying| keying.borrow_mut().as_mut().map(|keying| keying.handled = true));
+        page.0.borrow_mut().marked = None;
+        tell(json!({ "op": "ime", "tab": page.1, "action": "commit", "text": text }));
+    }
+
+    extern "C-unwind" fn set_marked_text(this: &AnyObject, _: Sel, text: *mut AnyObject, selected: Range, _: Range) {
+        let Some(page) = of(this) else { return };
+        let text = text_of(text);
+        KEYING.with(|keying| keying.borrow_mut().as_mut().map(|keying| keying.handled = true));
+        if text.is_empty() {
+            page.0.borrow_mut().marked = None;
+            tell(json!({ "op": "ime", "tab": page.1, "action": "cancel" }));
+            return;
+        }
+        page.0.borrow_mut().marked = Some(text.encode_utf16().count());
+        let (from, to) = (selected.location, selected.location + selected.length);
+        tell(json!({ "op": "ime", "tab": page.1, "action": "set", "text": text, "from": from, "to": to }));
+    }
+
+    extern "C-unwind" fn unmark_text(this: &AnyObject, _: Sel) {
+        let Some(page) = of(this) else { return };
+        if page.0.borrow_mut().marked.take().is_some() {
+            tell(json!({ "op": "ime", "tab": page.1, "action": "finish" }));
+        }
+    }
+
+    extern "C-unwind" fn has_marked_text(this: &AnyObject, _: Sel) -> Bool {
+        Bool::new(of(this).is_some_and(|page| page.0.borrow().marked.is_some()))
+    }
+
+    extern "C-unwind" fn marked_range(this: &AnyObject, _: Sel) -> Range {
+        match of(this).and_then(|page| page.0.borrow().marked) {
+            Some(length) => Range { location: 0, length },
+            None => Range { location: NOT_FOUND, length: 0 },
+        }
+    }
+
+    extern "C-unwind" fn selected_range(_: &AnyObject, _: Sel) -> Range {
+        Range { location: NOT_FOUND, length: 0 }
+    }
+
+    extern "C-unwind" fn valid_attributes(_: &AnyObject, _: Sel) -> *mut AnyObject {
+        // SAFETY: an empty, autoreleased NSArray.
+        unsafe { msg_send![class!(NSArray), array] }
+    }
+
+    extern "C-unwind" fn substring(_: &AnyObject, _: Sel, _: Range, _: *mut Range) -> *mut AnyObject {
+        std::ptr::null_mut()
+    }
+
+    extern "C-unwind" fn character_index(_: &AnyObject, _: Sel, _: NSPoint) -> usize {
+        NOT_FOUND
+    }
+
+    /// Where the text being composed is, on the screen: the candidate window shows under it.
+    extern "C-unwind" fn first_rect(this: &AnyObject, _: Sel, _: Range, _: *mut Range) -> NSRect {
+        let (x, y, width, height) = of(this).and_then(|page| page.0.borrow().ime_rect).unwrap_or((0., 0., 0., 20.));
+        // SAFETY: AppKit on the main thread; the view's in a window while it takes keys.
+        unsafe {
+            let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width.max(1.), height.max(1.)));
+            let in_window: NSRect = msg_send![this, convertRect: rect, toView: std::ptr::null_mut::<AnyObject>()];
+            let window: *mut AnyObject = msg_send![this, window];
+            if window.is_null() { in_window } else { msg_send![window, convertRectToScreen: in_window] }
+        }
+    }
+
+    extern "C-unwind" fn do_command(this: &AnyObject, _: Sel, _: Sel) {
+        // A key the input method hands back as a command (Return, Delete, an arrow): the key itself, which carries
+        // its editing command (`key_events`).
+        key_as_it_is(this);
+    }
+
+    pub(super) fn add(builder: &mut ClassBuilder) {
+        if let Some(protocol) = objc2::runtime::AnyProtocol::get(c"NSTextInputClient") {
+            builder.add_protocol(protocol);
+        }
+        // SAFETY: each method's signature matches NSTextInputClient's.
+        unsafe {
+            builder.add_method(sel!(insertText:replacementRange:), insert_text as extern "C-unwind" fn(_, _, _, _));
+            builder.add_method(
+                sel!(setMarkedText:selectedRange:replacementRange:),
+                set_marked_text as extern "C-unwind" fn(_, _, _, _, _),
+            );
+            builder.add_method(sel!(unmarkText), unmark_text as extern "C-unwind" fn(_, _));
+            builder.add_method(sel!(hasMarkedText), has_marked_text as extern "C-unwind" fn(_, _) -> _);
+            builder.add_method(sel!(markedRange), marked_range as extern "C-unwind" fn(_, _) -> _);
+            builder.add_method(sel!(selectedRange), selected_range as extern "C-unwind" fn(_, _) -> _);
+            builder.add_method(sel!(validAttributesForMarkedText), valid_attributes as extern "C-unwind" fn(_, _) -> _);
+            builder.add_method(
+                sel!(attributedSubstringForProposedRange:actualRange:),
+                substring as extern "C-unwind" fn(_, _, _, _) -> _,
+            );
+            builder.add_method(sel!(characterIndexForPoint:), character_index as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(
+                sel!(firstRectForCharacterRange:actualRange:),
+                first_rect as extern "C-unwind" fn(_, _, _, _) -> _,
+            );
+            builder.add_method(sel!(doCommandBySelector:), do_command as extern "C-unwind" fn(_, _, _));
+        }
+    }
+}
+
+/// The view as a drag destination: files, text or a link dragged in from another app (Finder, Safari) go to the
+/// page as a drag over it, then a drop (the engine's `drop`); what the page says it would do comes back for the
+/// pointer's badge.
+mod dropping {
+    use super::*;
+
+    /// The pasteboard types a page takes dropped.
+    pub(super) const TYPES: [&str; 3] = ["public.file-url", "public.url", "public.utf8-plain-text"];
+
+    /// The drag's files, link and text, read from its pasteboard.
+    fn carried(info: *mut AnyObject) -> (Vec<String>, Option<String>, Option<String>) {
+        let mut files = Vec::new();
+        let mut link = None;
+        // SAFETY: AppKit on the main thread, reading the drag's pasteboard while AppKit hands it over.
+        unsafe {
+            let pasteboard: *mut AnyObject = msg_send![info, draggingPasteboard];
+            let classes: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
+            let urls: *mut AnyObject =
+                msg_send![pasteboard, readObjectsForClasses: classes, options: std::ptr::null_mut::<AnyObject>()];
+            let count: usize = if urls.is_null() { 0 } else { msg_send![urls, count] };
+            for index in 0..count {
+                let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
+                let file: bool = msg_send![url, isFileURL];
+                if file {
+                    let path: *mut AnyObject = msg_send![url, path];
+                    files.push(super::input_method_text(path));
+                } else if link.is_none() {
+                    let text: *mut AnyObject = msg_send![url, absoluteString];
+                    link = Some(super::input_method_text(text));
+                }
+            }
+            let kind = NSString::from_str(TYPES[2]);
+            let text: *mut AnyObject = msg_send![pasteboard, stringForType: &*kind];
+            let text = (!text.is_null()).then(|| super::input_method_text(text)).filter(|text| !text.is_empty());
+            (files, link, text)
+        }
+    }
+
+    /// Hands the drag's step to the page: its spot, what it carries (entering), and what its source allows.
+    fn step(view: &AnyObject, action: &str, info: *mut AnyObject) -> usize {
+        let Some(page) = of(view) else { return 0 };
+        // SAFETY: AppKit on the main thread, with the dragging info AppKit is handing the view.
+        let (at, allowed): (NSPoint, usize) = unsafe {
+            let location: NSPoint = msg_send![info, draggingLocation];
+            (
+                msg_send![view, convertPoint: location, fromView: std::ptr::null_mut::<AnyObject>()],
+                msg_send![info, draggingSourceOperationMask],
+            )
+        };
+        let mut request =
+            json!({ "op": "drop", "tab": page.1, "action": action, "x": at.x, "y": at.y, "ops": allowed & 0x3f });
+        if action == "enter" {
+            let (files, link, text) = carried(info);
+            request["files"] = json!(files);
+            if let Some(link) = link {
+                request["url"] = json!(link);
+            }
+            if let Some(text) = text {
+                request["text"] = json!(text);
+            }
+            page.0.borrow_mut().drop_operation = allowed & 1;
+        }
+        if let (Ok(Some(answer)), Some(cx)) = (send(request, true), cx()) {
+            let shared = page.0.clone();
+            cx.spawn(async move |_| {
+                if let Ok(Ok(answer)) = answer.await {
+                    shared.borrow_mut().drop_operation = answer["operation"].as_u64().unwrap_or(0) as usize;
+                }
+            })
+            .detach();
+        }
+        page.0.borrow().drop_operation
+    }
+
+    extern "C-unwind" fn entered(this: &AnyObject, _: Sel, info: *mut AnyObject) -> usize {
+        step(this, "enter", info)
+    }
+
+    extern "C-unwind" fn updated(this: &AnyObject, _: Sel, info: *mut AnyObject) -> usize {
+        step(this, "over", info)
+    }
+
+    extern "C-unwind" fn exited(this: &AnyObject, _: Sel, info: *mut AnyObject) {
+        step(this, "leave", info);
+    }
+
+    extern "C-unwind" fn prepare(_: &AnyObject, _: Sel, _: *mut AnyObject) -> Bool {
+        Bool::YES
+    }
+
+    extern "C-unwind" fn perform(this: &AnyObject, _: Sel, info: *mut AnyObject) -> Bool {
+        step(this, "drop", info);
+        Bool::YES
+    }
+
+    pub(super) fn add(builder: &mut ClassBuilder) {
+        // SAFETY: each method's signature matches NSDraggingDestination's.
+        unsafe {
+            builder.add_method(sel!(draggingEntered:), entered as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(draggingUpdated:), updated as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(draggingExited:), exited as extern "C-unwind" fn(_, _, _));
+            builder.add_method(sel!(prepareForDragOperation:), prepare as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(performDragOperation:), perform as extern "C-unwind" fn(_, _, _) -> _);
+        }
+    }
+}
+
+fn input_method_text(object: *mut AnyObject) -> String {
+    if object.is_null() {
+        return String::new();
+    }
+    // SAFETY: an NSString, read on the main thread.
+    unsafe {
+        let text: *const std::ffi::c_char = msg_send![object, UTF8String];
+        if text.is_null() { String::new() } else { std::ffi::CStr::from_ptr(text).to_string_lossy().into_owned() }
+    }
+}
+
+/// Chromium's command ids for the menu items Filo does itself (chromium/filo_chromium.mm), and its Print.
+const OPEN_LINK: i64 = 26501;
+const COPY_LINK: i64 = 26502;
+const OPEN_IMAGE: i64 = 26503;
+const COPY_IMAGE: i64 = 26504;
+const PRINT: i64 = 131;
+
+thread_local! {
+    /// The menu item a right-click menu's pick set (`FiloChromiumMenuTarget`).
+    static PICKED: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// A check's pick, by label, made without showing the menu; and the last menu's labels (`dev` builds).
+    static MENU_PICK: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_MENU: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The next right-click menu is answered with the item labelled `label` (none: shown as usual) without showing it
+/// (`dev` builds).
+#[cfg(feature = "dev")]
+pub fn pick_from_menu(label: Option<&str>) {
+    MENU_PICK.with(|pick| *pick.borrow_mut() = label.map(str::to_string));
+}
+
+/// The last right-click menu's items (`dev` builds).
+#[cfg(feature = "dev")]
+pub fn last_menu() -> Vec<String> {
+    LAST_MENU.with(|menu| menu.borrow().clone())
+}
+
+/// The target of a right-click menu's items: the pick is the item's tag.
+fn menu_target() -> Option<Retained<AnyObject>> {
+    static CLASS: OnceLock<Option<usize>> = OnceLock::new();
+    let class = CLASS.get_or_init(|| {
+        let name = c"FiloChromiumMenuTarget";
+        if let Some(class) = AnyClass::get(name) {
+            return Some(class as *const AnyClass as usize);
+        }
+        let mut builder = ClassBuilder::new(name, AnyClass::get(c"NSObject")?)?;
+        extern "C-unwind" fn pick(_: &AnyObject, _: Sel, item: *mut AnyObject) {
+            // SAFETY: the NSMenuItem AppKit hands its action.
+            let tag: isize = unsafe { msg_send![item, tag] };
+            PICKED.with(|picked| picked.set(Some(tag as i64)));
+        }
+        // SAFETY: the action's signature.
+        unsafe {
+            builder.add_method(sel!(pick:), pick as extern "C-unwind" fn(_, _, _));
+        }
+        Some(builder.register() as *const AnyClass as usize)
+    });
+    let class = (*class)?;
+    // SAFETY: a registered class; the target is returned retained.
+    unsafe {
+        let class = &*(class as *const AnyClass);
+        msg_send![class, new]
+    }
+}
+
+/// A right-click menu (the engine's `menu` event) shown as a native one where the page was clicked, for the user's own
+/// page on screen: the command picked. None for a page off the screen or an agent's at work (its right-click is for
+/// the page's own menu, which this one would cover).
+fn context_menu(view: *mut AnyObject, message: &Value) -> Option<i64> {
+    // SAFETY: the view is alive while its page is (the tab holds both), on the main thread.
+    let view_ref = unsafe { &*view };
+    let items = message["items"].as_array().cloned().unwrap_or_default();
+    // "&Back" is Back, "Save && Close" Save & Close.
+    let label = |item: &Value| {
+        item["label"].as_str().unwrap_or_default().replace("&&", "\u{1}").replace('&', "").replace('\u{1}', "&")
+    };
+    LAST_MENU.with(|menu| {
+        *menu.borrow_mut() =
+            items.iter().map(|item| if item["separator"] == true { "-".to_string() } else { label(item) }).collect();
+    });
+    if let Some(wanted) = MENU_PICK.with(|pick| pick.borrow_mut().take()) {
+        return items.iter().find(|item| label(item) == wanted).and_then(|item| item["id"].as_i64());
+    }
+    if native::parked(view_ref) || super::tab_of_view(view).is_some_and(|tab| tab.working()) {
+        return None;
+    }
+    let target = menu_target()?;
+    PICKED.with(|picked| picked.set(None));
+    // SAFETY: AppKit on the main thread; the menu and its items are retained here while it shows (modally, until a
+    // pick or a click away).
+    unsafe {
+        let menu: Retained<AnyObject> = msg_send![class!(NSMenu), new];
+        let _: () = msg_send![&*menu, setAutoenablesItems: false];
+        for item in &items {
+            if item["separator"] == true {
+                let separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+                let _: () = msg_send![&*menu, addItem: separator];
+                continue;
+            }
+            let title = NSString::from_str(&label(item));
+            let key = NSString::from_str("");
+            let allocated: Allocated<AnyObject> = msg_send![class!(NSMenuItem), alloc];
+            let entry: Retained<AnyObject> =
+                msg_send![allocated, initWithTitle: &*title, action: sel!(pick:), keyEquivalent: &*key];
+            let _: () = msg_send![&*entry, setTarget: &*target];
+            let _: () = msg_send![&*entry, setTag: item["id"].as_i64().unwrap_or(-1) as isize];
+            let _: () = msg_send![&*entry, setEnabled: item["enabled"] != false];
+            if item["checked"] == true {
+                let _: () = msg_send![&*entry, setState: 1isize];
+            }
+            let _: () = msg_send![&*menu, addItem: &*entry];
+        }
+        let at = NSPoint::new(message["x"].as_f64().unwrap_or(0.), message["y"].as_f64().unwrap_or(0.));
+        let _: Bool = msg_send![&*menu, popUpMenuPositioningItem: std::ptr::null_mut::<AnyObject>(), atLocation: at, inView: view];
+    }
+    PICKED.with(std::cell::Cell::take)
+}
+
+/// Puts `text` on the clipboard (a link's or a picture's address).
+fn copy_text(text: &str) {
+    // SAFETY: AppKit on the main thread.
+    unsafe {
+        let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        let _: isize = msg_send![pasteboard, clearContents];
+        let text = NSString::from_str(text);
+        let kind = NSString::from_str("public.utf8-plain-text");
+        let _: Bool = msg_send![pasteboard, setString: &*text, forType: &*kind];
+    }
 }
 
 fn new_view(width: f64, height: f64) -> Option<Retained<AnyObject>> {
@@ -887,6 +1421,10 @@ fn new_view(width: f64, height: f64) -> Option<Retained<AnyObject>> {
         if let Some(area) = area {
             let _: () = msg_send![&*view, addTrackingArea: &*area];
         }
+        let types: Vec<Retained<NSString>> = dropping::TYPES.iter().map(|kind| NSString::from_str(kind)).collect();
+        let types: Vec<&NSString> = types.iter().map(|kind| &**kind).collect();
+        let types = objc2_foundation::NSArray::from_slice(&types);
+        let _: () = msg_send![&*view, registerForDraggedTypes: &*types];
         Some(view)
     }
 }
