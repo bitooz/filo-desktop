@@ -148,7 +148,7 @@ impl ChatFixture {
             // Started 14 hours ago; its second round has run 6 minutes. Its title is longer than a row.
             { "taskId": "task-sidebar", "tool": "claude-code", "title": "Restore docked Working sidebar and keep each task on one line", "status": "running",
               "now": "Running cargo test --bin filo -- working_panel coding_sessions", "pending": 0.0, "createdAt": now - 14. * 60. * MINUTE,
-              "updatedAt": now - MINUTE, "roundStartedAt": now - 6. * MINUTE, "repoName": "notes-app", "branch": "main",
+              "updatedAt": now - MINUTE, "requestStartedAt": now - 6. * MINUTE, "repoName": "notes-app", "branch": "main",
               "model": "claude-opus-5-5", "computer": { "name": "Sam's MacBook", "lastSeenAt": now - MINUTE } },
         ]))
         .expect("fixture sessions");

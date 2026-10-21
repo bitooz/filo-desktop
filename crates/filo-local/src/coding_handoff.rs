@@ -133,9 +133,13 @@ pub struct Handoff {
     pub stop_requested: bool,
     pub round_started_at: Option<i64>,
     pub created_at: i64,
+    /// When its current request started: a round taking the brief or a follow-up (`start_round`), or the agent's note
+    /// while it waited on background work (`new_request`); a round carrying on (`carry_on_round`) leaves it. None for a
+    /// hand-off from before it was kept.
+    pub request_started_at: Option<i64>,
 }
 
-const HANDOFF_COLUMNS: &str = "task_id, chat_id, agent_id, speaker, goal, done_when, notes, look_only, stop_requested, round_started_at, created_at";
+const HANDOFF_COLUMNS: &str = "task_id, chat_id, agent_id, speaker, goal, done_when, notes, look_only, stop_requested, round_started_at, created_at, request_started_at";
 
 fn handoff_row(row: &Row) -> rusqlite::Result<Handoff> {
     Ok(Handoff {
@@ -150,6 +154,7 @@ fn handoff_row(row: &Row) -> rusqlite::Result<Handoff> {
         stop_requested: row.get::<_, i64>(8)? != 0,
         round_started_at: row.get(9)?,
         created_at: row.get(10)?,
+        request_started_at: row.get(11)?,
     })
 }
 
@@ -176,7 +181,7 @@ pub fn create(db: &Db, task_id: &str, new: &NewHandoff, now: i64) -> Result<Task
     db.write(|tx| {
         tx.execute(
             &format!(
-                "INSERT INTO coding_handoffs ({HANDOFF_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9)"
+                "INSERT INTO coding_handoffs ({HANDOFF_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, NULL)"
             ),
             params![
                 task_id,
@@ -293,7 +298,7 @@ pub fn adopt(
 ) -> Result<(), String> {
     db.write(|tx| {
         tx.execute(
-            &format!("INSERT INTO coding_handoffs ({HANDOFF_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, 0, 0, NULL, ?6) ON CONFLICT (task_id) DO NOTHING"),
+            &format!("INSERT INTO coding_handoffs ({HANDOFF_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, 0, 0, NULL, ?6, NULL) ON CONFLICT (task_id) DO NOTHING"),
             params![task.id, chat_id, agent_id, speaker, task.title, now],
         )
     })
@@ -336,15 +341,38 @@ pub fn proof_dir(data_root: &Path, task_id: &str, round: i64) -> PathBuf {
     data_root.join("coding").join("proof").join(task_id).join(format!("round-{round}"))
 }
 
-/// A round starts: its row, and when (the chat's "Working · 4m").
+/// A round taking a new request (the brief, or a follow-up) starts: its row, and when, for the round and for the
+/// request ("Working · 4m" counts from the request's, `working_since`).
 pub fn start_round(db: &Db, task_id: &str, round: i64, proof_dir: &Path, now: i64) -> Result<(), String> {
+    begin_round(db, task_id, round, proof_dir, now, true)
+}
+
+/// A round carrying on the same request (the tool picking up after background work) starts: the request's time goes
+/// on.
+pub fn carry_on_round(db: &Db, task_id: &str, round: i64, proof_dir: &Path, now: i64) -> Result<(), String> {
+    begin_round(db, task_id, round, proof_dir, now, false)
+}
+
+fn begin_round(db: &Db, task_id: &str, round: i64, proof_dir: &Path, now: i64, request: bool) -> Result<(), String> {
     db.write(|tx| {
         tx.execute(
             &format!("INSERT INTO coding_rounds ({ROUND_COLUMNS}) VALUES (?1, ?2, 'running', NULL, NULL, ?3, ?4, NULL)
              ON CONFLICT (task_id, round) DO UPDATE SET status = 'running', result = NULL, error = NULL, proof_dir = ?3, started_at = ?4, finished_at = NULL"),
             params![task_id, round, proof_dir.display().to_string(), now],
         )?;
-        tx.execute("UPDATE coding_handoffs SET round_started_at = ?2 WHERE task_id = ?1", params![task_id, now])
+        tx.execute("UPDATE coding_handoffs SET round_started_at = ?2 WHERE task_id = ?1", params![task_id, now])?;
+        if request {
+            tx.execute("UPDATE coding_handoffs SET request_started_at = ?2 WHERE task_id = ?1", params![task_id, now])?;
+        }
+        Ok(())
+    })
+}
+
+/// The agent gave the task new direction while it waited on background work (its message, kept as a note): a new
+/// request, so its time starts again.
+pub fn new_request(db: &Db, task_id: &str, now: i64) -> Result<(), String> {
+    db.write(|tx| {
+        tx.execute("UPDATE coding_handoffs SET request_started_at = ?2 WHERE task_id = ?1", params![task_id, now])
     })
     .map(|_| ())
 }
@@ -445,28 +473,18 @@ pub fn worked_ms(db: &Db, task_id: &str) -> Result<Option<i64>, String> {
 }
 
 /// When an unfinished task's "Working …" counts from, the same in the Agents list, the pet's tray and the chat's side
-/// panel: the start of the round that took its current request (the brief, or the conversation's latest follow-up),
-/// so a follow-up starts at 0, while a round that only carries on that request (the tool picking up after background
-/// work) keeps counting from it, the wait included. coding_rounds doesn't say why a round started: it took a new
-/// request when one of the owner's steps that isn't a note (`coding::follow_up`'s message, or the brief) came after the
-/// round before it started; notes go to the tool mid-round, and a carried-on round has none. "Done · …" (`worked_ms`)
-/// still counts every round. The round's start (`round_started_at`), else the task's creation, for a task without its
-/// rounds recorded.
-pub fn working_since(db: &Db, task: &Task, owner: &Handoff) -> Result<i64, String> {
-    let rounds = rounds(db, &task.id)?;
-    if rounds.is_empty() {
-        return Ok(owner.round_started_at.unwrap_or(task.created_at));
-    }
-    let asked: Vec<i64> = db.with(|conn| {
-        conn.prepare_cached("SELECT at FROM coding_events WHERE task_id = ?1 AND source = 'owner' AND kind IS NULL")?
-            .query_map([&task.id], |row| row.get(0))?
-            .collect()
-    })?;
-    let request = rounds
-        .windows(2)
-        .rposition(|pair| asked.iter().any(|at| *at > pair[0].started_at && *at <= pair[1].started_at))
-        .map_or(0, |before| before + 1);
-    Ok(rounds[request].started_at)
+/// panel: when its current request started (`Handoff::request_started_at`), so a follow-up starts at 0, while a round
+/// that only carries on the request (the tool picking up after background work) keeps counting, the wait included.
+/// "Done · …" (`worked_ms`) still counts every round. For a hand-off from before the request's time was kept, its
+/// round's start; else the task's creation.
+pub fn working_since(task: &Task, owner: &Handoff) -> i64 {
+    owner.request_started_at.or(owner.round_started_at).unwrap_or(task.created_at)
+}
+
+/// `working_since` for the rows that say how long the tool has run (`requestStartedAt`: the chat's side panel, the
+/// agent's view of the task): only while it runs, and never made up from the task's creation.
+pub fn shown_request_start(task: &Task, owner: &Handoff) -> Option<i64> {
+    (task.status == "running" && owner.round_started_at.is_some()).then(|| working_since(task, owner))
 }
 
 /// A file the tool saved in a round's proof folder.
@@ -601,6 +619,14 @@ pub fn ensure_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     )?;
     if !has {
         conn.execute_batch("ALTER TABLE coding_requests ADD COLUMN option_notes TEXT")?;
+    }
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('coding_handoffs') WHERE name = 'request_started_at')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE coding_handoffs ADD COLUMN request_started_at INTEGER")?;
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS coding_asks (
@@ -1537,8 +1563,8 @@ pub fn status_json(db: &Db, task: &Task, handoff: Option<&Handoff>, recent: usiz
     }
     if let Some(handoff) = handoff {
         row["onlyLooks"] = json!(handoff.look_only);
-        if handoff.round_started_at.is_some() && task.status == "running" {
-            row["roundStartedAt"] = json!(working_since(db, task, handoff)?);
+        if let Some(started) = shown_request_start(task, handoff) {
+            row["requestStartedAt"] = json!(started);
         }
     }
     if let Some(round) = latest_round(db, &task.id)? {
@@ -1603,7 +1629,7 @@ mod tests {
     fn a_task_another_process_ends_reads_ended_after_the_chats_rows_read_it() {
         let path = crate::db::tests::temp_path("handoff-snapshot");
         let (app, worker) = (Db::open(&path).unwrap(), Db::open(&path).unwrap());
-        let (task, owner) = task_with_handoff(&app, "chat-1");
+        let (task, _) = task_with_handoff(&app, "chat-1");
         start_round(&app, &task.id, 1, Path::new("/p"), 10).unwrap();
         coding::set_running(&app, &task.id, 10).unwrap();
         coding::add_event(&app, &task.id, 11, &coding::Step::said("Working on it")).unwrap();
@@ -1619,7 +1645,7 @@ mod tests {
             )
         };
         assert_eq!(read(&app).0, "running");
-        assert_eq!(working_since(&app, &task, &owner).unwrap(), 10);
+        assert_eq!(working_since(&task, &get(&app, &task.id).unwrap().unwrap()), 10);
         // The round's worker ends it.
         finish_round(&worker, &task.id, 1, "done", Some("Done"), None, 20).unwrap();
         coding::finish_round(&worker, &task.id, "done", None, Some("Done"), 20).unwrap();
@@ -1714,18 +1740,27 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let (task, owner) = task_with_handoff(&db, "chat-1");
         const MIN: i64 = 60_000;
-        let since = || working_since(&db, &task, &get(&db, &task.id).unwrap().unwrap()).unwrap();
-        // Queued, no round yet: from its creation.
-        assert_eq!(working_since(&db, &task, &owner).unwrap(), task.created_at);
+        let owner_now = || get(&db, &task.id).unwrap().unwrap();
+        let task_now = || coding::task(&db, &task.id).unwrap().unwrap();
+        let since = || working_since(&task, &owner_now());
+        let shown = || shown_request_start(&task_now(), &owner_now());
+        // Queued, no round yet: from its creation, and the side panel shows no time.
+        assert_eq!(working_since(&task, &owner), task.created_at);
+        assert_eq!(shown(), None);
         // The brief's round from 10 min works an hour, then waits on background work (Monitoring): the time goes on
         // through the wait.
         start_round(&db, &task.id, 1, Path::new("/p"), 10 * MIN).unwrap();
         coding::set_running(&db, &task.id, 10 * MIN).unwrap();
-        assert_eq!(since(), 10 * MIN);
+        assert_eq!((since(), shown()), (10 * MIN, Some(10 * MIN)));
         finish_round(&db, &task.id, 1, "monitoring", Some("Waiting on the tests"), None, 70 * MIN).unwrap();
-        assert_eq!(since(), 10 * MIN);
+        coding::set_monitoring(&db, &task.id, Some("Waiting on the tests"), "Monitoring", true, 70 * MIN).unwrap();
+        assert_eq!((since(), shown()), (10 * MIN, None));
         // The tool picks up at 75 min, round 2: the same request, so "Working 1h 8m" at 78 min, not "Working 3m".
-        start_round(&db, &task.id, 2, Path::new("/p"), 75 * MIN).unwrap();
+        carry_on_round(&db, &task.id, 2, Path::new("/p"), 75 * MIN).unwrap();
+        coding::set_running(&db, &task.id, 75 * MIN).unwrap();
+        assert_eq!((since(), shown()), (10 * MIN, Some(10 * MIN)));
+        // However much of its history is trimmed (coding::add_event keeps the latest steps): the start is kept.
+        db.write(|tx| tx.execute("DELETE FROM coding_events WHERE task_id = ?1", [&task.id])).unwrap();
         assert_eq!(since(), 10 * MIN);
         finish_round(&db, &task.id, 2, "done", Some("Done"), None, 78 * MIN).unwrap();
         coding::finish_round(&db, &task.id, "done", None, Some("Done"), 78 * MIN).unwrap();
@@ -1733,14 +1768,24 @@ mod tests {
         coding::follow_up(&db, &task.id, "Also the menu", 100 * MIN).unwrap();
         start_round(&db, &task.id, 3, Path::new("/p"), 100 * MIN).unwrap();
         assert_eq!(since(), 100 * MIN);
-        // A note mid-round, then background work and the tool carrying on: still the follow-up's time.
+        // A note while it works is read at its next step: still the follow-up's time.
         add_note(&db, &task.id, "The user wants it blue", 105 * MIN).unwrap();
-        finish_round(&db, &task.id, 3, "monitoring", Some("Waiting"), None, 110 * MIN).unwrap();
-        start_round(&db, &task.id, 4, Path::new("/p"), 115 * MIN).unwrap();
         assert_eq!(since(), 100 * MIN);
+        // One while it waits on background work is new direction (coding_mcp.rs `continue_task`): it starts again,
+        // and the tool carrying on with it keeps that.
+        finish_round(&db, &task.id, 3, "monitoring", Some("Waiting"), None, 110 * MIN).unwrap();
+        new_request(&db, &task.id, 112 * MIN).unwrap();
+        carry_on_round(&db, &task.id, 4, Path::new("/p"), 115 * MIN).unwrap();
+        assert_eq!(since(), 112 * MIN);
         // "Done · …" still counts every round: 60 + 3 + 10 min worked, and round 4's 5.
         finish_round(&db, &task.id, 4, "done", Some("Done"), None, 120 * MIN).unwrap();
         assert_eq!(worked_ms(&db, &task.id).unwrap(), Some(78 * MIN));
+        // A hand-off from before the request's start was kept: its round's.
+        db.write(|tx| {
+            tx.execute("UPDATE coding_handoffs SET request_started_at = NULL WHERE task_id = ?1", [&task.id])
+        })
+        .unwrap();
+        assert_eq!(since(), 115 * MIN);
     }
 
     #[test]

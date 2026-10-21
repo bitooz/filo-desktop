@@ -591,6 +591,10 @@ fn continue_task(
     };
     if !finished {
         handoff::add_note(db, &task.id, message, now)?;
+        // New direction while it waits on background work: its time starts again, as a follow-up's does.
+        if task.status == "monitoring" {
+            handoff::new_request(db, &task.id, now)?;
+        }
         let note = if task.status == "monitoring" {
             "It's waiting on background work: your note reaches it now, and it carries on with it."
         } else {
@@ -801,6 +805,36 @@ mod tests {
         db.write(|tx| tx.execute("UPDATE coding_tasks SET status = 'done', rounds = 5 WHERE id = ?1", [&id])).unwrap();
         assert!(next(Some("low")).unwrap_err().contains("userSaidSo"));
         assert_eq!(effort().as_deref(), Some("high"));
+        drop(db);
+        std::fs::remove_dir_all(store.root()).ok();
+    }
+
+    #[test]
+    fn a_message_while_it_waits_on_background_work_starts_its_time_again() {
+        let store = temp_store("coding-mcp-new-request");
+        let chat = store.create_chat(Engine::Claude).unwrap();
+        let target = target(&store, &chat.id);
+        let db = Db::open(&target.db).unwrap();
+        let folder = store.root().join("app");
+        std::fs::create_dir_all(&folder).unwrap();
+        let started = reply(call(
+            &target,
+            "start_work",
+            &json!({ "title": "Wrap table text", "goal": "Long table cells wrap", "doneWhen": "A long cell wraps", "changes": true, "project": folder.display().to_string() }),
+        ));
+        let id = started["taskId"].as_str().unwrap().to_string();
+        let request_started = || handoff::get(&db, &id).unwrap().unwrap().request_started_at;
+        handoff::start_round(&db, &id, 1, &folder, 10).unwrap();
+        coding::set_running(&db, &id, 10).unwrap();
+        let tell =
+            |message: &str| reply(call(&target, "tell_coding_task", &json!({ "taskId": id, "message": message })));
+        // While it works, a note is read at its next step: the same request.
+        tell("Keep the header too");
+        assert_eq!(request_started(), Some(10));
+        // While it waits on background work, a message is new direction: its time starts again.
+        coding::set_monitoring(&db, &id, None, "Monitoring", true, 20).unwrap();
+        assert!(tell("Then do the footer")["note"].as_str().unwrap().contains("waiting on background work"));
+        assert!(request_started().unwrap() > 20);
         drop(db);
         std::fs::remove_dir_all(store.root()).ok();
     }

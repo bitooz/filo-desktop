@@ -397,7 +397,7 @@ impl Local {
         let mut since: HashMap<String, f64> = HashMap::new();
         let Ok(db) = self.db() else { return since };
         for (task, owner) in handoff::unfinished(db).unwrap_or_default() {
-            let started = handoff::working_since(db, &task, &owner).unwrap_or(task.created_at) as f64;
+            let started = handoff::working_since(&task, &owner) as f64;
             let entry = since.entry(owner.chat_id).or_insert(started);
             *entry = entry.min(started);
         }
@@ -413,7 +413,7 @@ impl Local {
                     let db = self.db()?;
                     let mut chats: Vec<(String, f64, Vec<String>)> = Vec::new();
                     for (task, owner) in handoff::unfinished(db)? {
-                        let started = handoff::working_since(db, &task, &owner)? as f64;
+                        let started = handoff::working_since(&task, &owner) as f64;
                         match chats.iter_mut().find(|(chat, _, _)| *chat == owner.chat_id) {
                             Some((_, since, agents)) => {
                                 *since = since.min(started);
@@ -551,9 +551,8 @@ impl Local {
                     .map_or_else(|| model.clone(), |option| option.label.clone());
                 row["model"] = json!(label);
             }
-            // When its "Working · 4m" counts from: the current request's start, as the Agents list's and the tray's.
-            if owner.round_started_at.is_some() && task.status == "running" {
-                row["roundStartedAt"] = json!(handoff::working_since(db, &task, &owner)? as f64);
+            if let Some(started) = handoff::shown_request_start(&task, &owner) {
+                row["requestStartedAt"] = json!(started as f64);
             }
             // How long it has worked, for "Done · 18m" once it's finished.
             if let Some(worked) = handoff::worked_ms(db, &task.id)? {
@@ -586,7 +585,7 @@ impl Local {
                     json!({ "requestId": request.id, "kind": request.kind, "question": question, "options": options })
                 });
             let mut row = tray_row(&task, &owner, group.as_deref());
-            row["since"] = json!(handoff::working_since(db, &task, &owner)? as f64);
+            row["since"] = json!(handoff::working_since(&task, &owner) as f64);
             row["ask"] = ask.unwrap_or(Value::Null);
             rows.push(row);
         }
@@ -872,7 +871,7 @@ impl Host for RoundHost<'_> {
         let (db, id, now) = (self.db, self.task.id.as_str(), now_ms());
         if self.waiting {
             self.round += 1;
-            let _ = handoff::start_round(db, id, self.round, &self.proof, now);
+            let _ = handoff::carry_on_round(db, id, self.round, &self.proof, now);
             self.waiting = false;
             self.followed = true;
         }

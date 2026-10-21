@@ -1073,7 +1073,7 @@ mod tests {
         assert_eq!(status_time("Needs you", Some(0.), 65. * minute), "Needs you · 1h 5m");
         assert_eq!(status_time("Paused", None, 4. * minute), "Paused");
         // Each row carries when its work started: the coding task's current round's start.
-        let running = CodingSession { round_started_at: Some(5_000.), ..session("s", "running", 0.) };
+        let running = CodingSession { request_started_at: Some(5_000.), ..session("s", "running", 0.) };
         assert_eq!(here_rows(&[running]).iter().map(|row| row.since).collect::<Vec<_>>(), [Some(5_000.)]);
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
             now: now.into(),
             pending,
             created_at: 1_000.,
-            round_started_at: Some(1_000.),
+            request_started_at: Some(1_000.),
             ..session("t", status, 0.)
         }
     }
@@ -1233,7 +1233,7 @@ mod tests {
         let hour = 60. * minute;
         let at = |status: &str, round: Option<f64>| CodingSession {
             created_at: 0.,
-            round_started_at: round,
+            request_started_at: round,
             ..coding(status, "Running npm test", 0.)
         };
         // A new task: queued five minutes with no time, then claimed at 5m; at 7m it has worked 2m, not 7m.
@@ -1260,7 +1260,7 @@ mod tests {
         let full: CodingSession = serde_json::from_value(serde_json::json!({
             "taskId": "f", "tool": "claude-code", "title": "Add weekly and monthly usage limits", "status": "running", "now": "Running tests",
             "pending": 0.0, "createdAt": 1.0, "updatedAt": 1.0, "repoName": "notes-app", "branch": "main",
-            "model": "claude-opus-5-5", "roundStartedAt": 1.0, "computer": { "name": "Sam's MacBook", "lastSeenAt": 1.0 },
+            "model": "claude-opus-5-5", "requestStartedAt": 1.0, "computer": { "name": "Sam's MacBook", "lastSeenAt": 1.0 },
         }))
         .unwrap();
         let row = here_rows(&[full]).remove(0);
