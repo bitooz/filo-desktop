@@ -551,8 +551,9 @@ impl Local {
                     .map_or_else(|| model.clone(), |option| option.label.clone());
                 row["model"] = json!(label);
             }
-            if let Some(started) = owner.round_started_at.filter(|_| task.status == "running") {
-                row["roundStartedAt"] = json!(started as f64);
+            // When its "Working · 4m" counts from: the current request's start, as the Agents list's and the tray's.
+            if owner.round_started_at.is_some() && task.status == "running" {
+                row["roundStartedAt"] = json!(handoff::working_since(db, &task, &owner)? as f64);
             }
             // How long it has worked, for "Done · 18m" once it's finished.
             if let Some(worked) = handoff::worked_ms(db, &task.id)? {

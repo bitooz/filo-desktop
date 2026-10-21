@@ -444,18 +444,29 @@ pub fn worked_ms(db: &Db, task_id: &str) -> Result<Option<i64>, String> {
     Ok((!worked.is_empty()).then(|| worked.iter().sum()))
 }
 
-/// When an unfinished task's "Working …" counts from (the Agents list, the pet's tray): its latest round's start, set
-/// back by what the rounds before it worked (`round_worked_ms`, as `worked_ms` adds them up), so the time carries on
-/// from the task's total when a new round starts (the tool picking up after background work, a follow-up) rather than
-/// going back to 0, and ends near "Done · …". Like that, the time between rounds isn't counted. The round's start
-/// (`round_started_at`), else the task's creation, for a task without its rounds recorded.
+/// When an unfinished task's "Working …" counts from, the same in the Agents list, the pet's tray and the chat's side
+/// panel: the start of the round that took its current request (the brief, or the conversation's latest follow-up),
+/// so a follow-up starts at 0, while a round that only carries on that request (the tool picking up after background
+/// work) keeps counting from it, the wait included. coding_rounds doesn't say why a round started: it took a new
+/// request when one of the owner's steps that isn't a note (`coding::follow_up`'s message, or the brief) came after the
+/// round before it started; notes go to the tool mid-round, and a carried-on round has none. "Done · …" (`worked_ms`)
+/// still counts every round. The round's start (`round_started_at`), else the task's creation, for a task without its
+/// rounds recorded.
 pub fn working_since(db: &Db, task: &Task, owner: &Handoff) -> Result<i64, String> {
     let rounds = rounds(db, &task.id)?;
-    let Some((latest, earlier)) = rounds.split_last() else {
+    if rounds.is_empty() {
         return Ok(owner.round_started_at.unwrap_or(task.created_at));
-    };
-    let requests = requests_for_task(db, &task.id)?;
-    Ok(latest.started_at - earlier.iter().filter_map(|round| round_worked_ms(round, &requests)).sum::<i64>())
+    }
+    let asked: Vec<i64> = db.with(|conn| {
+        conn.prepare_cached("SELECT at FROM coding_events WHERE task_id = ?1 AND source = 'owner' AND kind IS NULL")?
+            .query_map([&task.id], |row| row.get(0))?
+            .collect()
+    })?;
+    let request = rounds
+        .windows(2)
+        .rposition(|pair| asked.iter().any(|at| *at > pair[0].started_at && *at <= pair[1].started_at))
+        .map_or(0, |before| before + 1);
+    Ok(rounds[request].started_at)
 }
 
 /// A file the tool saved in a round's proof folder.
@@ -1526,8 +1537,8 @@ pub fn status_json(db: &Db, task: &Task, handoff: Option<&Handoff>, recent: usiz
     }
     if let Some(handoff) = handoff {
         row["onlyLooks"] = json!(handoff.look_only);
-        if let Some(at) = handoff.round_started_at.filter(|_| task.status == "running") {
-            row["roundStartedAt"] = json!(at);
+        if handoff.round_started_at.is_some() && task.status == "running" {
+            row["roundStartedAt"] = json!(working_since(db, task, handoff)?);
         }
     }
     if let Some(round) = latest_round(db, &task.id)? {
@@ -1699,27 +1710,37 @@ mod tests {
     }
 
     #[test]
-    fn working_carries_on_from_the_tasks_time_when_a_round_follows() {
+    fn working_counts_from_the_current_request_and_carries_on_through_its_rounds() {
         let db = Db::in_memory().unwrap();
         let (task, owner) = task_with_handoff(&db, "chat-1");
         const MIN: i64 = 60_000;
+        let since = || working_since(&db, &task, &get(&db, &task.id).unwrap().unwrap()).unwrap();
         // Queued, no round yet: from its creation.
         assert_eq!(working_since(&db, &task, &owner).unwrap(), task.created_at);
-        // Round 1 from 10 min works 60 min, then waits on background work (Monitoring): still the round's start, so
-        // the time goes on through the wait.
+        // The brief's round from 10 min works an hour, then waits on background work (Monitoring): the time goes on
+        // through the wait.
         start_round(&db, &task.id, 1, Path::new("/p"), 10 * MIN).unwrap();
-        assert_eq!(working_since(&db, &task, &owner).unwrap(), 10 * MIN);
+        coding::set_running(&db, &task.id, 10 * MIN).unwrap();
+        assert_eq!(since(), 10 * MIN);
         finish_round(&db, &task.id, 1, "monitoring", Some("Waiting on the tests"), None, 70 * MIN).unwrap();
-        assert_eq!(working_since(&db, &task, &owner).unwrap(), 10 * MIN);
-        // The tool picks up at 75 min, round 2: "Working 1h" carries on (1h 3m at 78 min), not "Working 3m"; the wait
-        // between isn't counted, as "Done · …" doesn't count it.
+        assert_eq!(since(), 10 * MIN);
+        // The tool picks up at 75 min, round 2: the same request, so "Working 1h 8m" at 78 min, not "Working 3m".
         start_round(&db, &task.id, 2, Path::new("/p"), 75 * MIN).unwrap();
-        let owner = get(&db, &task.id).unwrap().unwrap();
-        let since = working_since(&db, &task, &owner).unwrap();
-        assert_eq!((since, 78 * MIN - since), (15 * MIN, 63 * MIN));
-        // It ends at 78 min: "Done · 1h 3m", the same count.
+        assert_eq!(since(), 10 * MIN);
         finish_round(&db, &task.id, 2, "done", Some("Done"), None, 78 * MIN).unwrap();
-        assert_eq!(worked_ms(&db, &task.id).unwrap(), Some(78 * MIN - since));
+        coding::finish_round(&db, &task.id, "done", None, Some("Done"), 78 * MIN).unwrap();
+        // The agent follows up at 100 min: its round starts at 0.
+        coding::follow_up(&db, &task.id, "Also the menu", 100 * MIN).unwrap();
+        start_round(&db, &task.id, 3, Path::new("/p"), 100 * MIN).unwrap();
+        assert_eq!(since(), 100 * MIN);
+        // A note mid-round, then background work and the tool carrying on: still the follow-up's time.
+        add_note(&db, &task.id, "The user wants it blue", 105 * MIN).unwrap();
+        finish_round(&db, &task.id, 3, "monitoring", Some("Waiting"), None, 110 * MIN).unwrap();
+        start_round(&db, &task.id, 4, Path::new("/p"), 115 * MIN).unwrap();
+        assert_eq!(since(), 100 * MIN);
+        // "Done · …" still counts every round: 60 + 3 + 10 min worked, and round 4's 5.
+        finish_round(&db, &task.id, 4, "done", Some("Done"), None, 120 * MIN).unwrap();
+        assert_eq!(worked_ms(&db, &task.id).unwrap(), Some(78 * MIN));
     }
 
     #[test]

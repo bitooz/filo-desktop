@@ -41,8 +41,8 @@ pub struct CodingSession {
     pub plain_folder: bool,
     pub branch: Option<String>,
     pub model: Option<String>,
-    /// While the tool runs: when its current round started, less any time it was paused or its question was with its
-    /// agent (`codingTasks.roundStartedAt`). None while it doesn't run, or from a backend or round without it.
+    /// While the tool runs: when its current request started (`coding_handoff::working_since`; `roundStartedAt`, its
+    /// old name). None while it doesn't run, or from a backend or round without it.
     pub round_started_at: Option<f64>,
     /// How long it has worked, in milliseconds (`coding_handoff::worked_ms`): "Done · 18m" once it's finished.
     pub worked_ms: Option<f64>,
@@ -99,9 +99,10 @@ impl CodingSession {
         (!generic).then(|| line.to_string())
     }
 
-    /// When "Working · 4m" counts from: the current round's running start, from the backend, so a second round the
-    /// next morning starts at 0 rather than counting from the task's creation, and redrawing or opening the chat again
-    /// changes nothing. Only while it works: waiting, needing the user or being checked show no time, and a running
+    /// When "Working · 4m" counts from: the start of the task's current request, from the backend
+    /// (`coding_handoff::working_since`, as the Agents list and the pet's tray), so a follow-up the next morning starts
+    /// at 0 rather than counting from the task's creation, a round carrying on after background work keeps counting, and
+    /// redrawing or opening the chat again changes nothing. Only while it works: waiting, needing the user or being checked show no time, and a running
     /// task without the field (an older backend, or a round begun before it) shows "Working" alone, never a made-up time.
     pub fn since(&self) -> Option<f64> {
         if self.pill().1 != "Working" {
