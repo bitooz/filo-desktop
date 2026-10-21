@@ -1128,7 +1128,9 @@ identity.
 **The Chromium engine** (Settings › Browser's download; "The browser") is released apart from Filo, by hand. Run
 `SIGN_IDENTITY="Developer ID Application: …" ARCHS="arm64 x86_64" ENGINE_BUILD=<n> NOTARY_KEY_PATH=… NOTARY_KEY_ID=…
 NOTARY_ISSUER=… chromium/package.sh` on a Mac with the same identity as Filo's (Filo takes only an engine signed by its
-own developer) and an `ENGINE_BUILD` above the last one, so installed engines update to it. Then run
+own developer) and an `ENGINE_BUILD` above the last one, so installed engines update to it. Apple's notarization of
+each zip takes a few minutes (about 3 for 154.0.34.1's), and the stapling after it is tried up to 5 times, a minute
+apart, as Filo's is. Then run
 `chromium/publish.sh`, which needs gh with write access: it makes the release `chromium-<version>` (never the latest)
 with the zips and swaps the feed into the release `chromium-engine`. Filos running Chromium pick it up within 6 hours. A
 new CEF is `cef` and its SHA-1s in chromium/build.sh, with ENGINE_BUILD back to 1. Each Chromium security release of

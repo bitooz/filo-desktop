@@ -32,6 +32,18 @@ notarize=""
 if [ -n "${NOTARY_KEY_PATH:-}" ] && [ "${SIGN_IDENTITY:--}" != "-" ]; then notarize=1; fi
 mkdir -p "$OUT"
 
+# Staples the notarization ticket to $1 and checks it, as scripts/package.sh does: tried up to 5 times, a minute apart,
+# so a dropped connection to Apple (stapler's exit 68) doesn't fail an engine that's already notarized.
+staple() {
+  tries=0
+  until xcrun stapler staple "$1" && xcrun stapler validate "$1"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 5 ]; then echo "Couldn't staple $1 after $tries tries" >&2; return 1; fi
+    echo "Stapling $1 failed (try $tries of 5), trying again in a minute" >&2
+    sleep 60
+  done
+}
+
 builds=""
 for arch in $ARCHS; do
   case "$arch" in aarch64) arch=arm64 ;; esac
@@ -41,8 +53,7 @@ for arch in $ARCHS; do
   ditto -c -k --keepParent "$app" "$zip"
   if [ -n "$notarize" ]; then
     xcrun notarytool submit "$zip" --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
-    xcrun stapler staple "$app"
-    xcrun stapler validate "$app"
+    staple "$app"
     rm "$zip" && ditto -c -k --keepParent "$app" "$zip"
   fi
   name=$(basename "$zip")
