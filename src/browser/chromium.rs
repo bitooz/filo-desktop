@@ -603,13 +603,17 @@ fn open_panel(multiple: bool, folder: bool) -> Vec<PathBuf> {
 /// The page shown by `view`, when it's Chromium's (native.rs asks first).
 pub fn of(view: &AnyObject) -> Option<Handle> {
     let at = view as *const AnyObject as usize;
-    PAGES.with(|pages| {
-        pages
-            .borrow()
-            .iter()
-            .find(|(_, page)| page.borrow().view == at)
-            .map(|(key, page)| Handle(page.clone(), key.clone()))
-    })
+    // As Filo quits, a closing tab's view leaves its window (`viewDidMoveToWindow`) after the pages have gone.
+    PAGES
+        .try_with(|pages| {
+            pages
+                .borrow()
+                .iter()
+                .find(|(_, page)| page.borrow().view == at)
+                .map(|(key, page)| Handle(page.clone(), key.clone()))
+        })
+        .ok()
+        .flatten()
 }
 
 pub struct Handle(Rc<RefCell<Shared>>, String);

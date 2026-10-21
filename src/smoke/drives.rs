@@ -6904,6 +6904,11 @@ pub fn open_from_env(window: &mut Window, cx: &mut Context<AppShell>) {
         cx.on_next_frame(window, |shell, window, cx| shell.open_skills(window, cx));
     } else if let Some(tab) = tab {
         cx.on_next_frame(window, move |shell, window, cx| shell.open_tab(tab, window, cx));
+    } else if kind == "browser-settings-pick" {
+        // Chromium picked as Settings › Browser's row picks it, then the page opened, mid-switch: a window another app
+        // covers draws only its first frames, so a picture of the switch going on is taken this way.
+        crate::browser::engine::choose(crate::browser::engine::Kind::Chromium, cx);
+        cx.on_next_frame(window, move |shell, window, cx| shell.push(Route::BrowserSettings, window, cx));
     } else if let Some(route) = route {
         cx.on_next_frame(window, move |shell, window, cx| shell.push(route, window, cx));
     } else if !matches!(kind.as_str(), "welcome" | "welcome-demo") {

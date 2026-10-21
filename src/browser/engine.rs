@@ -328,6 +328,9 @@ impl Engines {
         self.note = None;
         let from = current();
         eprintln!("browser: switching the engine from {} to {}", from.label(), kind.label());
+        // Its first step shows at once, and the rows wait.
+        let download = kind == Kind::Chromium && app_path().is_none();
+        self.set(Some(if download { Busy::Looking } else { Busy::CopyingLogins }), cx);
         self._switch = Some(cx.spawn(async move |this, cx| {
             let result = switch(&this, from, kind, cx).await;
             this.update(cx, |this, cx| {
@@ -401,6 +404,16 @@ async fn install(this: &WeakEntity<Engines>, release: Release, cx: &mut AsyncApp
     let build =
         release.builds.get(processor()).cloned().ok_or("There's no Chromium engine for this Mac's processor yet.")?;
     let url = if build.file.contains("://") { build.file.clone() } else { format!("{}/{}", feed(), build.file) };
+    // The zip, the engine unpacked from it (about 2.3 times its size) and room to spare.
+    let needed = build.size * 4;
+    let _ = std::fs::create_dir_all(engines_dir());
+    if let Some(free) = free_space(&engines_dir()).filter(|free| *free < needed) {
+        return Err(format!(
+            "Chromium needs about {} MB free to install, and this Mac has {} MB: free some space and pick it again.",
+            needed / 1_000_000,
+            free / 1_000_000
+        ));
+    }
     let staging = engines_dir().join(format!(".download-{}", release.version));
     let progress = this.read_with(cx, |this, _| this.progress.clone()).map_err(|_| "Filo is quitting.")?;
     progress.store(0, Ordering::Relaxed);
@@ -455,6 +468,17 @@ async fn install(this: &WeakEntity<Engines>, release: Release, cx: &mut AsyncApp
         installed.version, installed.chromium
     );
     Ok(installed)
+}
+
+/// The bytes free on the disk `path` is on.
+fn free_space(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills the struct it's given, for a path that's a C string.
+    unsafe {
+        let mut stats: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then(|| stats.f_bavail as u64 * stats.f_frsize as u64)
+    }
 }
 
 /// Unzips the engine in `staging` and checks it: its version, a signature that holds, by Filo's own developer.
@@ -518,7 +542,6 @@ async fn update(this: &WeakEntity<Engines>, cx: &mut AsyncApp) -> Result<(), Str
 /// Downloads the engine when there's none, copies the logins over, saves the choice and opens the tabs again in it.
 async fn switch(this: &WeakEntity<Engines>, from: Kind, to: Kind, cx: &mut AsyncApp) -> Result<Option<String>, String> {
     if to == Kind::Chromium && app_path().is_none() {
-        this.update(cx, |this, cx| this.set(Some(Busy::Looking), cx)).ok();
         let release = look(cx).await?;
         install(this, release, cx).await?;
     }

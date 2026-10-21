@@ -936,23 +936,66 @@ user opens it from Window › Browser (⇧⌘B); agents work it in the backgroun
   gets the saved login offered and filled. A test run's logins go to `local/test-secrets` (or `FILO_SECRETS_DIR`), never
   the Keychain, and its WebKit data store is removed at the end. `FILO_FIXTURE_SHOTS=<dir>` saves the panel, the
   suggestions and the login bar.
-- **Chromium, a test engine** (`dev` builds only; browser/chromium.rs, chromium/): with `FILO_BROWSER_ENGINE=chromium`
-  new tabs open in Chromium through CEF in windowless mode instead of WebKit, and WebKit stays the default.
-  `chromium/build.sh` downloads CEF's minimal build (checked against its SHA-1) into `target/cef`, builds its C++
-  wrapper and `Filo Chromium.app` (an ObjC++ app, chromium/filo_chromium.mm, with Chromium's helper apps; ~325 MB,
-  `FILO_CHROMIUM_APP` names another). Filo starts it with the first such tab, its profile in `local/chromium`, and
-  talks to it over its standard input and output, a JSON line each way. A tab is a `Tab` as WebKit's are, with a view of
-  Filo's own (`FiloChromiumView`) where the web view would be: parked off the screen or moved into the browser window,
-  showing the frames Chromium draws into shared memory and handing the user's mouse and keys to the page. native.rs asks
-  `chromium::of` first: page.js runs in an isolated world through DevTools (`Page.createIsolatedWorld`,
-  `Runtime.evaluate`), clicks and keys are DevTools input (trusted in the page; keys carry the Mac editing commands
-  Chromium leaves to its own view, as Playwright sends them), and a screenshot is the last frame. Dialogs, file
-  choosers, downloads and pop-ups come back as events to the same places WebKit's do. `browser-check` and
-  `browser-tools-check` pass with it; HTML5 drag and drop isn't done. `FILO_OPEN=chromium-check`
-  (browser/chromium_check.rs) measures memory per tab in both engines, tries Google's sign-in in both
-  (`FILO_CHECK_GOOGLE_EMAIL`), and with `FILO_CHROMIUM_COOKIES=<a copy of a WebKit Cookies.binarycookies>` puts its
-  cookies into Chromium's profile and says which of `FILO_CHROMIUM_SITES` are signed in. `FILO_CHROMIUM_SCALE=1` draws
-  pages at 1× (less memory, soft on a Retina screen).
+- **The engine, WebKit or Chromium** (Settings › Browser; browser/engine.rs, screens/browser_settings.rs): WebKit is
+  built in and the default. Chromium, marked Beta, is an app of Filo's own, `Filo Chromium.app` (chromium/), downloaded
+  the first time it's picked, so Filo's own download stays the same size. Only what drives a page differs (a tab's
+  `Page::WebKit` or `Page::Chromium`); everything else in the browser is shared, and native.rs asks `chromium::of` first
+  for what it would ask WebKit.
+  - *Download and checks:* the feed is `chromium-<protocol>.json` in the GitHub release `chromium-engine` (the protocol
+    Filo and the engine speak, `engine::PROTOCOL` and the engine's `kProtocol`, so a changed protocol never reaches an
+    older Filo). It names the newest engine and each processor's zip with its size and SHA-256. Picking Chromium
+    first checks there's room (four times the zip's size; it says how much is needed) and downloads this Mac's zip into `local/chromium-engine/<version>` (`engine.json` there names the one in use), with
+    its progress on the page, and checks the size, the SHA-256, that the signature holds and that it's by Filo's own
+    developer (skipped for a Filo signed ad hoc; the download shares updater.rs `fetch_checked`).
+  - *Logins:* the cookies WebKit has and Chromium hasn't are copied over: read from WebKit's store (with an empty page of
+    WebKit's open on it, as WebKit serves its cookies only then) and never changed there, set with the engine's
+    `set_cookies`. Picking WebKit again copies Chromium's newer ones back the same way. Site storage (localStorage,
+    IndexedDB, service workers) doesn't move. The engine keeps session cookies while Filo runs, as WebKit does, and
+    caps a cookie's life at 400 days, as Chrome does.
+  - *The switch:* the choice is saved in `local/browser.json` (`engine`), and every tab opens again in the new engine
+    (browser.rs `reopen_tabs`) with its id, owner, opener and agent's work, hidden as before, and the agent hears of it.
+    An engine that stops on its own has its tabs opened again in a new one. Remove Chromium deletes the engine (not its
+    profile, `local/chromium`).
+  - *Updates:* while Chromium is chosen, Filo looks at the feed a minute after launch and every 6 hours. A newer engine
+    downloads in the background, checked the same way, and goes in the next time the engine starts (at once when no tab
+    is open in it); older ones are removed at the next launch. Engine updates are their own releases, never Filo's.
+  - *The engine:* CEF (Chromium Embedded Framework) in windowless mode, an ObjC++ app (chromium/filo_chromium.mm)
+    that Filo starts with the first Chromium tab and talks to over its standard input and output, a JSON line each way.
+    Its helper processes run in Chromium's sandbox (CefScopedSandboxContext). A Chromium tab's view is Filo's own
+    (`FiloChromiumView`), showing the frames Chromium draws into shared memory: at 1x while it's parked off the screen
+    (about a third less memory than at 2x: 539 MB for three pages against 833 MB; WebKit takes 361 MB), and at the
+    window's scale in the browser window. page.js runs in an isolated world through DevTools
+    (`Page.createIsolatedWorld`, `Runtime.evaluate`); agents' clicks and keys are DevTools input (trusted in the page;
+    keys carry the Mac editing commands, as Playwright sends them), and a screenshot is the last frame. Dialogs, file
+    choosers, downloads and pop-ups come back as events to where WebKit's go.
+  - *What the user does in a Chromium page:*
+    - Keys go through the input method (the view is an NSTextInputClient: marked text is the page's composition, with
+      the candidate window at the text).
+    - A right-click shows the page's menu as a native one: Chromium's, less View Source, plus Open and Copy for links
+      and pictures, which Filo does itself. An agent's tab and a parked one get none.
+    - Files, links and text dragged in from another app drop into the page. The page's own drag and drop Chromium
+      carries in the page; Filo's world watches dragstart and dragend to tell browser_drag whether the drop was taken.
+    - Printing, in both engines (browser.rs `print`): ⌘P in the browser window prints the page shown (WebKit's view, or
+      Chromium's `Page.printToPDF` through PDFKit) with the print panel as a sheet. In Chromium, window.print() and the
+      menu's Print do too (a binding of Filo's), for the user's page in the window only.
+  - *Building it:* `chromium/build.sh` downloads CEF's minimal build for `ARCH` (checked against its SHA-1) into
+    `target/cef/<arch>` and builds the app. With `SIGN_IDENTITY` it signs every binary for notarization (the hardened
+    runtime, a secure timestamp, each helper's entitlements in chromium/entitlements/). `chromium/package.sh` makes the
+    zips and the feed (notarized with an App Store Connect key, as scripts/package.sh does Filo), and
+    `chromium/publish.sh` puts them on GitHub ("Checks and releases").
+  - *Dev builds:* `FILO_BROWSER_ENGINE=webkit|chromium` picks the engine for a run, `FILO_CHROMIUM_APP` names an engine
+    to run (`none`: only one installed; otherwise a build in target/cef stands in), `FILO_CHROMIUM_FEED` another feed,
+    and `FILO_CHROMIUM_SCALE` draws Chromium pages at that scale everywhere.
+  - *Checks:*
+    - `FILO_OPEN=browser-engine-check` (browser/engine_check.rs) switches both ways from a feed of two engines it
+      serves itself (`FILO_CHECK_ENGINES`, folders chromium/package.sh made with `FILES_URL=""`): download, checks,
+      logins, tabs, sandbox, scale, the update and Remove.
+    - `FILO_OPEN=browser-input-check` (browser/input_check.rs): the input method, menus, a drop and printing.
+    - `FILO_OPEN=browser-settings-pick` pictures Settings › Browser mid-switch.
+    - `FILO_OPEN=chromium-check` (browser/chromium_check.rs) measures memory per tab in both engines, tries Google's
+      sign-in in both (`FILO_CHECK_GOOGLE_EMAIL`), and with `FILO_CHROMIUM_COOKIES=<a copy of a WebKit
+      Cookies.binarycookies>` says which of `FILO_CHROMIUM_SITES` are signed in with its cookies.
+    - The browser's other checks pass in either engine (`FILO_BROWSER_ENGINE`).
 
 ## Scheduled work: reminders, routines and check-ins
 
@@ -1081,6 +1124,15 @@ The release needs these repository secrets (Settings › Secrets and variables �
 
 The workflow stops with a message when one of the first five is missing or the .p12 holds no Developer ID Application
 identity.
+
+**The Chromium engine** (Settings › Browser's download; "The browser") is released apart from Filo, by hand. Run
+`SIGN_IDENTITY="Developer ID Application: …" ARCHS="arm64 x86_64" ENGINE_BUILD=<n> NOTARY_KEY_PATH=… NOTARY_KEY_ID=…
+NOTARY_ISSUER=… chromium/package.sh` on a Mac with the same identity as Filo's (Filo takes only an engine signed by its
+own developer) and an `ENGINE_BUILD` above the last one, so installed engines update to it. Then run
+`chromium/publish.sh`, which needs gh with write access: it makes the release `chromium-<version>` (never the latest)
+with the zips and swaps the feed into the release `chromium-engine`. Filos running Chromium pick it up within 6 hours. A
+new CEF is `cef` and its SHA-1s in chromium/build.sh, with ENGINE_BUILD back to 1. Each Chromium security release of
+CEF (every 2–4 weeks) is one of these, with no Filo release.
 
 ## From a terminal
 

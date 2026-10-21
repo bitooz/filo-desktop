@@ -20,10 +20,10 @@ What's in it:
 - **Coding.** Hand a task to Claude Code, Codex, Muse Code, OpenCode or pi, from the Coding page or from any conversation.
   It runs in your project or in a git worktree of its own, and you can follow each step as it happens.
 - **Artifacts.** Reports, pages, diagrams and small tools your agents make, with every version kept.
-- **A browser.** Pages on macOS's WebKit that keep your logins, which agents read, click, type, upload and download
-  in the background while you use other apps, and you can open and use too (Window › Browser). You see an agent work
-  there and can pause it or take the page over. It can bring in your bookmarks, history and exported passwords from
-  Helium or Chrome.
+- **A browser.** Pages on macOS's WebKit, or on Chromium (a download from Settings › Browser, in beta), that keep your
+  logins, which agents read, click, type, upload and download in the background while you use other apps, and you can
+  open and use too (Window › Browser). You see an agent work there and can pause it or take the page over. It can bring
+  in your bookmarks, history and exported passwords from Helium or Chrome.
 - **Scheduled work.** Reminders, routines that run on a schedule, and check-ins, even while Filo is closed.
 - **Voice messages, a Feed and Notes,** plus apps (MCP servers) your agents can use, a menu bar item and a desktop pet.
 
