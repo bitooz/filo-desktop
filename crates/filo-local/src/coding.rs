@@ -805,6 +805,7 @@ impl ToolModel {
             label: self.name,
             default: self.is_default,
             aliases: Vec::new(),
+            unavailable: None,
         }
     }
 }

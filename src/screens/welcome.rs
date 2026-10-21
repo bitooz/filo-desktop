@@ -1475,6 +1475,7 @@ impl WelcomeTour {
                     label: "Default model".into(),
                     default: true,
                     aliases: vec![],
+                    unavailable: None,
                 });
             }
         }

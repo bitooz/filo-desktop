@@ -202,6 +202,9 @@ pub struct ModelOption {
     pub default: bool,
     /// Other names the CLI takes for the same model (Claude Code's alias and the full name it resolves to).
     pub aliases: Vec<String>,
+    /// Why it can't answer now (pi's sign-in to its provider doesn't work: pi_logins.rs), as the pickers show it,
+    /// greyed out and not picked; None when it can. Not kept with the rows (models.rs).
+    pub unavailable: Option<String>,
 }
 
 impl ModelOption {
@@ -644,6 +647,7 @@ pub fn claude_options(default: Option<&Model>, resolved: &[(String, Model)]) -> 
                         label: default.label.clone(),
                         default: true,
                         aliases: vec![alias.to_string()],
+                        unavailable: None,
                     });
                 }
             }
@@ -655,6 +659,7 @@ pub fn claude_options(default: Option<&Model>, resolved: &[(String, Model)]) -> 
             label: model.map_or_else(|| family.to_string(), |model| model.label.clone()),
             default: false,
             aliases: model.map(|model| vec![model.id.clone()]).unwrap_or_default(),
+            unavailable: None,
         });
     }
     if let (Some(default), None) = (default, default_row) {
@@ -666,6 +671,7 @@ pub fn claude_options(default: Option<&Model>, resolved: &[(String, Model)]) -> 
                 label: default.label.clone(),
                 default: true,
                 aliases: Vec::new(),
+                unavailable: None,
             },
         );
     }
@@ -704,6 +710,7 @@ fn codex_options_from(catalogue: &[u8], default: Option<&str>) -> Vec<ModelOptio
         id: model.id,
         label: model.label,
         aliases: Vec::new(),
+        unavailable: None,
     };
     let mut options: Vec<ModelOption> = codex_models(catalogue, true).into_iter().map(option).collect();
     if let Some(default) =

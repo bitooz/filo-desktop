@@ -231,7 +231,9 @@ pub(crate) fn model_picker<T: gpui_component::Selectable + IntoElement + 'static
                 rows.iter()
                     .map(|row| search_menu::Choice {
                         icon: Some(engine_logo(row.engine)),
-                        note: row.default.then(|| "Default".into()),
+                        // A model that can't answer now says why instead (its sign-in doesn't work).
+                        note: row.unavailable.clone().map(Into::into).or_else(|| row.default.then(|| "Default".into())),
+                        off: row.unavailable.is_some(),
                         checked: model_row_checked(row, &current),
                         group: row.engine as usize,
                         also: format!("{} {}", row.id, row.engine.label()),
@@ -5847,6 +5849,7 @@ mod tests {
             label: label.into(),
             default,
             aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            unavailable: None,
         };
         let rows = vec![
             row(Engine::Claude, "claude-opus-5-5", "Opus 5.5", true, &["opus"]),

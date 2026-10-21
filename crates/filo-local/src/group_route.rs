@@ -113,10 +113,11 @@ fn cheapest_first(rows: &[ModelOption]) -> Vec<ModelOption> {
 }
 
 /// The model routing uses when none was picked (or the one picked is gone): the cheapest of the first tool in `ready`
-/// (the tools installed and signed in, in the app's order) that has models listed.
+/// (the tools installed and signed in, in the app's order) that has models listed that work.
 pub fn default_model(rows: &[ModelOption], ready: &[Engine]) -> Option<crate::group::RouteModel> {
     ready.iter().find_map(|engine| {
-        let own: Vec<ModelOption> = rows.iter().filter(|row| row.engine == *engine).cloned().collect();
+        let own: Vec<ModelOption> =
+            rows.iter().filter(|row| row.engine == *engine && row.unavailable.is_none()).cloned().collect();
         cheapest_first(&own).into_iter().next().map(|row| crate::group::RouteModel {
             engine: *engine,
             model: row.id,
@@ -316,7 +317,14 @@ mod tests {
     use super::*;
 
     fn option(engine: Engine, id: &str, label: &str) -> ModelOption {
-        ModelOption { engine, id: id.into(), label: label.into(), default: false, aliases: Vec::new() }
+        ModelOption {
+            engine,
+            id: id.into(),
+            label: label.into(),
+            default: false,
+            aliases: Vec::new(),
+            unavailable: None,
+        }
     }
 
     fn members() -> Vec<Member> {

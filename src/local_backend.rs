@@ -36,6 +36,7 @@ use filo_local::engine::{self, ModelOption, Stopper};
 use filo_local::memories;
 use filo_local::models;
 use filo_local::notes;
+use filo_local::pi_logins;
 use filo_local::skills;
 use filo_local::store::valid_id;
 use filo_local::turn::{self, Runtime};
@@ -199,6 +200,10 @@ pub const MOVED: &[&str] = &[
 
 /// The model picker's cache is asked about again only when older than this (ms): an app restarted soon after reuses it.
 const MODELS_FRESH_FOR: i64 = 10 * 60 * 1000;
+/// While a picker shows, how often pi's sign-ins are looked at for a change (`pi_look_due`).
+const PI_LOOK_EVERY: Duration = Duration::from_secs(5);
+/// How long a check that found a pi sign-in not working holds before pi is asked again (made offline, it'd be wrong).
+const PI_RECHECK_AFTER: Duration = Duration::from_secs(10 * 60);
 /// While turns run, how often their chats' files are checked for replies.
 const WATCH_EVERY: Duration = Duration::from_millis(300);
 /// A reply nobody has seen for this long (ms) is notified about (`pushedUntil` in `voiceSessions:unseen`): a banner, the
@@ -298,6 +303,17 @@ struct Running {
     detached: bool,
 }
 
+/// The pickers' looks at pi's sign-ins (`Local::pi_look_due`).
+#[derive(Default)]
+struct PiLook {
+    /// When the pickers last asked for one.
+    polled: Option<std::time::Instant>,
+    /// When pi was last asked which sign-ins work, in this run.
+    checked: Option<std::time::Instant>,
+    /// One is under way, or the models are being asked about.
+    looking: bool,
+}
+
 pub struct Local {
     root: PathBuf,
     /// The agents' conversations.
@@ -321,6 +337,8 @@ pub struct Local {
     picker: Mutex<Option<(Vec<Engine>, Arc<Vec<ModelOption>>, Arc<Vec<ModelOption>>)>>,
     /// This run has asked the CLIs about their models already, or is asking (`claim_model_refresh`).
     models_refreshing: AtomicBool,
+    /// The pickers' looks at pi's sign-ins (`pi_look_due`, `look_at_pi_logins`).
+    pi_look: Mutex<PiLook>,
     /// The group chat's runner (local_backend/group.rs).
     group: group::State,
     /// Checks and sign-ins under way for the user's apps, and where their secrets are (local_backend/apps.rs).
@@ -434,6 +452,7 @@ impl Local {
             models: Mutex::new(None),
             picker: Mutex::new(None),
             models_refreshing: AtomicBool::new(false),
+            pi_look: Mutex::new(PiLook::default()),
             group: group::State::default(),
             apps: apps::State::default(),
             in_worker: AtomicBool::new(false),
@@ -485,7 +504,116 @@ impl Local {
     /// row), the tool signed out or not; the pickers list `model_options`.
     pub fn all_model_options(&self) -> Arc<Vec<ModelOption>> {
         let mut rows = self.models.lock().unwrap();
-        rows.get_or_insert_with(|| Arc::new(models::picker_rows(self.db.as_ref().ok()))).clone()
+        rows.get_or_insert_with(|| Arc::new(self.marked(models::picker_rows(self.db.as_ref().ok())))).clone()
+    }
+
+    /// `rows` with pi's models that can't answer now marked so (filo_local `pi_logins`).
+    fn marked(&self, mut rows: Vec<ModelOption>) -> Vec<ModelOption> {
+        if let Ok(db) = &self.db
+            && rows.iter().any(|row| row.engine == Engine::Pi)
+        {
+            pi_logins::apply(&mut rows, &pi_logins::marks(db, &pi_logins::Auth::read()));
+        }
+        rows
+    }
+
+    /// The pickers' rows marked again as the database has pi's sign-ins now (a reply that failed on one, in a worker
+    /// too). True when that changed them.
+    fn mark_pi_rows(&self) -> bool {
+        let rows = self.all_model_options();
+        let marked = self.marked(rows.to_vec());
+        if marked == *rows {
+            return false;
+        }
+        *self.models.lock().unwrap() = Some(Arc::new(marked));
+        true
+    }
+
+    /// Whether to look at pi's sign-ins now (`look_at_pi_logins`, off the UI thread), claiming the look: asked as the
+    /// pickers draw, at most every `PI_LOOK_EVERY`, and not while the models are being asked about.
+    pub fn pi_look_due(&self) -> bool {
+        if self.in_worker.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut look = self.pi_look.lock().unwrap();
+        if look.looking || look.polled.is_some_and(|at| at.elapsed() < PI_LOOK_EVERY) {
+            return false;
+        }
+        look.polled = Some(std::time::Instant::now());
+        look.looking = true;
+        true
+    }
+
+    /// pi's sign-ins changed since they were checked (a /login, a logout: its `auth.json` changed), or a check found
+    /// one not working a while ago: pi's models are asked about again and its sign-ins checked. Otherwise the rows are
+    /// marked as the database has them. The pages hear of a change. Blocks while pi answers: off the UI thread.
+    pub fn look_at_pi_logins(&self) -> bool {
+        let changed = match &self.db {
+            Ok(db) => {
+                let recheck = pi_logins::has_checked_marks(db)
+                    && self.pi_look.lock().unwrap().checked.is_none_or(|at| at.elapsed() > PI_RECHECK_AFTER);
+                if recheck || pi_logins::checked_auth_at(db) != Some(pi_logins::auth_changed_at()) {
+                    self.refresh_pi_models(filo_local::now_ms() as i64)
+                } else {
+                    self.mark_pi_rows()
+                }
+            }
+            Err(_) => false,
+        };
+        self.pi_look.lock().unwrap().looking = false;
+        if changed {
+            self.changed();
+        }
+        changed
+    }
+
+    /// pi's models asked about again (`coding_pi::models`), saved and kept for the pickers, then its sign-ins checked.
+    /// True when the pickers' rows changed.
+    fn refresh_pi_models(&self, now: i64) -> bool {
+        let before = self.all_model_options();
+        let path = login_path();
+        let program = engine::find_program(Engine::Pi, Some(path));
+        let said: Vec<ModelOption> = program
+            .as_deref()
+            .map(|program| filo_local::coding_pi::models(program, Some(path)))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|model| model.option(Engine::Pi))
+            .collect();
+        // Signed out of every provider, or pi not there: none. One that couldn't say keeps what it said before.
+        if !said.is_empty() || program.is_none() || !coding::pi_signed_in() {
+            if let Ok(db) = &self.db {
+                let _ = models::save(db, Engine::Pi, &said, now);
+            }
+            let mut rows: Vec<ModelOption> =
+                before.iter().filter(|row| row.engine != Engine::Pi).cloned().chain(said).collect();
+            rows.sort_by_key(|row| Engine::ALL.iter().position(|engine| *engine == row.engine));
+            *self.models.lock().unwrap() = Some(Arc::new(rows));
+        }
+        coding::saw_sign_in(Engine::Pi, program.is_some() && coding::pi_signed_in());
+        self.check_pi_logins(program.as_deref());
+        *self.all_model_options() != *before
+    }
+
+    /// Asks pi whether the sign-in of each provider its models are of works (`pi auth check`), keeps what it says in the
+    /// database, and marks the rows so.
+    fn check_pi_logins(&self, program: Option<&Path>) {
+        let Ok(db) = &self.db else { return };
+        let mut providers: Vec<String> = Vec::new();
+        for row in self.all_model_options().iter().filter(|row| row.engine == Engine::Pi) {
+            let provider = pi_logins::provider_of(&row.id).to_string();
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        let dead = match program {
+            Some(program) if !providers.is_empty() => pi_logins::check(program, Some(login_path()), &providers),
+            _ => Vec::new(),
+        };
+        // As auth.json is after the checks, which may have renewed a sign-in.
+        let _ = pi_logins::checked(db, &pi_logins::Auth::read(), &dead, pi_logins::auth_changed_at());
+        self.pi_look.lock().unwrap().checked = Some(std::time::Instant::now());
+        self.mark_pi_rows();
     }
 
     /// The model pickers' rows (the composer's, the Edit agent page's, the group's routing step): the models of the
@@ -533,12 +661,15 @@ impl Local {
         let before = self.model_options();
         coding::look_at_tools();
         if ask {
+            self.pi_look.lock().unwrap().looking = true;
             self.refresh_models_with(
                 probe_claude_models,
                 engine::codex_options,
                 probe_session_models,
                 filo_local::now_ms() as i64,
             );
+            self.check_pi_logins(engine::find_program(Engine::Pi, Some(login_path())).as_deref());
+            self.pi_look.lock().unwrap().looking = false;
         }
         *self.model_options() != *before
     }
@@ -576,6 +707,7 @@ impl Local {
             }
             rows.extend(said);
         }
+        let rows = self.marked(rows);
         let changed = rows != *before;
         *self.models.lock().unwrap() = Some(Arc::new(rows));
         changed
@@ -1800,6 +1932,14 @@ impl Local {
         error: &str,
         stderr: Vec<String>,
     ) {
+        // pi's sign-in to the model's provider doesn't work, or doesn't reach the model: the pickers grey it out.
+        if engine == Some(Engine::Pi)
+            && let Ok(db) = &self.db
+            && pi_logins::learn(db, &pi_logins::Auth::read(), model.as_deref(), error)
+            && self.mark_pi_rows()
+        {
+            self.changed();
+        }
         let failure = filo_local::failures::Failure {
             at: now_ms() as u64,
             kind: kind.into(),
@@ -3341,6 +3481,7 @@ A note the user shared from their Notes:\nTitle: Untitled note\n\nCall the bank"
             label: label.into(),
             default,
             aliases: Vec::new(),
+            unavailable: None,
         };
         let opus = vec![
             row(Engine::Claude, "claude-opus-5-5", "Opus 5.5", true),
@@ -3380,6 +3521,46 @@ A note the user shared from their Notes:\nTitle: Untitled note\n\nCall the bank"
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A pi reply that failed on a sign-in greys out what it says doesn't work, for the pickers and whatever reads the
+    /// rows next (a restart too), and routing doesn't fall back on it.
+    #[test]
+    fn a_pi_reply_failing_on_its_sign_in_greys_its_models_out() {
+        let local = temp();
+        let row = |id: &str| ModelOption {
+            engine: Engine::Pi,
+            id: id.into(),
+            label: id.into(),
+            default: false,
+            aliases: Vec::new(),
+            unavailable: None,
+        };
+        let pi = vec![row("openai-codex/gpt-6.1-sol"), row("openai/gpt-5.5"), row("openai/gpt-6.1-sol")];
+        local.refresh_models_with(|| Some(Vec::new()), Vec::new, || vec![(Engine::Pi, Some(pi.clone()))], 1);
+        let shown = |local: &Local| {
+            local.all_model_options().iter().map(|row| (row.id.clone(), row.unavailable.clone())).collect::<Vec<_>>()
+        };
+        assert!(shown(&local).iter().all(|(_, unavailable)| unavailable.is_none()));
+
+        let refused = "pi: OpenAI API error (400): 400 {\"detail\":\"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.\"}";
+        local.note_failure("turn", "t-1", Some(Engine::Pi), Some("openai/gpt-5.5".into()), refused, Vec::new());
+        let dead = "pi: OAuth refresh failed for openai-codex: OpenAI Codex token refresh failed (401)";
+        local.note_failure("turn", "t-2", Some(Engine::Pi), Some("openai-codex/gpt-6.1-sol".into()), dead, Vec::new());
+        // Another tool's failure marks nothing.
+        local.note_failure("turn", "t-3", Some(Engine::Codex), Some("gpt-a".into()), dead, Vec::new());
+        let expected = vec![
+            ("openai-codex/gpt-6.1-sol".to_string(), Some(pi_logins::SIGN_IN_AGAIN.to_string())),
+            ("openai/gpt-5.5".to_string(), Some(pi_logins::NOT_WITH_SIGN_IN.to_string())),
+            ("openai/gpt-6.1-sol".to_string(), None),
+        ];
+        assert_eq!(shown(&local), expected);
+        assert_eq!(
+            filo_local::group_route::default_model(&local.all_model_options(), &[Engine::Pi]).map(|route| route.model),
+            Some("openai/gpt-6.1-sol".into())
+        );
+        // Opened again: the rows from the database, marked the same.
+        assert_eq!(shown(&Local::open(local.root.clone())), expected);
+    }
+
     #[test]
     fn the_picker_lists_only_the_tools_signed_in() {
         let row = |engine, id: &str| ModelOption {
@@ -3388,6 +3569,7 @@ A note the user shared from their Notes:\nTitle: Untitled note\n\nCall the bank"
             label: id.into(),
             default: false,
             aliases: Vec::new(),
+            unavailable: None,
         };
         let rows = vec![row(Engine::Claude, "haiku"), row(Engine::Codex, "gpt-a"), row(Engine::OpenCode, "big")];
         let ids = |ready: &[Engine]| signed_in_rows(&rows, ready).into_iter().map(|row| row.id).collect::<Vec<_>>();

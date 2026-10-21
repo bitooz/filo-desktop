@@ -42,6 +42,7 @@ pub fn cached(db: &Db, engine: Engine) -> Result<Vec<ModelOption>, String> {
                 label: row.get(1)?,
                 default: row.get::<_, i64>(2)? != 0,
                 aliases: serde_json::from_str(&aliases).unwrap_or_default(),
+                unavailable: None,
             })
         })?;
         rows.collect()
@@ -108,6 +109,7 @@ mod tests {
             label: label.into(),
             default,
             aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            unavailable: None,
         }
     }
 

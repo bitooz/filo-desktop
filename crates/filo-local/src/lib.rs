@@ -17,7 +17,8 @@
 //   publish and change posts (in every conversation, or on their own for a coding tool's session).
 // - `skills`: the user's skills, a folder each beside it (the Skills page), and what a turn gets of them.
 // - `memories`: what Filo remembers about the user in it (the Memories page, and every turn's prompt).
-// - `models`: the composer model picker's rows in it, as the CLIs last named their models and defaults.
+// - `models`: the composer model picker's rows in it, as the CLIs last named their models and defaults; `pi_logins`:
+//   which of pi's sign-ins work, so the pickers grey out the models of one that doesn't.
 // - `schedule`: reminders, routines and Filo's own check-ins in it, and what comes due when; `schedule_mcp`: the
 //   tools that make and change them.
 // - `app_data`: the app's own small data in it: the agents, the profile, read markers, pinned and archived chats and
@@ -112,6 +113,7 @@ pub mod models;
 pub mod notes;
 mod notes_mcp;
 pub mod pages;
+pub mod pi_logins;
 pub mod plan_usage;
 pub mod reseed;
 pub mod schedule;

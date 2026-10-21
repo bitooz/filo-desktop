@@ -37,11 +37,22 @@ pub struct Choice {
     pub group: usize,
     /// What a search looks in besides the name (an id, a tool's name).
     pub also: String,
+    /// It can't be picked now (a model whose sign-in doesn't work): greyed out, its note saying why, and a click or
+    /// Return on it does nothing.
+    pub off: bool,
 }
 
 impl Choice {
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Choice { label: label.into(), icon: None, note: None, checked: false, group: 0, also: String::new() }
+        Choice {
+            label: label.into(),
+            icon: None,
+            note: None,
+            checked: false,
+            group: 0,
+            also: String::new(),
+            off: false,
+        }
     }
 
     fn holds(&self, words: &[String]) -> bool {
@@ -131,10 +142,13 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                 theme.popover_foreground,
             );
             let colors = *cx.colors();
-            // Picks the choice, then closes the menu.
+            // Picks the choice, then closes the menu; one that's off stays as it is.
             let choose = {
-                let (pick, popover) = (pick.clone(), popover.clone());
+                let (pick, popover, choices) = (pick.clone(), popover.clone(), choices.clone());
                 Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                    if choices[index].off {
+                        return;
+                    }
                     pick(index, window, cx);
                     popover.update(cx, |popover, cx| popover.dismiss(window, cx));
                 })
@@ -174,6 +188,7 @@ pub fn search_menu<T: Selectable + IntoElement + 'static>(
                                         .text_sm()
                                         .when(ruled, |this| this.border_t_1().border_color(border).rounded_none())
                                         .when(row == highlight, |this| this.bg(hover_bg).text_color(hover_fg))
+                                        .when(choice.off, |this| this.opacity(0.5))
                                         .child(div().flex_none().w(px(12.)).when(choice.checked, |this| {
                                             this.child(Icon::new(IconName::Check).xsmall())
                                         }))

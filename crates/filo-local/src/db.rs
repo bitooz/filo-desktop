@@ -121,6 +121,7 @@ impl Db {
         crate::glances::ensure_columns(&conn)?;
         crate::group::ensure_columns(&conn)?;
         crate::artifacts::ensure_columns(&conn)?;
+        crate::pi_logins::ensure_tables(&conn)?;
         crate::group::move_old_speakers(&conn)?;
         Ok(Db { conn: Mutex::new(conn), dir })
     }

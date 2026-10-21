@@ -590,7 +590,14 @@ pub fn run(spec: &Spec, host: &mut dyn Host, on_start: impl FnOnce(Stopper)) -> 
     }
     if let Some(error) = &end.error {
         let haystack = format!("{error}\n{}", stderr.join("\n"));
-        if Engine::signed_out(&haystack) && !error.contains(&spec.engine.sign_in_hint()) {
+        // pi's sign-in to the model's provider doesn't work, or doesn't reach the model: another model may.
+        let pi_hint = (spec.engine == Engine::Pi)
+            .then(|| crate::pi_logins::hint(spec.model.as_deref(), &haystack))
+            .flatten()
+            .filter(|hint| !error.contains(hint));
+        if let Some(hint) = pi_hint {
+            end.error = Some(format!("{error}\n\n{hint}"));
+        } else if Engine::signed_out(&haystack) && !error.contains(&spec.engine.sign_in_hint()) {
             end.error = Some(format!("{error}\n\n{}", spec.engine.sign_in_hint()));
         }
         end.stderr = stderr;
@@ -2605,7 +2612,8 @@ cat >> "$0.heard"
         assert!(began.elapsed() >= RETRY_FOR, "{:?}", began.elapsed());
     }
 
-    /// A chat turn on pi whose model call fails says why, with how to sign in again when that's the reason.
+    /// A chat turn on pi whose model call fails says why, and when pi's sign-in to the model's provider is the reason,
+    /// to pick a model of another provider or sign in to that one again.
     #[test]
     fn a_pi_turn_fails_with_its_providers_words() {
         let dir = crate::test_support::temp_dir("session-pi-fail");
@@ -2619,10 +2627,21 @@ cat >> "$0.heard"
 "#
         );
         let fake = script(&dir, "pi", &body);
-        let spec = Spec { chat: true, new_session: None, ..spec(Engine::Pi, fake, &dir) };
+        let spec = Spec {
+            chat: true,
+            new_session: None,
+            model: Some("openrouter/openai/gpt-6.1-sol".into()),
+            ..spec(Engine::Pi, fake, &dir)
+        };
         let end = run(&spec, &mut Recorder::default(), |_| {});
         let error = end.error.unwrap_or_default();
-        assert!(error.starts_with("pi: 401: API key expired.") && error.contains("/login"), "{error}");
+        assert!(error.starts_with("pi: 401: API key expired."), "{error}");
+        assert!(
+            error.contains(
+                "sign-in to openrouter doesn't work anymore. Pick a model of another provider in the model picker"
+            ) && error.contains("/login"),
+            "{error}"
+        );
     }
 
     /// A chat turn on OpenCode: a message steered in reaches the agent once its inbox delivers it (here in the execution

@@ -5442,6 +5442,7 @@ mod tests {
             label: id.into(),
             default,
             aliases: Vec::new(),
+            unavailable: None,
         };
         let rows = [
             row(Engine::Claude, "sonnet", false),

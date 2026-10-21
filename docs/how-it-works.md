@@ -613,6 +613,22 @@ list is pi's `get_available_models` (the providers it's signed in to), ids `prov
 each takes (`--thinking`); signed in means a provider in pi's `auth.json` (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`),
 read, never written.
 
+`get_available_models` lists every provider with credentials, one whose sign-in can't be renewed included, so the
+pickers grey out the models of a provider that doesn't work, with why ("Sign in again", "Not with this sign-in"), and
+don't pick them (crates/filo-local `pi_logins`). After asking pi for its models, Filo runs `pi auth check --provider
+<id> --json` for each provider they're of: `invalid` (a refused renewal) or `not_ready` marks it. The check renews an
+OAuth sign-in about to run out as any pi run does, under pi's own lock. What a check can't tell comes from a reply
+that failed on it: a renewal refused ("OAuth refresh failed for <id>"), a key that ran out (the `signed_out` words), or
+a model the sign-in doesn't reach (a ChatGPT sign-in under `openai` takes only Codex's models: "not supported when
+using Codex with a ChatGPT account"); `Local::note_failure` marks the provider or the model. The marks are in the
+database (`pi_logins`), each kept with a fingerprint of the provider's entry in `auth.json`: a provider's while the
+entry is the same, a model's while the sign-in is the same kind (renewed tokens don't count), so a /login clears them.
+While a picker draws, the app looks every 5 seconds (`Backend::model_options`, `Local::look_at_pi_logins`, in the
+background): `auth.json` changed since the last check (a /login, a logout) asks pi for its models and checks them
+again, without a restart; a check that found one not working is made again after 10 minutes (made offline, it'd be
+wrong); otherwise the marks are read again (a worker's failed reply). Such a reply's error says to pick a model of
+another provider in the model picker, or to sign in to that one again with /login (`pi_logins::hint`).
+
 What pi doesn't have comes from Filo's extension (crates/filo-local `pi_extension.ts`, written to the temporary folder
 and loaded with `-e`), told what it needs in `FILO_PI`:
 

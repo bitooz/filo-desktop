@@ -137,8 +137,14 @@ impl Backend {
         })
     }
 
-    /// The model pickers' rows: the signed-in tools' models (local_backend `model_options`).
+    /// The model pickers' rows: the signed-in tools' models (local_backend `model_options`). Every few seconds while a
+    /// picker draws, pi's sign-ins are looked at in the background, so a /login or a sign-in that stopped working
+    /// shows without a restart (`look_at_pi_logins`); the pages hear of a change.
     pub fn model_options(&self) -> Arc<Vec<filo_local::engine::ModelOption>> {
+        if self.local.pi_look_due() {
+            let local = self.local.clone();
+            self.rt.spawn_blocking(move || local.look_at_pi_logins());
+        }
         self.local.model_options()
     }
 

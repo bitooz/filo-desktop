@@ -1312,15 +1312,17 @@ fn opencode_account_in(auth: &Value) -> (bool, Option<String>, Option<String>) {
 /// pi signed in: a provider it has credentials for (`/login` in pi, kept in its `auth.json` in `$PI_CODING_AGENT_DIR`,
 /// else `~/.pi/agent`), named as the plan ("OpenRouter, ChatGPT"). It has the same shape as OpenCode's.
 fn pi_account() -> (bool, Option<String>, Option<String>) {
-    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".pi/agent"));
-    let auth: Value = std::fs::read(dir.join("auth.json"))
+    let auth: Value = std::fs::read(filo_local::pi_logins::agent_dir().join("auth.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);
     opencode_account_in(&auth)
+}
+
+/// Whether pi has credentials for a provider now (`pi_account`), for its models' look when they change
+/// (local_backend.rs `refresh_pi_models`).
+pub(crate) fn pi_signed_in() -> bool {
+    pi_account().0
 }
 
 /// "OpenRouter" for `openrouter`, "Cline Pass" for `cline-pass`: a provider id as it reads.
