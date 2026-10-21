@@ -1,7 +1,7 @@
-// Filo Chromium: the test engine for Filo's browser (`dev` builds, FILO_BROWSER_ENGINE=chromium; src/browser/chromium.rs).
+// Filo Chromium: the Chromium engine of Filo's browser (src/browser/chromium.rs), downloaded from Settings › Browser.
 // Chromium through CEF in windowless mode: each tab is a browser with no window, drawn into a frame in shared memory
 // that Filo shows in its browser window. Filo starts this app and talks to it over its standard input and output, one
-// JSON line each way:
+// JSON line each way (`kProtocol`: Filo starts only an engine that speaks its own):
 //
 //   in:  {"id":1,"op":"create","tab":"t1","url":"…","width":1280,"height":800,"scale":2}
 //        {"id":2,"op":"cdp","tab":"t1","method":"Runtime.evaluate","params":{…}}   (DevTools, answered with its result)
@@ -9,7 +9,9 @@
 //        {"op":"resize","tab":"t1","width":…,"height":…,"scale":2}
 //        {"op":"dialog","tab":"t1","accept":true,"text":"…"}  {"op":"files","tab":"t1","paths":[…]}  (none: cancel)
 //        {"op":"download","tab":"t1","item":3,"path":"…"}  ("": cancel)  {"op":"rename","tab":"p1","to":"t7"}
-//   out: {"id":1,"ok":true}  {"id":2,"ok":true,"result":{…}}  {"id":2,"ok":false,"error":"…"}
+//        {"id":3,"op":"cookies"}  (every cookie)  {"id":4,"op":"set_cookies","cookies":[…],"missing":true}
+//   out: {"ev":"ready","version":"154.0.34.1","cef":"…","protocol":1}
+//        {"id":1,"ok":true}  {"id":2,"ok":true,"result":{…}}  {"id":2,"ok":false,"error":"…"}
 //        {"ev":"state","tab":"t1","title":"…","url":"…","loading":false,"back":true,"forward":false}
 //        {"ev":"frame","tab":"t1","shm":"/filo-cr-…","width":2560,"height":1600,"seq":7}
 //        {"ev":"popup","tab":"p1","opener":"t1","url":"…"}  {"ev":"closed","tab":"p1"}  {"ev":"cursor","tab":"t1","type":2}
@@ -17,7 +19,9 @@
 //        {"ev":"download","tab":"t1","item":3,"url":"…","name":"…"}  {"ev":"downloaded","tab":"t1","item":3,"url":"…","ok":true}
 //
 // Agents' clicks and keys are DevTools input (Input.dispatchMouseEvent and the like), so pages get trusted events.
-// The app quits when Filo closes its standard input. Built by chromium/build.sh.
+// A cookie is {"name","value","domain","path","secure","httpOnly","sameSite":"Lax"|"Strict"|"None","expires"} (seconds
+// since 1970; none for a session cookie), its domain starting with a dot unless it's the host's own. The app quits
+// when Filo closes its standard input. Built by chromium/build.sh; its helper processes run in Chromium's sandbox.
 
 #import <Cocoa/Cocoa.h>
 
@@ -26,6 +30,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -45,12 +50,20 @@
 #include "include/cef_download_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_parser.h"
+#include "include/cef_sandbox_mac.h"
 #include "include/cef_version.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
 #include "include/wrapper/cef_library_loader.h"
 
+#ifndef FILO_ENGINE_VERSION
+#define FILO_ENGINE_VERSION "0"
+#endif
+
 namespace {
+
+// What Filo and the engine say to each other, as above: Filo reads the feed of engines that speak its own.
+constexpr int kProtocol = 1;
 
 // The protocol's output: Filo's pipe, kept apart from standard output, which goes to standard error (Chromium and the
 // system libraries print there).
@@ -99,6 +112,12 @@ void Answer(int id, bool ok, const std::string& error = std::string()) {
   } else {
     Send("{\"id\":" + std::to_string(id) + ",\"ok\":false,\"error\":" + Quote(error) + "}");
   }
+}
+
+// An answer with a result, `json` an object.
+void AnswerWith(int id, const std::string& json) {
+  if (id <= 0) return;
+  Send("{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":" + json + "}");
 }
 
 class Tab;
@@ -477,6 +496,137 @@ double Number(CefRefPtr<CefDictionaryValue> request, const char* key, double oth
   return otherwise;
 }
 
+// Cookies, in the profile's store: what Settings › Browser carries over between the engines (src/browser/engine.rs).
+std::string CookieJson(const CefCookie& cookie) {
+  std::string domain = CefString(&cookie.domain).ToString();
+  std::string json = "{\"name\":" + Quote(CefString(&cookie.name).ToString()) +
+                     ",\"value\":" + Quote(CefString(&cookie.value).ToString()) + ",\"domain\":" + Quote(domain) +
+                     ",\"path\":" + Quote(CefString(&cookie.path).ToString()) +
+                     ",\"secure\":" + (cookie.secure ? "true" : "false") +
+                     ",\"httpOnly\":" + (cookie.httponly ? "true" : "false");
+  if (cookie.same_site == CEF_COOKIE_SAME_SITE_LAX_MODE) json += ",\"sameSite\":\"Lax\"";
+  if (cookie.same_site == CEF_COOKIE_SAME_SITE_STRICT_MODE) json += ",\"sameSite\":\"Strict\"";
+  if (cookie.same_site == CEF_COOKIE_SAME_SITE_NO_RESTRICTION) json += ",\"sameSite\":\"None\"";
+  if (cookie.has_expires) {
+    cef_time_t time;
+    double seconds = 0;
+    if (cef_time_from_basetime(cookie.expires, &time) && cef_time_to_doublet(&time, &seconds)) {
+      json += ",\"expires\":" + std::to_string(static_cast<long long>(seconds));
+    }
+  }
+  return json + "}";
+}
+
+// "name domain path": a cookie's place in the store.
+std::string CookieKey(const std::string& name, const std::string& domain, const std::string& path) {
+  return name + "\t" + domain + "\t" + path;
+}
+
+// Visits every cookie; `done` gets them once the store has none left to give (the visitor goes then).
+class AllCookies : public CefCookieVisitor {
+ public:
+  explicit AllCookies(std::function<void(std::vector<CefCookie>)> done) : done_(std::move(done)) {}
+  ~AllCookies() override {
+    auto done = std::move(done_);
+    auto cookies = std::move(cookies_);
+    CefPostTask(TID_UI, base::BindOnce([](std::function<void(std::vector<CefCookie>)> done,
+                                          std::vector<CefCookie> cookies) { done(std::move(cookies)); },
+                                       std::move(done), std::move(cookies)));
+  }
+  bool Visit(const CefCookie& cookie, int, int, bool&) override {
+    cookies_.push_back(cookie);
+    return true;
+  }
+
+ private:
+  std::function<void(std::vector<CefCookie>)> done_;
+  std::vector<CefCookie> cookies_;
+  IMPLEMENT_REFCOUNTING(AllCookies);
+};
+
+void VisitCookies(std::function<void(std::vector<CefCookie>)> done) {
+  // Not visited (no store yet), the visitor goes with this reference and answers with none.
+  CefCookieManager::GetGlobalManager(nullptr)->VisitAllCookies(new AllCookies(done));
+}
+
+// Counts the cookies set, and answers once the last one is.
+class SetCount : public CefSetCookieCallback {
+ public:
+  SetCount(int id, int skipped, int left) : id_(id), skipped_(skipped), left_(left) {
+    if (left_ == 0) Done();
+  }
+  void OnComplete(bool success) override {
+    if (success) set_++;
+    if (--left_ == 0) Done();
+  }
+
+ private:
+  void Done() {
+    CefCookieManager::GetGlobalManager(nullptr)->FlushStore(nullptr);
+    AnswerWith(id_, "{\"set\":" + std::to_string(set_) + ",\"skipped\":" + std::to_string(skipped_) + "}");
+  }
+  int id_, skipped_, left_, set_ = 0;
+  IMPLEMENT_REFCOUNTING(SetCount);
+};
+
+void SetCookies(int id, CefRefPtr<CefListValue> list, bool missing_only) {
+  VisitCookies([id, list, missing_only](std::vector<CefCookie> have) {
+    std::set<std::string> there;
+    for (const CefCookie& cookie : have) {
+      std::string domain = CefString(&cookie.domain).ToString();
+      there.insert(CookieKey(CefString(&cookie.name).ToString(), domain, CefString(&cookie.path).ToString()));
+    }
+    std::vector<std::pair<std::string, CefCookie>> wanted;
+    int skipped = 0;
+    for (size_t index = 0; list && index < list->GetSize(); index++) {
+      CefRefPtr<CefDictionaryValue> entry = list->GetDictionary(index);
+      if (!entry) continue;
+      auto text = [&](const char* key) {
+        return entry->HasKey(key) && entry->GetType(key) == VTYPE_STRING ? entry->GetString(key).ToString()
+                                                                        : std::string();
+      };
+      std::string name = text("name"), domain = text("domain"), path = text("path");
+      if (name.empty() || domain.empty()) {
+        skipped++;
+        continue;
+      }
+      if (path.empty()) path = "/";
+      if (missing_only && there.count(CookieKey(name, domain, path))) {
+        skipped++;
+        continue;
+      }
+      bool secure = entry->HasKey("secure") && entry->GetBool("secure");
+      CefCookie cookie;
+      CefString(&cookie.name) = name;
+      CefString(&cookie.value) = text("value");
+      // A domain cookie keeps its dot; a host's own cookie is set with no domain, on its host's address.
+      std::string host = domain[0] == '.' ? domain.substr(1) : domain;
+      if (domain[0] == '.') CefString(&cookie.domain) = domain;
+      CefString(&cookie.path) = path;
+      cookie.secure = secure;
+      cookie.httponly = entry->HasKey("httpOnly") && entry->GetBool("httpOnly");
+      std::string same_site = text("sameSite");
+      cookie.same_site = same_site == "Lax"      ? CEF_COOKIE_SAME_SITE_LAX_MODE
+                         : same_site == "Strict" ? CEF_COOKIE_SAME_SITE_STRICT_MODE
+                         : same_site == "None"   ? CEF_COOKIE_SAME_SITE_NO_RESTRICTION
+                                                 : CEF_COOKIE_SAME_SITE_UNSPECIFIED;
+      cookie.priority = CEF_COOKIE_PRIORITY_MEDIUM;
+      if (entry->HasKey("expires")) {
+        double seconds = entry->GetType("expires") == VTYPE_INT ? entry->GetInt("expires") : entry->GetDouble("expires");
+        cef_time_t time;
+        if (seconds > 0 && cef_time_from_doublet(seconds, &time) && cef_time_to_basetime(&time, &cookie.expires)) {
+          cookie.has_expires = true;
+        }
+      }
+      wanted.emplace_back(std::string(secure ? "https://" : "http://") + host + path, cookie);
+    }
+    CefRefPtr<SetCount> count = new SetCount(id, skipped, static_cast<int>(wanted.size()));
+    for (auto& [url, cookie] : wanted) {
+      if (!CefCookieManager::GetGlobalManager(nullptr)->SetCookie(url, cookie, count)) count->OnComplete(false);
+    }
+  });
+}
+
 void Handle(const std::string& line) {
   CefRefPtr<CefValue> value = CefParseJSON(line, JSON_PARSER_RFC);
   if (!value || value->GetType() != VTYPE_DICTIONARY) return;
@@ -486,6 +636,23 @@ void Handle(const std::string& line) {
   std::string key = Text(request, "tab");
   if (op == "quit") {
     Quit();
+    return;
+  }
+  if (op == "cookies") {
+    VisitCookies([id](std::vector<CefCookie> cookies) {
+      std::string json = "{\"cookies\":[";
+      for (size_t index = 0; index < cookies.size(); index++) {
+        if (index) json += ",";
+        json += CookieJson(cookies[index]);
+      }
+      AnswerWith(id, json + "]}");
+    });
+    return;
+  }
+  if (op == "set_cookies") {
+    // A copy: the request's own list goes with it.
+    SetCookies(id, request->HasKey("cookies") ? request->GetList("cookies")->Copy() : nullptr,
+               request->HasKey("missing") && request->GetBool("missing"));
     return;
   }
   if (op == "create") {
@@ -598,7 +765,8 @@ class App : public CefApp, public CefBrowserProcessHandler {
   }
 
   void OnContextInitialized() override {
-    Send("{\"ev\":\"ready\",\"version\":" + Quote(CEF_VERSION) + "}");
+    Send("{\"ev\":\"ready\",\"version\":" + Quote(FILO_ENGINE_VERSION) + ",\"cef\":" + Quote(CEF_VERSION) +
+         ",\"protocol\":" + std::to_string(kProtocol) + "}");
     std::thread(Read).detach();
   }
 
@@ -628,6 +796,9 @@ class App : public CefApp, public CefBrowserProcessHandler {
 
 int main(int argc, char* argv[]) {
 #if defined(FILO_HELPER)
+  // Into Chromium's sandbox before anything else runs here (renderers, the GPU process, the network service).
+  CefScopedSandboxContext sandbox;
+  if (!sandbox.Initialize(argc, argv)) return 1;
   CefScopedLibraryLoader library;
   if (!library.LoadInHelper()) return 1;
   CefMainArgs main_args(argc, argv);
@@ -645,6 +816,11 @@ int main(int argc, char* argv[]) {
     std::string arg = argv[index];
     if (arg.rfind("--filo-profile=", 0) == 0) profile = arg.substr(15);
   }
+  // CEF takes the profile only by its real path (/private/tmp, not /tmp).
+  if (char* real = realpath(profile.c_str(), nullptr)) {
+    profile = real;
+    free(real);
+  }
 
   @autoreleasepool {
     [FiloChromiumApplication sharedApplication];
@@ -652,9 +828,9 @@ int main(int argc, char* argv[]) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
 
     CefSettings settings;
-    settings.no_sandbox = true;
     settings.windowless_rendering_enabled = true;
-    settings.persist_session_cookies = false;
+    // Kept as WebKit keeps them while Filo runs: the engine stops and starts again more often than Filo does.
+    settings.persist_session_cookies = true;
     settings.log_severity = LOGSEVERITY_WARNING;
     if (!profile.empty()) {
       CefString(&settings.root_cache_path) = profile;
