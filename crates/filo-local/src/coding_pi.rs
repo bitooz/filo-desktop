@@ -56,11 +56,23 @@ pub fn extension_file() -> Result<PathBuf, String> {
 
 /// `pi --mode rpc` with Filo's extension, the instructions, the model and thinking level, the session to carry on;
 /// for a chat, Filo's skills only (from the workspace, where store.rs writes them) and none of the user's extensions.
+/// `--no-extensions` takes pi's own MCP away too (pi 1.3), so a chat with servers loads it back (`builtin:mcp`), for
+/// the servers the extension registers, and names its tools: pi's usual four and those of the chat's servers only,
+/// the MCP servers of the user's `mcp.json` left out.
 pub fn args(spec: &Spec, extension: &Path) -> Vec<String> {
     let mut args: Vec<String> = ["--mode", "rpc", "-e"].map(str::to_string).to_vec();
     args.push(extension.display().to_string());
     if let Some(skills) = &spec.skills {
         args.extend(["--no-extensions".into(), "--no-skills".into()]);
+        if !spec.servers.is_empty() {
+            let mut tools = vec!["read".to_string(), "bash".into(), "edit".into(), "write".into()];
+            for server in &spec.servers {
+                let name: String =
+                    server.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+                tools.push(format!("mcp__{name}__*"));
+            }
+            args.extend(["-e".into(), "builtin:mcp".into(), "--tools".into(), tools.join(",")]);
+        }
         let folder = spec.cwd.join(".agents/skills");
         let names = skills
             .iter()
@@ -661,15 +673,35 @@ mod tests {
         let config: Value = serde_json::from_str(&env(&round)[0].1).unwrap();
         assert_eq!(config["askShell"], true);
         assert_eq!(config["roots"], json!(["/w", "/proof"]));
-        // A chat: none of the user's extensions or skills, and its shell isn't asked about.
+        // A chat: none of the user's extensions or skills but pi's own MCP, for its servers' tools only, and its shell
+        // isn't asked about.
         let mut chat = spec("auto", true);
-        chat.servers = vec![crate::engine::McpServer {
-            name: "filo".into(),
-            program: "/F/filo".into(),
-            args: vec!["--local-mcp".into()],
-        }];
         let args = super::args(&chat, Path::new("/tmp/filo.ts"));
-        assert!(args.contains(&"--no-extensions".to_string()) && args.contains(&"--no-skills".to_string()));
+        assert_eq!(
+            args,
+            ["--mode", "rpc", "-e", "/tmp/filo.ts", "--no-extensions", "--no-skills", "--append-system-prompt", "Work well."]
+        );
+        chat.servers = vec![
+            crate::engine::McpServer { name: "filo".into(), program: "/F/filo".into(), args: vec!["--local-mcp".into()] },
+            crate::engine::McpServer { name: "my-app".into(), program: "/F/app".into(), args: Vec::new() },
+        ];
+        let args = super::args(&chat, Path::new("/tmp/filo.ts"));
+        assert_eq!(
+            args[..10],
+            [
+                "--mode",
+                "rpc",
+                "-e",
+                "/tmp/filo.ts",
+                "--no-extensions",
+                "--no-skills",
+                "-e",
+                "builtin:mcp",
+                "--tools",
+                "read,bash,edit,write,mcp__filo__*,mcp__my_app__*"
+            ]
+        );
+        chat.servers.truncate(1);
         let config: Value = serde_json::from_str(&env(&chat)[0].1).unwrap();
         assert_eq!(config["askShell"], false);
         assert_eq!(config["servers"], json!([{ "name": "filo", "command": "/F/filo", "args": ["--local-mcp"] }]));

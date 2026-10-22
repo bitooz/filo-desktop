@@ -647,7 +647,10 @@ and loaded with `-e`), told what it needs in `FILO_PI`:
   card is dismissed at once, with a line in the thread.
 
 A chat runs with `--no-extensions --no-skills` and its skills given one by one (`--skill`, from the workspace's
-`.agents/skills`); a coding round loads the user's own extensions and skills. `PI_OFFLINE=1` keeps update checks out
+`.agents/skills`); a coding round loads the user's own extensions and skills. `--no-extensions` also turns off pi's
+built-in extensions, its MCP among them (pi 1.3), so a chat with servers loads that one back (`-e builtin:mcp`) and
+names its tools with `--tools`: `read,bash,edit,write` and `mcp__<server>__*` for each of its servers, so the servers
+of the user's `mcp.json` still connect but none of their tools reach the chat. `PI_OFFLINE=1` keeps update checks out
 of every run. `cargo test -p filo-local real_pi_scripted -- --ignored` (and `--test turn_e2e real_pi_scripted`) runs the
 installed pi with a scripted model of the tests' own (tests/pi/scripted-provider.ts: no sign-in, nothing called): the
 permission card, a steer mid-run, a resumed session, and a chat turn replying through Filo's real MCP server.
