@@ -4,11 +4,12 @@
 // else", which is typed in the composer; key hints, Back and Next or Skip at the bottom. Copy question and Open the
 // task are in its ⋯ menu.
 //
-// Keys, while it has the keyboard: ↑↓ move the highlight (on the current answer, else the recommended one), ↵ picks
-// and goes to the next question, ←→ switch questions, 1–9 pick, and typing a letter carries on in the composer
-// ("Or type your own answer…", where ↵ answers). ↓ from the last answer goes down to the composer and ↑ on the
-// composer's first line comes back to it; the highlight shows only while the panel has the keyboard, so nothing looks
-// picked while the user types. A click picks and moves on. A
+// Keys, while it has the keyboard: ↑↓ move the highlight (the first press puts it on the current answer, else the
+// recommended one: a panel opens with none, so nothing looks picked or hovered), ↵ picks the highlighted answer and goes
+// to the next question, ←→ switch questions, 1–9 pick, and typing a letter carries on in the composer ("Or type your
+// own answer…", where ↵ answers). ↓ from the last answer goes down to the composer and ↑ on the composer's first line
+// comes back to it; the highlight shows only while the panel has the keyboard, so nothing looks picked while the user
+// types. The pointer moves the highlight too, and takes it off the row it leaves. A click picks and moves on. A
 // lone question goes as soon as it's picked; with more, Review ends with Send answers. Several tasks asking at once
 // queue: the panel shows one task's questions, then the next.
 
@@ -62,9 +63,11 @@ pub struct QuestionPanel {
     /// The task whose questions show (the first in the queue), and which of them: its count is Review.
     shown: Option<String>,
     index: usize,
-    /// The highlighted row, and the question it was placed for.
-    highlight: usize,
+    /// The highlighted row (none until a key or the pointer puts it on one), and the question it was placed for.
+    highlight: Option<usize>,
     highlight_for: Option<(String, usize)>,
+    /// The keys moved it last (not the pointer): the next question shows it at once, on its current answer.
+    keyed: bool,
     /// Counts each question shown, so each eases in.
     step: usize,
     /// How tall each question of the set (and Review, after them) draws, measured from hidden copies: the body keeps
@@ -86,8 +89,9 @@ impl QuestionPanel {
             error: None,
             shown: None,
             index: 0,
-            highlight: 0,
+            highlight: None,
             highlight_for: None,
+            keyed: false,
             step: 0,
             heights: Rc::default(),
             focus: cx.focus_handle(),
@@ -147,6 +151,7 @@ impl QuestionPanel {
             self.error = None;
             self.step += 1;
             self.heights.borrow_mut().clear();
+            self.keyed = false;
         }
         let last = if group.len() > 1 { group.len() } else { 0 };
         if self.index > last {
@@ -156,13 +161,13 @@ impl QuestionPanel {
         if let Some(task) = &self.shown {
             let at = (task.clone(), self.index);
             if self.highlight_for.as_ref() != Some(&at) {
-                self.highlight = self.default_highlight(&group);
+                self.highlight = self.keyed.then(|| self.default_highlight(&group));
                 self.highlight_for = Some(at);
             }
         }
     }
 
-    /// Where the highlight starts: on the answer picked, else on the recommended one (Review: on Send answers).
+    /// Where the keys put the highlight first: on the answer picked, else on the recommended one (Review: on Send answers).
     fn default_highlight(&self, group: &[ChatRequest]) -> usize {
         let Some(request) = group.get(self.index) else { return group.len() };
         let choices = coding_requests::choices(request);
@@ -207,10 +212,11 @@ impl QuestionPanel {
     /// Back up from the composer: the highlight on the bottom row (Something else, or Review's Send answers).
     pub fn from_below(&mut self, cx: &mut Context<Self>) {
         let group = self.group();
-        self.highlight = match group.get(self.index) {
+        self.highlight = Some(match group.get(self.index) {
             Some(request) => coding_requests::choices(request).len(),
             None => group.len(),
-        };
+        });
+        self.keyed = true;
         cx.notify();
     }
 
@@ -235,7 +241,7 @@ impl QuestionPanel {
         format!(
             "task {} · {place}{at} · highlight {} · picks {picks:?} · queued {}{}{}",
             first.task_id,
-            self.highlight + 1,
+            self.highlight.map_or("none".to_string(), |row| (row + 1).to_string()),
             self.queued(),
             if self.sending > 0 { " · sending" } else { "" },
             self.error.as_ref().map(|error| format!(" · error {error}")).unwrap_or_default()
@@ -370,6 +376,22 @@ impl QuestionPanel {
         cx.notify();
     }
 
+    /// The pointer on a row highlights it; leaving it takes the highlight off, unless the keys moved it elsewhere.
+    fn hover_row(&mut self, row: usize, hovered: bool, cx: &mut Context<Self>) {
+        let highlight = if hovered {
+            Some(row)
+        } else if self.highlight == Some(row) {
+            None
+        } else {
+            return;
+        };
+        if highlight != self.highlight {
+            self.highlight = highlight;
+            self.keyed = false;
+            cx.notify();
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
@@ -385,28 +407,34 @@ impl QuestionPanel {
         // A question's answers and Something else; Review's questions and Send answers.
         let rows = if review { group.len() + 1 } else { choices.len() + 1 };
         let many = group.len() > 1;
-        match keystroke.key.as_str() {
-            "up" => self.highlight = self.highlight.saturating_sub(1),
+        let key = keystroke.key.as_str();
+        if matches!(key, "up" | "down" | "left" | "right" | "enter") {
+            self.keyed = true;
+        }
+        match (key, self.highlight) {
+            // No highlight yet: ↑, ↓ or ↵ puts it where it starts, so ↵ never picks a row that doesn't show.
+            ("up" | "down" | "enter", None) => self.highlight = Some(self.default_highlight(&group)),
+            ("up", Some(row)) => self.highlight = Some(row.saturating_sub(1)),
             // Down past the last answer: on to the composer, where Something else is typed.
-            "down" if !review && self.highlight + 1 >= rows => cx.emit(PanelEvent::Compose(None)),
-            "down" => self.highlight = (self.highlight + 1).min(rows - 1),
-            "left" if many => self.go(self.index.saturating_sub(1), cx),
-            "right" if many => self.go(self.index + 1, cx),
-            "enter" if review => {
-                if self.highlight >= group.len() {
+            ("down", Some(row)) if !review && row + 1 >= rows => cx.emit(PanelEvent::Compose(None)),
+            ("down", Some(row)) => self.highlight = Some((row + 1).min(rows - 1)),
+            ("left", _) if many => self.go(self.index.saturating_sub(1), cx),
+            ("right", _) if many => self.go(self.index + 1, cx),
+            ("enter", Some(row)) if review => {
+                if row >= group.len() {
                     self.send(window, cx);
                 } else {
-                    self.go(self.highlight, cx);
+                    self.go(row, cx);
                 }
             }
-            "enter" => {
-                if self.highlight < choices.len() {
-                    self.pick(self.highlight, window, cx);
+            ("enter", Some(row)) => {
+                if row < choices.len() {
+                    self.pick(row, window, cx);
                 } else {
                     cx.emit(PanelEvent::Compose(None));
                 }
             }
-            key if !review && !modifiers.shift && key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => {
+            (key, _) if !review && !modifiers.shift && key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => {
                 let number = (key.as_bytes()[0] - b'0') as usize;
                 if number >= 1 && number <= choices.len() {
                     self.pick(number - 1, window, cx);
@@ -580,7 +608,7 @@ impl QuestionPanel {
     ) -> gpui::Stateful<gpui::Div> {
         let colors = *cx.colors();
         // The keyboard's highlight only while the panel has it; with the composer's, the pointer's hover.
-        let highlighted = focused && self.highlight == row;
+        let highlighted = focused && self.highlight == Some(row);
         div()
             .id(SharedString::from(id))
             .w_full()
@@ -595,12 +623,7 @@ impl QuestionPanel {
             .when(highlighted || picked, |this| this.bg(colors.surface_strong))
             .when(!focused, |this| this.hover(|style| style.bg(colors.surface_strong)))
             .when(self.sending == 0, |this| this.cursor_pointer())
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered && this.highlight != row {
-                    this.highlight = row;
-                    cx.notify();
-                }
-            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(row, *hovered, cx)))
             .child(mark)
             .child(
                 div()
@@ -766,15 +789,10 @@ impl QuestionPanel {
                 .justify_between()
                 .gap(px(space::MD))
                 .rounded(px(radius::SM - 1.))
-                .when(focused && self.highlight == index, |this| this.bg(colors.surface_strong))
+                .when(focused && self.highlight == Some(index), |this| this.bg(colors.surface_strong))
                 .when(!focused, |this| this.hover(|style| style.bg(colors.surface_strong)))
                 .cursor_pointer()
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    if *hovered && this.highlight != index {
-                        this.highlight = index;
-                        cx.notify();
-                    }
-                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(index, *hovered, cx)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.focus.focus(window);
                     this.go(index, cx);
@@ -830,7 +848,7 @@ impl QuestionPanel {
                     .into_any_element(),
             )
         } else if review {
-            let ring = focused && self.highlight >= group.len();
+            let ring = focused && self.highlight.is_some_and(|row| row >= group.len());
             Some(
                 crate::smoke::tracked(
                     "question-send",
