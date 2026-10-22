@@ -183,13 +183,16 @@ impl FeedScreen {
             while let Some(message) = rx.next().await {
                 let updated = match message {
                     PageMessage::Size { height, .. } => {
-                        let changed = glance::note_height(&id, height);
-                        let first = weak.upgrade().is_some_and(|page| !page.ready.replace(true));
-                        this.update(cx, |_, cx| {
-                            if changed || first {
-                                cx.notify();
-                            }
-                        })
+                        if !glance::note_height(&id, height) {
+                            continue;
+                        }
+                        this.update(cx, |_, cx| cx.notify())
+                    }
+                    PageMessage::Painted => {
+                        if !weak.upgrade().is_some_and(|page| !page.ready.replace(true)) {
+                            continue;
+                        }
+                        this.update(cx, |_, cx| cx.notify())
                     }
                     PageMessage::Escape => {
                         glance::page_escape(handle, cx);

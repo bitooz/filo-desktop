@@ -4,8 +4,10 @@
 // (scripts, but no origin, so nothing in it can reach the app or the host's IPC), with the app's theme and font put in.
 //
 // A native view draws above everything GPUI paints, so each one sits inside a clip view of its own, cut to what of the
-// card shows between the chat's top and the composer, and a sweep at the end of each frame (`sweep`) hides every one
-// that wasn't laid out in it: scrolled away, another page, or under a dialog. Scroll-wheel events pass through the
+// card shows between the chat's top and the composer, and a sweep at the end of each frame (`sweep`) parks every one
+// that wasn't laid out in it: scrolled away, another page, or under a dialog. Parked is see-through and out of reach,
+// never hidden, so WebKit keeps the page drawn at full priority and it shows at once when it's back (`native::park`);
+// a new page's card shows its placeholder until the page has drawn (`PageMessage::Painted`). Scroll-wheel events pass through the
 // card's view to GPUI, so the chat scrolls over a glance as over anything else. Open larger shows the same page larger
 // the way the media viewer shows a picture (media_viewer.rs): over the whole window on its dark backdrop, the page on a
 // card of the theme's surface in the middle, and a bar of controls along the bottom: the views (the visual, the table,
@@ -86,6 +88,9 @@ pub(crate) enum PageMessage {
         height: f32,
         width: Option<f32>,
     },
+    /// A frame has been drawn since it first said how tall it is: it may show (until then the card shows its
+    /// placeholder).
+    Painted,
     Escape,
     /// One of its choices clicked (`data-choice`): only a page in the Feed sends these.
     Choice(String),
@@ -308,6 +313,13 @@ impl Conversation {
                     PageMessage::Size { height, width } => {
                         (height.clamp(MIN_HEIGHT, MAX_HEIGHT), width.map(|width| width.clamp(0., MAX_NATURAL)))
                     }
+                    PageMessage::Painted => {
+                        let first = weak.upgrade().is_some_and(|page| !page.ready.replace(true));
+                        if first && this.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     PageMessage::Escape => {
                         page_escape(handle, cx);
                         continue;
@@ -325,14 +337,12 @@ impl Conversation {
                         previous.is_none_or(|previous| (previous - width).abs() > 0.5)
                     });
                 }
-                let first = weak.upgrade().is_some_and(|page| !page.ready.replace(true));
+                if !changed {
+                    continue;
+                }
                 let updated = this.update(cx, |this, cx| {
-                    if changed {
-                        this.rebuild(cx);
-                    }
-                    if changed || first {
-                        cx.notify();
-                    }
+                    this.rebuild(cx);
+                    cx.notify();
                 });
                 if updated.is_err() {
                     break;
@@ -824,6 +834,15 @@ impl GlanceSheet {
             while let Some(message) = rx.next().await {
                 let height = match message {
                     PageMessage::Size { height, .. } => height,
+                    PageMessage::Painted => {
+                        if let Some(page) = weak.upgrade()
+                            && !page.ready.replace(true)
+                            && this.update(cx, |_, cx| cx.notify()).is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     PageMessage::Escape => {
                         page_escape(handle, cx);
                         continue;
@@ -841,9 +860,6 @@ impl GlanceSheet {
                         continue;
                     }
                 };
-                if let Some(page) = weak.upgrade() {
-                    page.ready.set(true);
-                }
                 if this
                     .update_in(cx, |this, window, cx| {
                         this.height = height.clamp(MIN_HEIGHT, 2_000.);
@@ -1423,10 +1439,10 @@ fn host_page(document: &str, theme: &ThemeCss, large: bool, extra: &str) -> Stri
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <style>:root{{color-scheme:{scheme}}}html,body{{margin:0;height:100%;overflow:hidden;background:transparent}}iframe{{display:block;border:0;width:100%;height:100%;background:transparent}}</style></head>
-<body><iframe id="g" sandbox="allow-scripts" title="Glance"></iframe><script>(()=>{{const f=document.getElementById('g');
+<body><iframe id="g" sandbox="allow-scripts" title="Glance"></iframe><script>(()=>{{const f=document.getElementById('g');let drawn=false;
 const esc=()=>window.ipc.postMessage(JSON.stringify({{escape:true}}));
 addEventListener('keydown',e=>{{if(e.key==='Escape'&&!e.defaultPrevented&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&!e.shiftKey)esc()}});
-addEventListener('message',e=>{{if(e.source!==f.contentWindow||!e.data)return;if(e.data.filo==='escape')return esc();if(e.data.filo==='choice')return window.ipc.postMessage(JSON.stringify({{choice:String(e.data.value??'').slice(0,200)}}));if(e.data.filo!=='height')return;const h=Math.max(0,Math.min(4000,Number(e.data.h)||0)),w=Math.max(0,Math.min(4000,Number(e.data.w)||0));window.ipc.postMessage(JSON.stringify({{height:h,width:w}}))}});
+addEventListener('message',e=>{{if(e.source!==f.contentWindow||!e.data)return;if(e.data.filo==='escape')return esc();if(e.data.filo==='choice')return window.ipc.postMessage(JSON.stringify({{choice:String(e.data.value??'').slice(0,200)}}));if(e.data.filo!=='height')return;const h=Math.max(0,Math.min(4000,Number(e.data.h)||0)),w=Math.max(0,Math.min(4000,Number(e.data.w)||0));window.ipc.postMessage(JSON.stringify({{height:h,width:w}}));if(!drawn){{drawn=true;requestAnimationFrame(()=>requestAnimationFrame(()=>window.ipc.postMessage(JSON.stringify({{painted:true}}))))}}}});
 window.__filoScroll=dx=>{{if(f.contentWindow)f.contentWindow.postMessage({{filo:'scroll',dx}},'*')}};
 f.srcdoc={source};document.addEventListener('contextmenu',e=>e.preventDefault())}})();</script></body></html>"#
     )
@@ -1441,7 +1457,8 @@ thread_local! {
 pub struct NativePage {
     /// The page's theme (`ThemeCss::key`): a new theme makes a new page.
     pub(crate) theme: String,
-    /// The page said how tall it is: until then the web view stays hidden and the card shows its placeholder.
+    /// The page has drawn since it said how tall it is (`PageMessage::Painted`): until then its view stays parked and
+    /// the card shows its placeholder.
     pub(crate) ready: Cell<bool>,
     /// Laid out this frame (`PageElement`); the sweep hides the page otherwise.
     placed: Cell<bool>,
@@ -1505,7 +1522,7 @@ impl NativePage {
     /// Where its clip view is and whether the page in it shows, as the system has it; None while hidden.
     #[cfg(feature = "dev")]
     pub(crate) fn on_screen(&self, window: &Window) -> Option<Bounds<Pixels>> {
-        self.native.on_screen(window).filter(|(_, shown)| *shown).map(|(bounds, _)| bounds)
+        self.native.on_screen(window)
     }
 }
 
@@ -1738,8 +1755,10 @@ mod native {
         web: wry::WebView,
         frame: Cell<Option<(f64, f64, f64, f64)>>,
         inner: Cell<Option<(f64, f64, f64, f64)>>,
+        /// The clip view shows (opaque); otherwise it's parked (`park`).
         shown: Cell<bool>,
-        web_shown: Cell<bool>,
+        /// The larger view's page has faded in.
+        faded: Cell<bool>,
         /// What of the card the clip view shows, window points (`set_holes` cuts in it).
         visible: Cell<Option<Bounds<Pixels>>>,
         /// The holes cut last, in the clip view's points, and its size (none: no mask).
@@ -1750,6 +1769,24 @@ mod native {
 
     /// How long the larger view's page takes to fade in.
     const FADE_SECONDS: f64 = 0.18;
+
+    /// Parks a clip view or shows it. A parked one is see-through and lets every click and the wheel through
+    /// (`sheet_hit_test`), but isn't hidden: WebKit takes a hidden web view (`isHiddenOrHasHiddenAncestor`) for one out
+    /// of sight and runs its page and GPU work at background priority, where a busy Mac starves them: a page made hidden
+    /// took seconds to load, and WebKit could kill its GPU process as unresponsive, leaving the card's page drawn blank.
+    fn park(view: &AnyObject, parked: bool) {
+        // SAFETY: AppKit messages on the main thread; `view` is a live clip view.
+        unsafe {
+            let _: () = msg_send![view, setAlphaValue: if parked { 0.0f64 } else { 1.0f64 }];
+        }
+    }
+
+    /// Whether a clip view is parked (`park`).
+    fn parked(view: &AnyObject) -> bool {
+        // SAFETY: as in `park`.
+        let alpha: f64 = unsafe { msg_send![view, alphaValue] };
+        alpha <= 0.
+    }
 
     /// Fades `view` in from clear.
     fn fade_in(view: &AnyObject) {
@@ -1790,9 +1827,10 @@ mod native {
                 .filter(|(container, _)| {
                     // SAFETY: on the main thread; a clip view with holes is kept by its page.
                     unsafe {
-                        let hidden: Bool = msg_send![**container as *const AnyObject, isHiddenOrHasHiddenAncestor];
-                        let window: *mut AnyObject = msg_send![**container as *const AnyObject, window];
-                        !hidden.as_bool() && !window.is_null()
+                        let view = **container as *const AnyObject;
+                        let hidden: Bool = msg_send![view, isHiddenOrHasHiddenAncestor];
+                        let window: *mut AnyObject = msg_send![view, window];
+                        !hidden.as_bool() && !parked(&*view) && !window.is_null()
                     }
                 })
                 .flat_map(|(_, holes)| holes.clone())
@@ -1844,6 +1882,9 @@ mod native {
 
     /// What floats over a page shows through a hole in it (`set_holes`), and the click there is its own.
     extern "C-unwind" fn sheet_hit_test(this: &AnyObject, _: Sel, point: NSPoint) -> *mut AnyObject {
+        if parked(this) {
+            return std::ptr::null_mut();
+        }
         // SAFETY: AppKit messages on the main thread, where AppKit hit-tests.
         unsafe {
             let key = this as *const AnyObject as usize;
@@ -1952,15 +1993,17 @@ mod native {
                 if !layer.is_null() {
                     let _: () = msg_send![layer, setMasksToBounds: true];
                 }
-                let _: () = msg_send![&*container, setHidden: true];
                 let _: () = msg_send![parent, addSubview: &*container];
                 container
             };
+            park(&container, true);
             let handle = Parent(NonNull::new(Retained::as_ptr(&container) as *mut c_void)?);
             let built = wry::WebViewBuilder::new()
                 .with_html(html)
                 .with_transparent(true)
-                .with_visible(false)
+                // Never suspended while out of sight (a window behind others, a minimized one): back in view, it shows
+                // at once rather than blank until WebKit wakes it.
+                .with_background_throttling(wry::BackgroundThrottlingPolicy::Disabled)
                 .with_focused(false)
                 .with_incognito(true)
                 .with_accept_first_mouse(true)
@@ -1972,7 +2015,9 @@ mod native {
                         return;
                     }
                     let Ok(message) = serde_json::from_str::<serde_json::Value>(request.body()) else { return };
-                    if message.get("escape").and_then(serde_json::Value::as_bool) == Some(true) {
+                    if message.get("painted").and_then(serde_json::Value::as_bool) == Some(true) {
+                        let _ = heights.unbounded_send(super::PageMessage::Painted);
+                    } else if message.get("escape").and_then(serde_json::Value::as_bool) == Some(true) {
                         let _ = heights.unbounded_send(super::PageMessage::Escape);
                     } else if let Some(choice) = message
                         .get("choice")
@@ -1994,7 +2039,7 @@ mod native {
                     frame: Cell::new(None),
                     inner: Cell::new(None),
                     shown: Cell::new(false),
-                    web_shown: Cell::new(false),
+                    faded: Cell::new(false),
                     visible: Cell::new(None),
                     holes: std::cell::RefCell::new(Vec::new()),
                     inline,
@@ -2040,31 +2085,27 @@ mod native {
                     size: wry::dpi::LogicalSize::new(inner.2, inner.3).into(),
                 });
             }
-            if ready && !self.web_shown.replace(true) {
-                // The larger view's page fades in once it's drawn; the chat's shows as it is, with its card.
-                if !self.inline {
+            // Parked until its page has drawn; then it shows wherever it's placed. The larger view's page fades in the
+            // first time; the chat's shows as it is, with its card.
+            if ready && !self.shown.replace(true) {
+                if !self.inline && !self.faded.replace(true) {
                     fade_in(&self.container);
+                } else {
+                    park(&self.container, false);
                 }
-                let _ = self.web.set_visible(true);
                 reclaim_keys(window);
-            }
-            if !self.shown.replace(true) {
-                // SAFETY: as in `open`.
-                unsafe {
-                    let _: () = msg_send![&*self.container, setHidden: false];
-                }
             }
         }
 
-        /// Where the clip view really is and whether its page shows (window points from the top left), as AppKit
-        /// has it: None while hidden (the fixture's checks).
+        /// Where the clip view really is while its page shows (window points from the top left), as AppKit has it:
+        /// None while it's parked or hidden (the fixture's checks).
         #[cfg(feature = "dev")]
-        pub fn on_screen(&self, window: &Window) -> Option<(Bounds<Pixels>, bool)> {
+        pub fn on_screen(&self, window: &Window) -> Option<Bounds<Pixels>> {
             let parent = content_view(window)?;
             // SAFETY: as in `open`.
             unsafe {
                 let hidden: bool = msg_send![&*self.container, isHiddenOrHasHiddenAncestor];
-                if hidden {
+                if hidden || parked(&self.container) {
                     return None;
                 }
                 let frame: NSRect = msg_send![&*self.container, frame];
@@ -2079,7 +2120,7 @@ mod native {
                     gpui::point(gpui::px(frame.origin.x as f32), gpui::px(y as f32)),
                     gpui::size(gpui::px(frame.size.width as f32), gpui::px(frame.size.height as f32)),
                 );
-                Some((bounds, self.web_shown.get()))
+                Some(bounds)
             }
         }
 
@@ -2197,10 +2238,7 @@ mod native {
         pub fn hide(&self) {
             self.visible.set(None);
             if self.shown.replace(false) {
-                // SAFETY: AppKit messages on the main thread.
-                unsafe {
-                    let _: () = msg_send![&*self.container, setHidden: true];
-                }
+                park(&self.container, true);
             }
         }
     }

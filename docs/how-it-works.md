@@ -1225,6 +1225,13 @@ Smaller knobs, each documented where it's read: `FILO_DRIVE_PAUSE` and `FILO_DRI
   clicks through: the fade under a page's header (`ui::sub_page`'s `ui::header_fade`) shows over an artifact's page as it scrolls, as
   over any other page. The artifact page's Shared bar, which doesn't scroll, is part of its top, above the fade. `FILO_OPEN=overlays-drive:<artifact id>,<video file>` opens each kind of overlay over each
   kind of view and checks it shows, AppKit sends a click there to GPUI, and real clicks land.
+- `src/screens/chat/glance.rs`: a glance's page (in a chat, the Feed or opened larger) is never hidden. Out of sight
+  (scrolled away, another chat, a dialog over it) its clip view is parked: see-through, with every click and the wheel
+  going through it. WebKit runs a hidden web view's page and GPU work at background priority, where a busy Mac
+  starved them: a new glance took seconds to load, and WebKit killed its GPU process as unresponsive, leaving the
+  card's page blank. Its pages are never suspended either (wry's `BackgroundThrottlingPolicy::Disabled`), and a card
+  shows its placeholder until the page has drawn a frame (`PageMessage::Painted`, two animation frames after its first
+  size), not just measured itself.
 - `vendor/gpui-component`, `vendor/gpui`: our copies of gpui-component 0.5.1 and gpui 0.2.2 with Filo's fixes (each
   has a `FILO.md`). `computer-use/`: the Swift helper behind `use_computer`, with its own vendored code.
 - `assets/`: icons, fonts, and Filo's avatars (`assets/images/filo/{avatars,workers,avatar-colors}`).

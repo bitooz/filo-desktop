@@ -466,8 +466,15 @@ unsafe fn web_views(view: *mut AnyObject, out: &mut Vec<*mut AnyObject>) {
         let is_web: bool = msg_send![view, isKindOfClass: web];
         if is_web {
             let hidden: bool = msg_send![view, isHiddenOrHasHiddenAncestor];
-            let alpha: f64 = msg_send![view, alphaValue];
-            if !hidden && alpha > 0. {
+            // Nor one in a see-through view (a glance's page parked out of sight, chat/glance.rs).
+            let mut clear = false;
+            let mut ancestor = view;
+            while !ancestor.is_null() && !clear {
+                let alpha: f64 = msg_send![ancestor, alphaValue];
+                clear = alpha <= 0.;
+                ancestor = msg_send![ancestor, superview];
+            }
+            if !hidden && !clear {
                 out.push(view);
             }
             return;
@@ -529,6 +536,9 @@ struct Web {
     y: i64,
     width: usize,
     height: usize,
+    /// What of it shows: the picture's pixels left, top, right and bottom, cut to the views around it that clip it
+    /// (a glance's clip view, chat/glance.rs).
+    clip: [i64; 4],
     scale: f64,
     holes: Vec<([f64; 4], f64)>,
     /// The tints laid over it (a dialog's dim): rects in its points and their sRGB colours.
@@ -555,8 +565,31 @@ unsafe fn place(
         };
         let (x, y) = (((rect.origin.x - bounds.origin.x) * scale).round() as i64, (top * scale).round() as i64);
         let (width, height) = ((rect.size.width * scale).round() as usize, (rect.size.height * scale).round() as usize);
-        let inside =
-            x < picture.width as i64 && y < picture.height as i64 && x + width as i64 > 0 && y + height as i64 > 0;
+        let mut clip = [x, y, x + width as i64, y + height as i64];
+        let mut ancestor: *mut AnyObject = msg_send![web, superview];
+        while !ancestor.is_null() && ancestor != view {
+            let layer: *mut AnyObject = msg_send![ancestor, layer];
+            let clips: bool = !layer.is_null() && msg_send![layer, masksToBounds];
+            if clips {
+                let own: NSRect = msg_send![ancestor, bounds];
+                let at: NSRect = msg_send![ancestor, convertRect: own, toView: view];
+                let top = if flipped {
+                    at.origin.y - bounds.origin.y
+                } else {
+                    bounds.origin.y + bounds.size.height - at.origin.y - at.size.height
+                };
+                let left = ((at.origin.x - bounds.origin.x) * scale).round() as i64;
+                let top = (top * scale).round() as i64;
+                let right = left + (at.size.width * scale).round() as i64;
+                let bottom = top + (at.size.height * scale).round() as i64;
+                clip = [clip[0].max(left), clip[1].max(top), clip[2].min(right), clip[3].min(bottom)];
+            }
+            ancestor = msg_send![ancestor, superview];
+        }
+        let inside = clip[0] < picture.width as i64
+            && clip[1] < picture.height as i64
+            && clip[2] > 0.max(clip[0])
+            && clip[3] > 0.max(clip[1]);
         let (holes, tints, fades) = crate::web_holes::hole_rects(web);
         (inside && width > 0 && height > 0).then_some(Web {
             view: web,
@@ -564,6 +597,7 @@ unsafe fn place(
             y,
             width,
             height,
+            clip,
             scale,
             holes,
             tints,
@@ -636,12 +670,12 @@ fn image_pixels(image: *mut AnyObject, width: usize, height: usize) -> Option<Ve
 fn lay_over(picture: &mut Picture, pixels: &[u8], web: &Web) {
     for row in 0..web.height {
         let y = web.y + row as i64;
-        if y < 0 || y >= picture.height as i64 {
+        if y < 0 || y >= picture.height as i64 || y < web.clip[1] || y >= web.clip[3] {
             continue;
         }
         for column in 0..web.width {
             let x = web.x + column as i64;
-            if x < 0 || x >= picture.width as i64 {
+            if x < 0 || x >= picture.width as i64 || x < web.clip[0] || x >= web.clip[2] {
                 continue;
             }
             let (px, py) = ((column as f64 + 0.5) / web.scale, (row as f64 + 0.5) / web.scale);
