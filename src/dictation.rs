@@ -206,6 +206,8 @@ pub async fn type_words(
 pub struct Dictation {
     state: State,
     field: Option<Field>,
+    /// When fn+⌃ went down.
+    asked: Instant,
     _tick: Option<Task<()>>,
 }
 
@@ -227,7 +229,7 @@ const MAX_MS: f64 = 10. * 60_000.;
 
 impl Dictation {
     pub fn new() -> Dictation {
-        Dictation { state: State::Idle, field: None, _tick: None }
+        Dictation { state: State::Idle, field: None, asked: Instant::now(), _tick: None }
     }
 
     /// Recording, or about to.
@@ -242,6 +244,7 @@ impl Dictation {
             return;
         }
         self.field = Some(field);
+        self.asked = Instant::now();
         self.state = State::Opening;
         cx.notify();
         cx.on_next_frame(window, |_, window, cx| cx.on_next_frame(window, |this, window, cx| this.open(window, cx)));
@@ -252,7 +255,7 @@ impl Dictation {
             return;
         }
         crate::media::stop(cx);
-        match AwayRecording::start(&backend(cx)) {
+        match AwayRecording::start(&backend(cx), self.asked) {
             Ok(recording) => self.state = State::Recording { recording, started: Instant::now() },
             Err(problem) => return self.note(problem, window, cx),
         }
@@ -321,14 +324,17 @@ impl Dictation {
         let backend = backend(cx);
         cx.spawn_in(window, async move |this, cx| {
             let words = voice.words(&backend).await;
-            voice.discard();
             let problem = match words {
                 Ok(words) => {
                     let typed = type_words(field, words, fallback, cx).await;
+                    if typed {
+                        voice.log_timing();
+                    }
                     (!typed).then(|| "No text field had the cursor for what you said.".to_string())
                 }
                 Err(problem) => Some(problem),
             };
+            voice.discard();
             this.update_in(cx, |this, window, cx| {
                 if !matches!(this.state, State::Writing) {
                     return;

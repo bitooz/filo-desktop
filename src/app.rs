@@ -102,8 +102,11 @@ impl AppShell {
         cx.set_global(NavGlobal(shell));
         let appearance = cx.observe_window_appearance(window, |_, window, cx| theme::sync_appearance(window, cx));
         appearance.detach();
-        // Leaving the window mid-hold: the key release goes to another app.
+        // Leaving the window mid-hold: the key release goes to another app. In front, a session with the relay is kept
+        // open for the next recording (live_transcription.rs `keep_warm`).
+        crate::live_transcription::keep_warm(window.is_window_active(), &backend(cx));
         cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+            crate::live_transcription::keep_warm(window.is_window_active(), &backend(cx));
             this.check_attention(window, cx);
             if !window.is_window_active() && std::mem::take(&mut this.voice_chord) {
                 this._voice_hold = None;
@@ -439,7 +442,7 @@ impl AppShell {
             return recording;
         }
         let backend = backend(cx);
-        let recording = match screens::chat::conversation::AwayRecording::start(&backend) {
+        let recording = match screens::chat::conversation::AwayRecording::start(&backend, std::time::Instant::now()) {
             Ok(recording) => recording,
             Err(problem) => {
                 eprintln!("voice from another app: {problem}");

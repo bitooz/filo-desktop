@@ -407,6 +407,18 @@ the composer says so and when voice messages are back (from another app, the pet
 recording made in a chat stays there to send again. If the live stream fails midway, Send turns the saved recording
 into text through the relay instead (`voiceRecordings:send`). In `dev` builds, `FILO_WORKER_ORIGIN` points Filo at another relay.
 
+So the words come back as soon as they can, a session with the relay is open before the keys go down
+(`live_transcription::keep_warm`): connecting and the relay's start (booking the day's share, opening the speech
+service) take 1–3 s, which a short recording would otherwise wait out after it's let go. One is opened when Filo's
+window comes to the front and after each recording, kept 90 s (the relay ends a session 12 minutes after its start and a
+recording runs up to 10; Cloudflare drops a WebSocket quiet for 100 s), and replaced while the window stays in front.
+A recording takes it, or opens its own when it's gone or broken. Never in test runs. Letting go stops the microphone's
+stream and tells the relay at once, before the recorder closes its file. Each dictation logs its steps' timing once its
+words are in: `dictation: key down → connected …, ready … (opened … s before), first words … · last word → final … ·
+key up → commit …, final …, typed …` (`Marks`). `filo --record clip.wav [warm]` (dev, with a FILO_CONFIG_DIR of its
+own) streams a 16 kHz WAV at the microphone's pace as if fn+⌃ went down at its start and up at its end, and prints the
+same line.
+
 ## Sounds
 
 An audio file (mp3, m4a, wav, aac, ogg, flac and the like) in a chat's or the group's message, or saved by a coding

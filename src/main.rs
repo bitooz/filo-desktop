@@ -220,8 +220,10 @@ fn main() {
     // is already granted, so no prompt appears), streaming it to Filo's relay like a
     // voice message, and, with a session, sends it there the way a voice message goes
     // without live words (createUpload, kept, voiceRecordings:send). `filo --record
-    // clip.wav` (16 kHz mono PCM16) streams the file to the relay in real time instead,
-    // and `filo --record clip.m4a [sessionId]` sends a recording through it at once.
+    // clip.wav [warm]` (16 kHz mono PCM16) streams the file to the relay in real time instead,
+    // as if fn+⌃ went down as it starts and up as it ends (`warm`: on a session opened 3 s
+    // before), and logs the steps' timing; `filo --record clip.m4a [sessionId]` sends a
+    // recording through it at once.
     #[cfg(feature = "dev")]
     if args.first().map(String::as_str) == Some("--record") {
         std::process::exit(runtime.block_on(record_check(backend, args[1..].to_vec())));
@@ -560,24 +562,31 @@ async fn record_check(backend: backend::Backend, args: Vec<String>) -> i32 {
         return upload_check(backend, bytes, 1500., args.get(1).cloned()).await;
     }
     if let Some(file) = args.first().filter(|arg| arg.ends_with(".wav")) {
-        // The WAV's samples, in 100 ms chunks at the pace a microphone delivers them.
+        // The WAV's samples, in 100 ms chunks at the pace a microphone delivers them: each once it's been heard.
         let wav = std::fs::read(file).unwrap_or_default();
         let pcm = live_transcription::wav_data(&wav).unwrap_or_default().to_vec();
         let duration_ms = pcm.len() as f64 / 32.;
-        let live = live_transcription::LiveTranscription::start(&backend);
+        if args.get(1).map(String::as_str) == Some("warm") {
+            live_transcription::warm(live_transcription::Relay::new(&live_transcription::origin()), backend.runtime());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let asked = std::time::Instant::now();
+        let live = live_transcription::LiveTranscription::start(&backend, asked);
         let sink = live.sink();
-        for chunk in pcm.chunks(3200) {
+        for (n, chunk) in pcm.chunks(3200).enumerate() {
+            tokio::time::sleep_until((asked + std::time::Duration::from_millis(100 * (n as u64 + 1))).into()).await;
             sink.push(chunk.to_vec());
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let ended = std::time::Instant::now();
         let heard = live.heard().words;
+        let marks = live.marks();
         let transcript = live.finish(duration_ms).await;
         println!("words heard while streaming: {heard:?}");
         println!(
             "{duration_ms:.0} ms of audio · live transcript after {} ms: {transcript:?}",
             ended.elapsed().as_millis()
         );
+        println!("dictation: {}", marks.lock().unwrap().line(std::time::Instant::now()));
         return if transcript.is_ok() { 0 } else { 1 };
     }
     let permission = recorder::permission();
@@ -593,7 +602,7 @@ async fn record_check(backend: backend::Backend, args: Vec<String>) -> i32 {
             return 1;
         }
     };
-    let live = Some(live_transcription::LiveTranscription::start(&backend));
+    let live = Some(live_transcription::LiveTranscription::start(&backend, std::time::Instant::now()));
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mic = {
         let (sink, streamed) = (live.as_ref().map(|live| live.sink()), streamed.clone());

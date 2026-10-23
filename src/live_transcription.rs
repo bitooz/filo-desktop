@@ -9,9 +9,16 @@
 // If the stream failed, the saved recording goes through the relay afterwards instead (`transcribe_file`,
 // voiceRecordings:send). An allowance used up, the relay switched off, or no connection is a `Problem`, which says what
 // happened and when voice messages are back.
+//
+// Connecting and the relay's start (it books the recording's share of the day, then opens the speech service) take
+// 1–3 s, which a short recording would otherwise wait out after it's let go. So a session is kept open ahead of the
+// next recording (`keep_warm`, `SPARE`) while Filo's window is in front and after each recording, and a recording
+// takes it. Each one's steps are timed (`Marks`) and logged once its words are in ("dictation: …").
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::{FutureExt as _, LocalBoxFuture, Shared};
 use futures::{SinkExt as _, StreamExt as _};
@@ -38,6 +45,11 @@ const FILE_SPEED: f64 = 4.;
 const SILENT_PEAK: i16 = 16;
 /// The streamed audio may fall this far short of the recording before it is distrusted.
 const MAX_MISSING_MS: f64 = 1_500.;
+/// A chunk this loud (and at least a sixth of the loudest so far) is speech, for `Marks::last_speech`.
+const SPEECH_PEAK: i16 = 800;
+/// How long a session opened ahead waits for a recording. The relay ends a session 12 minutes after its start and a
+/// recording runs up to 10; Cloudflare drops a WebSocket that's quiet for 100 s.
+const SPARE_FOR: Duration = Duration::from_secs(90);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -110,6 +122,49 @@ pub struct Heard {
 /// The final transcript (empty when nothing was said), or why there's none: then the recording itself is transcribed
 /// (`transcribe_file`). Shared so a retried send reuses it.
 pub type Transcript = Shared<LocalBoxFuture<'static, Result<String, Problem>>>;
+
+/// When a recording's steps happened, from fn+⌃ (or the mic) going down to its words being in.
+#[derive(Clone, Debug, Default)]
+pub struct Marks {
+    /// The keys went down (the session may have been opened before: `opened`).
+    pub asked: Option<Instant>,
+    opened: Option<Instant>,
+    connected: Option<Instant>,
+    ready: Option<Instant>,
+    first_words: Option<Instant>,
+    /// The last chunk loud enough to be speech reached this Mac's stream.
+    last_speech: Option<Instant>,
+    /// The keys were let go (`LiveTranscription::finish`).
+    pub let_go: Option<Instant>,
+    committed: Option<Instant>,
+    final_words: Option<Instant>,
+}
+
+impl Marks {
+    /// One line for the log once the words are in at `typed`: each step in ms from the keys going down, or going up.
+    pub fn line(&self, typed: Instant) -> String {
+        let since = |from: Option<Instant>, to: Option<Instant>| match (from, to) {
+            (Some(from), Some(to)) => format!("{} ms", to.saturating_duration_since(from).as_millis()),
+            _ => "–".into(),
+        };
+        let warm = match (self.opened, self.asked) {
+            (Some(opened), Some(asked)) if opened < asked => {
+                format!(" (opened {:.0} s before)", asked.duration_since(opened).as_secs_f64())
+            }
+            _ => String::new(),
+        };
+        format!(
+            "key down → connected {}, ready {}{warm}, first words {} · last word → final {} · key up → commit {}, final {}, typed {}",
+            since(self.asked, self.connected.zip(self.asked).map(|(at, asked)| at.max(asked))),
+            since(self.asked, self.ready.zip(self.asked).map(|(at, asked)| at.max(asked))),
+            since(self.asked, self.first_words),
+            since(self.last_speech, self.final_words),
+            since(self.let_go, self.committed),
+            since(self.let_go, self.final_words),
+            since(self.let_go, Some(typed)),
+        )
+    }
+}
 
 /// Where Filo's relay is: dev.filo.im, or FILO_WORKER_ORIGIN in `dev` builds.
 pub fn origin() -> String {
@@ -213,6 +268,62 @@ pub struct LiveTranscription {
     heard: watch::Receiver<Heard>,
     task: Option<tokio::task::JoinHandle<Result<String, Problem>>>,
     rt: tokio::runtime::Handle,
+    marks: Arc<Mutex<Marks>>,
+}
+
+/// The session opened ahead of the next recording, and when (`warm`).
+static SPARE: Mutex<Option<(u64, LiveTranscription)>> = Mutex::new(None);
+static SPARES: AtomicU64 = AtomicU64::new(0);
+/// The app keeps spares (`keep_warm`): never in a check or a test.
+static WARMING: AtomicBool = AtomicBool::new(false);
+/// Filo's window is in front: a spare that runs out is replaced.
+static IN_FRONT: AtomicBool = AtomicBool::new(false);
+
+/// Filo's window came to the front (`front`) or left it: in front, a session is kept open for the next recording.
+pub fn keep_warm(front: bool, backend: &Backend) {
+    if crate::test_run::active() {
+        return;
+    }
+    WARMING.store(true, Ordering::Relaxed);
+    IN_FRONT.store(front, Ordering::Relaxed);
+    if front {
+        warm(Relay::new(&origin()), backend.runtime());
+    }
+}
+
+/// Opens a session for the next recording, unless one is open: kept `SPARE_FOR`, then closed, and replaced while
+/// Filo's window is in front.
+pub fn warm(relay: Relay, rt: tokio::runtime::Handle) {
+    let mut spare = SPARE.lock().unwrap();
+    if spare.as_ref().is_some_and(|(_, live)| live.usable()) {
+        return;
+    }
+    let id = SPARES.fetch_add(1, Ordering::Relaxed);
+    *spare = Some((id, LiveTranscription::start_with(relay.clone(), rt.clone())));
+    rt.clone().spawn(async move {
+        tokio::time::sleep(SPARE_FOR).await;
+        let mut spare = SPARE.lock().unwrap();
+        if spare.as_ref().is_some_and(|(spare, _)| *spare == id) {
+            *spare = None;
+            if IN_FRONT.load(Ordering::Relaxed) {
+                drop(spare);
+                warm(relay, rt);
+            }
+        }
+    });
+}
+
+/// A recording's session is done: another recording may well follow, so its session opens now (once the app keeps
+/// spares).
+fn warm_next(rt: tokio::runtime::Handle) {
+    if WARMING.load(Ordering::Relaxed) {
+        warm(Relay::new(&origin()), rt);
+    }
+}
+
+/// The open spare, if it's still good.
+fn take_spare() -> Option<LiveTranscription> {
+    SPARE.lock().unwrap().take().map(|(_, live)| live).filter(LiveTranscription::usable)
 }
 
 /// Feeds microphone audio in from the audio thread.
@@ -226,22 +337,47 @@ impl AudioSink {
 }
 
 impl LiveTranscription {
-    pub fn start(backend: &Backend) -> LiveTranscription {
-        LiveTranscription::start_with(Relay::new(&origin()), backend.runtime())
+    /// The stream for a recording whose keys went down at `asked`: the spare opened for it (`warm`), else a new one.
+    pub fn start(backend: &Backend, asked: Instant) -> LiveTranscription {
+        LiveTranscription::take_or_start(backend.runtime(), asked)
+    }
+
+    fn take_or_start(rt: tokio::runtime::Handle, asked: Instant) -> LiveTranscription {
+        let live = take_spare().unwrap_or_else(|| LiveTranscription::start_with(Relay::new(&origin()), rt));
+        live.marks.lock().unwrap().asked = Some(asked);
+        live
     }
 
     fn start_with(relay: Relay, rt: tokio::runtime::Handle) -> LiveTranscription {
         let (commands, mut rx) = mpsc::unbounded_channel();
         let (heard_tx, heard) = watch::channel(Heard::default());
-        let task = rt.spawn(async move {
-            let result = live(relay, &mut rx, &heard_tx).await;
-            if let Err(problem) = &result {
-                eprintln!("live transcription: {problem:?}");
-                heard_tx.send_modify(|heard| heard.problem = Some(problem.clone()));
+        let marks = Arc::new(Mutex::new(Marks { opened: Some(Instant::now()), ..Marks::default() }));
+        let task = rt.spawn({
+            let marks = marks.clone();
+            async move {
+                let result = live(relay, &mut rx, &heard_tx, &marks).await;
+                if let Err(problem) = &result {
+                    eprintln!("live transcription: {problem:?}");
+                    heard_tx.send_modify(|heard| heard.problem = Some(problem.clone()));
+                }
+                result
             }
-            result
         });
-        LiveTranscription { commands, heard, task: Some(task), rt }
+        LiveTranscription { commands, heard, task: Some(task), rt, marks }
+    }
+
+    /// Still connected (or connecting) and taking audio: a spare that can take a recording.
+    fn usable(&self) -> bool {
+        let heard = self.heard.borrow();
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+            && heard.problem.is_none()
+            && heard.stopped.is_none()
+            && self.marks.lock().unwrap().opened.is_some_and(|opened| opened.elapsed() < SPARE_FOR)
+    }
+
+    /// When its steps happened, filled in as they do.
+    pub fn marks(&self) -> Arc<Mutex<Marks>> {
+        self.marks.clone()
     }
 
     pub fn sink(&self) -> AudioSink {
@@ -261,17 +397,21 @@ impl LiveTranscription {
     /// Ends the stream. `recorded_ms` is the saved recording's length, so a stream that dropped out midway is not
     /// trusted.
     pub fn finish(mut self, recorded_ms: f64) -> Transcript {
+        self.marks.lock().unwrap().let_go.get_or_insert_with(Instant::now);
         let _ = self.commands.send(Command::Finish { recorded_ms });
         let task = self.task.take();
+        let rt = self.rt.clone();
         let waited = self.rt.spawn(async move {
             let mut task = task.ok_or_else(|| Problem::Failed("live transcription ended".into()))?;
-            match tokio::time::timeout(FINAL_TIMEOUT, &mut task).await {
+            let result = match tokio::time::timeout(FINAL_TIMEOUT, &mut task).await {
                 Ok(joined) => joined.unwrap_or_else(|_| Err(Problem::Failed("live transcription stopped".into()))),
                 Err(_) => {
                     task.abort();
                     Err(Problem::Failed("the words took too long to come back".into()))
                 }
-            }
+            };
+            warm_next(rt);
+            result
         });
         async move { waited.await.unwrap_or_else(|_| Err(Problem::Failed("live transcription stopped".into()))) }
             .boxed_local()
@@ -279,11 +419,15 @@ impl LiveTranscription {
     }
 }
 
-/// Dropped unfinished (the recording was discarded): abandon the stream.
+/// Dropped unfinished (the recording was discarded, or a spare ran out): abandon the stream.
 impl Drop for LiveTranscription {
     fn drop(&mut self) {
         if self.task.is_some() {
             let _ = self.commands.send(Command::Cancel);
+            if self.marks.lock().unwrap().asked.is_some() {
+                let rt = self.rt.clone();
+                self.rt.spawn(async move { warm_next(rt) });
+            }
         }
     }
 }
@@ -293,9 +437,14 @@ async fn live(
     relay: Relay,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     heard: &watch::Sender<Heard>,
+    marks: &Mutex<Marks>,
 ) -> Result<String, Problem> {
+    let mark = |step: fn(&mut Marks) -> &mut Option<Instant>| {
+        step(&mut marks.lock().unwrap()).get_or_insert_with(Instant::now);
+    };
     // Audio queues in `commands` while this connects.
     let mut socket = relay.connect().await?;
+    mark(|marks| &mut marks.connected);
     let (mut audio_bytes, mut peak) = (0usize, 0i16);
     // The relay ended the recording itself (`Reply::Limit`): it takes no more audio, and its final ends it.
     let mut limited = false;
@@ -310,7 +459,11 @@ async fn live(
                         continue;
                     }
                     audio_bytes += pcm.len();
-                    peak = pcm.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]]).saturating_abs()).fold(peak, i16::max);
+                    let loudest = pcm.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]]).saturating_abs()).fold(0, i16::max);
+                    peak = peak.max(loudest);
+                    if loudest >= SPEECH_PEAK.max(peak / 6) {
+                        marks.lock().unwrap().last_speech = Some(Instant::now());
+                    }
                     if let Err(error) = socket.send(Message::binary(pcm)).await {
                         break Err(stream_problem(error));
                     }
@@ -329,6 +482,7 @@ async fn live(
                         if let Err(error) = socket.send(Message::text(json!({ "type": "commit" }).to_string())).await {
                             break Err(stream_problem(error));
                         }
+                        mark(|marks| &mut marks.committed);
                     }
                     committed = true;
                 }
@@ -337,15 +491,27 @@ async fn live(
             },
             message = socket.next(), if early.is_none() => match message {
                 Some(Ok(Message::Text(text))) => match reply(text.as_str()) {
-                    Reply::Partial(words) => heard.send_modify(|heard| heard.words = words),
-                    Reply::Final(text) if committed => break Ok(text),
-                    Reply::Final(text) => early = Some(text),
+                    Reply::Partial(words) => {
+                        if !words.trim().is_empty() {
+                            mark(|marks| &mut marks.first_words);
+                        }
+                        heard.send_modify(|heard| heard.words = words)
+                    }
+                    Reply::Final(text) if committed => {
+                        mark(|marks| &mut marks.final_words);
+                        break Ok(text);
+                    }
+                    Reply::Final(text) => {
+                        mark(|marks| &mut marks.final_words);
+                        early = Some(text);
+                    }
                     Reply::Limit(problem) => {
                         limited = true;
                         heard.send_modify(|heard| heard.stopped = Some(problem));
                     }
                     Reply::Error(problem) => break Err(problem),
-                    Reply::Ready | Reply::Other => {}
+                    Reply::Ready => mark(|marks| &mut marks.ready),
+                    Reply::Other => {}
                 },
                 Some(Ok(Message::Close(_))) | None => break Err(Problem::Failed("the relay closed early".into())),
                 Some(Ok(_)) => {}
@@ -621,6 +787,34 @@ mod tests {
         assert_eq!(live.finish(1_000.).await, Ok("Milo, check the build.".into()));
         let (start, audio) = served.await.unwrap();
         assert_eq!((start["client"].as_str(), audio), (Some("desktop"), 32_000));
+    }
+
+    #[tokio::test]
+    async fn a_recording_takes_the_session_opened_ahead() {
+        let (relay, served) = fake_relay(|_, audio| match audio {
+            0 => vec![r#"{"type":"ready"}"#.into()],
+            _ => vec![r#"{"type":"final","text":"Sounds good."}"#.into()],
+        })
+        .await;
+        warm(relay, tokio::runtime::Handle::current());
+        let ready =
+            || SPARE.lock().unwrap().as_ref().is_some_and(|(_, spare)| spare.marks.lock().unwrap().ready.is_some());
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The keys go down after it's ready: it's this recording's, already connected.
+        let asked = Instant::now();
+        let live = LiveTranscription::take_or_start(tokio::runtime::Handle::current(), asked);
+        assert!(SPARE.lock().unwrap().is_none());
+        live.sink().push(speech(1_000));
+        let marks = live.marks();
+        assert_eq!(live.finish(1_000.).await, Ok("Sounds good.".into()));
+        let marks = marks.lock().unwrap().clone();
+        assert!(marks.connected.is_some_and(|connected| connected < asked));
+        assert!(marks.final_words.is_some_and(|words| words > asked) && marks.last_speech.is_some());
+        let line = marks.line(Instant::now());
+        assert!(line.starts_with("key down → connected 0 ms, ready 0 ms (opened 0 s before)"), "{line}");
+        assert_eq!(served.await.unwrap().1, 32_000);
     }
 
     #[tokio::test]

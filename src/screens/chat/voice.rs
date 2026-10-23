@@ -12,12 +12,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use super::*;
 use crate::backend::Backend;
-use crate::live_transcription::{self, Heard, LiveTranscription, Problem, Relay, Transcript};
+use crate::live_transcription::{self, Heard, LiveTranscription, Marks, Problem, Relay, Transcript};
 use crate::recorder::{self, MicStream, Permission, Recorder};
 
 /// A recording's shortest and longest length, its largest file and its type (local_backend/voice.rs takes the same).
@@ -210,15 +210,18 @@ impl Conversation {
         let backend = backend(cx);
         cx.spawn_in(window, async move |this, cx| {
             let words = voice.words(&backend).await;
-            voice.discard();
             this.update_in(cx, |this, window, cx| {
                 match words {
-                    Ok(words) => this.type_dictated(&words, window, cx),
+                    Ok(words) => {
+                        this.type_dictated(&words, window, cx);
+                        voice.log_timing();
+                    }
                     Err(problem) => this.hint = Some(problem),
                 }
                 cx.notify();
             })
             .ok();
+            voice.discard();
         })
         .detach();
     }
@@ -333,7 +336,7 @@ impl Conversation {
         media::stop(cx);
         // The stream first: the words it hears are the message.
         let opening = Instant::now();
-        let live = start_live(&backend(cx));
+        let live = start_live(&backend(cx), asked);
         match Recorder::start() {
             Ok(recorder) => {
                 eprintln!(
@@ -417,6 +420,10 @@ impl Conversation {
         self.voice_held = false;
         self.dictating = false;
         let Some(VoiceState::Recording { recorder, live, .. }) = self.voice.take() else { return };
+        // The relay hears it's over first (`end_live`); the transcript settles while the user listens or reaches for
+        // Send. One too short to send is dropped.
+        let live = live.filter(|_| recorder.elapsed_ms() >= MIN_VOICE_MS);
+        let transcript = end_live(&recorder, live).map(|(transcript, _)| transcript);
         let (path, duration_ms) = recorder.finish();
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         match draft_problem(duration_ms, size) {
@@ -428,14 +435,7 @@ impl Conversation {
                     format!("{problem} Please record between 1 second and 10 minutes.")
                 });
             }
-            None => {
-                // The transcript settles while the user listens or reaches for Send.
-                let transcript = live.map(|Live { mic, transcription }| {
-                    mic.stop();
-                    transcription.finish(duration_ms)
-                });
-                self.voice = Some(VoiceState::Preview { path, duration_ms, transcript });
-            }
+            None => self.voice = Some(VoiceState::Preview { path, duration_ms, transcript }),
         }
         cx.notify();
     }
@@ -828,12 +828,13 @@ pub struct AwayVoice {
     pub path: PathBuf,
     pub duration_ms: f64,
     pub transcript: Option<Transcript>,
+    marks: Option<Arc<Mutex<Marks>>>,
 }
 
 impl AwayRecording {
-    /// Starts recording, or says why it can't. The first time, macOS is asked for the microphone and nothing records:
-    /// the keys were let go for its prompt.
-    pub fn start(backend: &Backend) -> Result<AwayRecording, String> {
+    /// Starts recording for keys that went down at `asked`, or says why it can't. The first time, macOS is asked for
+    /// the microphone and nothing records: the keys were let go for its prompt.
+    pub fn start(backend: &Backend, asked: Instant) -> Result<AwayRecording, String> {
         if !recorder::in_app_bundle() && recorder::permission() != Permission::Granted {
             return Err(NOT_AN_APP.into());
         }
@@ -846,7 +847,7 @@ impl AwayRecording {
             Permission::Denied => return Err(MIC_OFF.into()),
         }
         let recorder = Recorder::start().map_err(|_| "Microphone could not start.".to_string())?;
-        Ok(AwayRecording { recorder, live: start_live(backend) })
+        Ok(AwayRecording { recorder, live: start_live(backend, asked) })
     }
 
     pub fn cancel(self) {
@@ -870,17 +871,19 @@ impl AwayRecording {
 
     /// Stops recording: what was recorded, or why it can't be sent (too short: nothing worth saying).
     pub fn finish(self) -> Result<AwayVoice, String> {
-        let (path, duration_ms) = self.recorder.finish();
+        let AwayRecording { recorder, live } = self;
+        if recorder.elapsed_ms() < MIN_VOICE_MS {
+            recorder.cancel();
+            return Err(draft_problem(0., 0).unwrap_or_default().into());
+        }
+        let (transcript, marks) = end_live(&recorder, live).unzip();
+        let (path, duration_ms) = recorder.finish();
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         if let Some(problem) = draft_problem(duration_ms, size) {
             recorder::remove(&path);
             return Err(problem.into());
         }
-        let transcript = self.live.map(|Live { mic, transcription }| {
-            mic.stop();
-            transcription.finish(duration_ms)
-        });
-        Ok(AwayVoice { path, duration_ms, transcript })
+        Ok(AwayVoice { path, duration_ms, transcript, marks })
     }
 }
 
@@ -903,6 +906,13 @@ impl AwayVoice {
             Ok(words) if words.trim().is_empty() => Err(NOTHING_HEARD.into()),
             Ok(words) => Ok(words),
             Err(problem) => Err(problem.message()),
+        }
+    }
+
+    /// Logs how long each step took ("dictation: …", `Marks::line`), now that its words are in.
+    pub fn log_timing(&self) {
+        if let Some(marks) = &self.marks {
+            eprintln!("dictation: {}", marks.lock().unwrap().line(Instant::now()));
         }
     }
 
@@ -945,10 +955,20 @@ pub async fn send_away(
     }
 }
 
-/// Live transcription for a new recording, or `None` (the recording is then
+/// Ends `live` as the keys are let go: the microphone's stream stops and the relay is told at once, before `recorder`
+/// closes its file (which takes a moment), so the final words are on their way meanwhile.
+fn end_live(recorder: &Recorder, live: Option<Live>) -> Option<(Transcript, Arc<Mutex<Marks>>)> {
+    let Live { mic, transcription } = live?;
+    let marks = transcription.marks();
+    marks.lock().unwrap().let_go = Some(Instant::now());
+    mic.stop();
+    Some((transcription.finish(recorder.elapsed_ms()), marks))
+}
+
+/// Live transcription for a new recording whose keys went down at `asked`, or `None` (the recording is then
 /// transcribed once it's kept) when the microphone can't be tapped.
-fn start_live(backend: &Backend) -> Option<Live> {
-    let transcription = LiveTranscription::start(backend);
+fn start_live(backend: &Backend, asked: Instant) -> Option<Live> {
+    let transcription = LiveTranscription::start(backend, asked);
     let sink = transcription.sink();
     match MicStream::start(live_transcription::SAMPLE_RATE, move |pcm| sink.push(pcm)) {
         Ok(mic) => Some(Live { mic, transcription }),
