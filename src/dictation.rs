@@ -48,9 +48,9 @@ pub fn target(chat: Option<Entity<Conversation>>, window: &mut Window, cx: &mut 
         return Some(Target::Field(Field::Web(web)));
     }
     if window.with_focused_input(cx, |_, _, _| ()).is_some() {
-        let composer = chat.as_ref().is_some_and(|chat| {
-            chat.read(cx).composer().read(cx).focus_handle(cx).contains_focused(window, cx)
-        });
+        let composer = chat
+            .as_ref()
+            .is_some_and(|chat| chat.read(cx).composer().read(cx).focus_handle(cx).contains_focused(window, cx));
         return Some(if composer { Target::Chat(chat?) } else { Target::Field(Field::Filo) });
     }
     chat.map(Target::Chat)
@@ -77,7 +77,9 @@ pub fn type_into_filo(words: &str, window: &mut Window, cx: &mut App) -> bool {
                 .then(|| input.text_for_range(range.start.saturating_sub(4)..range.start, &mut adjusted, window, cx))
                 .flatten()
                 .and_then(|text| text.chars().next_back());
-            let after = input.text_for_range(range.end..range.end + 4, &mut adjusted, window, cx).and_then(|text| text.chars().next());
+            let after = input
+                .text_for_range(range.end..range.end + 4, &mut adjusted, window, cx)
+                .and_then(|text| text.chars().next());
             input.replace_text_in_range(None, &spaced(words, before, after), window, cx);
             true
         })
@@ -215,7 +217,10 @@ enum State {
     Idle,
     /// The pill is up and the microphone opens once it's drawn.
     Opening,
-    Recording { recording: AwayRecording, started: Instant },
+    Recording {
+        recording: AwayRecording,
+        started: Instant,
+    },
     /// Let go: waiting for the words.
     Writing,
     /// Why nothing went in, for a few seconds.
@@ -432,7 +437,9 @@ impl Render for Dictation {
                         .footnote()
                         .text_color(colors.text_secondary)
                         .when(words.is_empty(), |this| this.child("Release to write it in · Esc to cancel"))
-                        .when(!words.is_empty(), |this| this.flex().justify_end().child(div().flex_none().child(words))),
+                        .when(!words.is_empty(), |this| {
+                            this.flex().justify_end().child(div().flex_none().child(words))
+                        }),
                 )
                 .into_any_element(),
         )

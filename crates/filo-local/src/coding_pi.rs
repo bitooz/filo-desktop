@@ -679,10 +679,23 @@ mod tests {
         let args = super::args(&chat, Path::new("/tmp/filo.ts"));
         assert_eq!(
             args,
-            ["--mode", "rpc", "-e", "/tmp/filo.ts", "--no-extensions", "--no-skills", "--append-system-prompt", "Work well."]
+            [
+                "--mode",
+                "rpc",
+                "-e",
+                "/tmp/filo.ts",
+                "--no-extensions",
+                "--no-skills",
+                "--append-system-prompt",
+                "Work well."
+            ]
         );
         chat.servers = vec![
-            crate::engine::McpServer { name: "filo".into(), program: "/F/filo".into(), args: vec!["--local-mcp".into()] },
+            crate::engine::McpServer {
+                name: "filo".into(),
+                program: "/F/filo".into(),
+                args: vec!["--local-mcp".into()],
+            },
             crate::engine::McpServer { name: "my-app".into(), program: "/F/app".into(), args: Vec::new() },
         ];
         let args = super::args(&chat, Path::new("/tmp/filo.ts"));

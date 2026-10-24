@@ -189,7 +189,7 @@ impl FeedScreen {
                         this.update(cx, |_, cx| cx.notify())
                     }
                     PageMessage::Painted => {
-                        if !weak.upgrade().is_some_and(|page| !page.ready.replace(true)) {
+                        if weak.upgrade().is_none_or(|page| page.ready.replace(true)) {
                             continue;
                         }
                         this.update(cx, |_, cx| cx.notify())

@@ -707,11 +707,13 @@ impl AppShell {
         let hold: Box<dyn Fn(&mut Window, &mut App)> = match crate::dictation::target(open, window, cx) {
             Some(crate::dictation::Target::Field(field)) => {
                 let dictation = self.dictation.clone();
-                Box::new(move |window, cx| dictation.update(cx, |dictation, cx| dictation.hold(field.clone(), window, cx)))
+                Box::new(move |window, cx| {
+                    dictation.update(cx, |dictation, cx| dictation.hold(field.clone(), window, cx))
+                })
             }
-            Some(crate::dictation::Target::Chat(conversation)) => {
-                Box::new(move |window, cx| conversation.update(cx, |conversation, cx| conversation.hold_voice(true, window, cx)))
-            }
+            Some(crate::dictation::Target::Chat(conversation)) => Box::new(move |window, cx| {
+                conversation.update(cx, |conversation, cx| conversation.hold_voice(true, window, cx))
+            }),
             None => return,
         };
         // It records at once; what can't says why only once the keys have stayed down a moment.

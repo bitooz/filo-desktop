@@ -1903,7 +1903,8 @@ pub(crate) mod native_input {
         let html = objc2_foundation::NSString::from_str(html);
         unsafe {
             let html = objc2::rc::Retained::as_ptr(&html) as *mut Object;
-            let _: *mut Object = msg_send![page as *mut Object, loadHTMLString: html baseURL: std::ptr::null_mut::<Object>()];
+            let _: *mut Object =
+                msg_send![page as *mut Object, loadHTMLString: html baseURL: std::ptr::null_mut::<Object>()];
         }
     }
 
@@ -3734,7 +3735,8 @@ fn run_coding_update_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             }
         };
         let wanted = std::env::var("FILO_DRIVE_TOOLS").unwrap_or_else(|_| "pi".into());
-        let stand_ins = std::env::var("FILO_LOGIN_PATH").ok().and_then(|path| path.split(':').next().map(str::to_string));
+        let stand_ins =
+            std::env::var("FILO_LOGIN_PATH").ok().and_then(|path| path.split(':').next().map(str::to_string));
         let tools: Vec<String> = wanted
             .split_whitespace()
             .filter(|tool| {
@@ -3742,7 +3744,9 @@ fn run_coding_update_drive(window: &mut Window, cx: &mut Context<AppShell>) {
                 let stand_in =
                     stand_ins.as_ref().is_some_and(|dir| std::path::Path::new(dir).join(engine.program()).is_file());
                 if !stand_in {
-                    eprintln!("coding-update-drive: {tool} isn't a stand-in in FILO_LOGIN_PATH's first folder: not clicked");
+                    eprintln!(
+                        "coding-update-drive: {tool} isn't a stand-in in FILO_LOGIN_PATH's first folder: not clicked"
+                    );
                 }
                 stand_in
             })
@@ -4132,7 +4136,8 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             Some(page)
         };
         let chord = native_input::FUNCTION | native_input::CONTROL;
-        let recording = |cx: &mut gpui::AsyncWindowContext| view.read_with(cx, |view, _| view.recording()).unwrap_or(false);
+        let recording =
+            |cx: &mut gpui::AsyncWindowContext| view.read_with(cx, |view, _| view.recording()).unwrap_or(false);
         let reaches_recorder = |hint: &str| hint.contains("runs as an app") || hint.contains("Microphone");
 
         check(
@@ -4172,10 +4177,7 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
             native_input::key(width, "\u{1b}", 53, chord);
             native_input::flags(width, 0);
             until(cx, &|cx| !recording(cx)).await;
-            check(
-                &format!("{case}: fn+⌃ held with text reaches the chat's recorder ({:?})", hint(cx)),
-                typed && heard,
-            );
+            check(&format!("{case}: fn+⌃ held with text reaches the chat's recorder ({:?})", hint(cx)), typed && heard);
             if case == "page hidden" {
                 native_input::remove_page(page);
             }
@@ -4228,29 +4230,46 @@ fn run_page_keys_drive(window: &mut Window, cx: &mut Context<AppShell>) {
         wait(200).await;
         this.update_in(cx, |_, window, cx| crate::dictation::type_into_filo("Oh,", window, cx)).ok();
         let before = until(cx, &|cx| text(cx) == "Oh, hi there").await;
-        check(&format!("words go into a Filo field at its caret, spaced ({:?})", text(cx)), filo_field && written && before);
+        check(
+            &format!("words go into a Filo field at its caret, spaced ({:?})", text(cx)),
+            filo_field && written && before,
+        );
 
         reset(cx).await;
         let in_page = match clicked_page(cx).await {
             Some(page) => {
-                let web = this.update_in(cx, |_, window, cx| match crate::dictation::target(Some(view.clone()), window, cx) {
-                    Some(Target::Field(Field::Web(web))) => Some(web),
-                    _ => None,
+                let web = this.update_in(cx, |_, window, cx| {
+                    match crate::dictation::target(Some(view.clone()), window, cx) {
+                        Some(Target::Field(Field::Web(web))) => Some(web),
+                        _ => None,
+                    }
                 });
                 let web = web.ok().flatten();
                 let mut ok = web.is_some();
                 if let Some(web) = &web {
                     native_input::load_page(page, "<input id=f value='hello world' style='width:260px'>");
                     wait(1200).await;
-                    crate::dictation::evaluate_bool(web, "var f=document.getElementById('f'); f.focus(); f.setSelectionRange(5,5); true").await;
+                    crate::dictation::evaluate_bool(
+                        web,
+                        "var f=document.getElementById('f'); f.focus(); f.setSelectionRange(5,5); true",
+                    )
+                    .await;
                     let typed = crate::dictation::type_into_web(web, "there").await;
-                    let value = crate::dictation::evaluate_bool(web, "document.getElementById('f').value === 'hello there world'").await;
+                    let value = crate::dictation::evaluate_bool(
+                        web,
+                        "document.getElementById('f').value === 'hello there world'",
+                    )
+                    .await;
                     eprintln!("page-keys-drive: page's field typed {typed}, value right {value}");
                     crate::dictation::evaluate_bool(web, "document.activeElement.blur(); true").await;
                     let field = Field::Web(web.clone());
-                    let fell_back = crate::dictation::type_words(field, "for the box".into(), Some(view.clone()), cx).await;
+                    let fell_back =
+                        crate::dictation::type_words(field, "for the box".into(), Some(view.clone()), cx).await;
                     let boxed = until(cx, &|cx| text(cx) == "for the box").await;
-                    eprintln!("page-keys-drive: with no field in the page, the box took them ({fell_back}, {:?})", text(cx));
+                    eprintln!(
+                        "page-keys-drive: with no field in the page, the box took them ({fell_back}, {:?})",
+                        text(cx)
+                    );
                     ok = typed && value && fell_back && boxed;
                 }
                 native_input::remove_page(page);

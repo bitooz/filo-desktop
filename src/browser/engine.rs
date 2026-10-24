@@ -477,7 +477,7 @@ fn free_space(path: &Path) -> Option<u64> {
     // SAFETY: statvfs fills the struct it's given, for a path that's a C string.
     unsafe {
         let mut stats: libc::statvfs = std::mem::zeroed();
-        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then(|| stats.f_bavail as u64 * stats.f_frsize as u64)
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then(|| stats.f_bavail as u64 * stats.f_frsize)
     }
 }
 

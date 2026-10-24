@@ -3216,7 +3216,9 @@ impl Conversation {
                     .border_t_1()
                     .border_color(fg.opacity(0.2))
                     .child(user_text(&key, &text, &[], &message.attachments, &self.mention_words(cx), None, cx))
-                    .when(self.fixture(), |this| this.relative().children(probe(&self.drawn, format!("transcript-{key}")))),
+                    .when(self.fixture(), |this| {
+                        this.relative().children(probe(&self.drawn, format!("transcript-{key}")))
+                    }),
             );
         } else if !text.trim().is_empty() {
             bubble = if user {
